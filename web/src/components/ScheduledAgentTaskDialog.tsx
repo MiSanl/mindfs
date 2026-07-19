@@ -1,6 +1,10 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { AgentIcon } from "./AgentIcon";
 import { AgentSelector } from "./AgentSelector";
+import { ModelSelector } from "./ModelSelector";
+import { AgentModeSelector } from "./AgentModeSelector";
+import { EffortSelector } from "./EffortSelector";
+import { FastServiceSelector } from "./FastServiceSelector";
 import { renderToolIcon } from "./stream/ToolCallCard";
 import type { AgentStatus } from "../services/agents";
 import {
@@ -43,12 +47,12 @@ const CRON_LABEL_KEYS: MessageKey[] = [
   "scheduled.cronWeek",
 ];
 
-const emptyForm = (agent = ""): FormState => ({
+const emptyForm = (agent = "", model = ""): FormState => ({
   name: "",
   enabled: true,
   task_cron: "0 9 * * 1-5",
   agent,
-  model: "",
+  model,
   mode: "",
   effort: "",
   fast_service: "",
@@ -154,6 +158,15 @@ function taskToForm(task: ScheduledAgentTask): FormState {
     prompt: task.prompt || "",
     new_session_cron: task.new_session_cron || "",
   };
+}
+
+function modelDefaultEffort(agent: AgentStatus | null | undefined, modelID: string): string {
+  const model = agent?.models?.find((item) => item.id === modelID);
+  if (model && !model.supportEffort) return "";
+  const modelEfforts = model?.efforts ?? [];
+  const efforts = modelEfforts.length > 0 ? modelEfforts : agent?.efforts ?? [];
+  return [model?.default_effort || "", agent?.default_effort || ""]
+    .find((item) => item && efforts.includes(item)) || efforts[0] || "";
 }
 
 const fieldStyle: React.CSSProperties = {
@@ -421,9 +434,15 @@ export function ScheduledAgentTaskDialog({
   const [runningTaskId, setRunningTaskId] = useState<string | null>(null);
   const dialogBodyRef = useRef<HTMLDivElement | null>(null);
 
-  const defaultAgent = useMemo(
-    () => agents.find((item) => item.available)?.name || agents[0]?.name || "",
+  const defaultAgentStatus = useMemo(
+    () => agents.find((item) => item.available) || agents[0] || null,
     [agents],
+  );
+  const defaultAgent = defaultAgentStatus?.name || "";
+  const defaultModel = defaultAgentStatus?.default_model_id || defaultAgentStatus?.current_model_id || "";
+  const formAgentStatus = useMemo(
+    () => agents.find((item) => item.name === form.agent) || null,
+    [agents, form.agent],
   );
 
   const loadTasks = async () => {
@@ -443,9 +462,9 @@ export function ScheduledAgentTaskDialog({
     if (!open) return;
     setView("list");
     setSelected(null);
-    setForm(emptyForm(defaultAgent));
+    setForm(emptyForm(defaultAgent, defaultModel));
     void loadTasks();
-  }, [open, rootId, defaultAgent]);
+  }, [open, rootId, defaultAgent, defaultModel]);
 
   useEffect(() => {
     if (!open) return;
@@ -477,7 +496,7 @@ export function ScheduledAgentTaskDialog({
 
   const startCreate = () => {
     setSelected(null);
-    setForm(emptyForm(defaultAgent));
+    setForm(emptyForm(defaultAgent, defaultModel));
     setError("");
     setView("create");
   };
@@ -980,39 +999,64 @@ export function ScheduledAgentTaskDialog({
               {t("scheduled.create")}
             </button>
           ) : (
-            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 4, minWidth: 0 }}>
               <AgentSelector
                 agent={form.agent}
-                model={form.model}
-                mode={form.mode}
-                effort={form.effort}
-                fastService={form.fast_service}
                 agents={agents}
                 compact
                 menuPlacement="bottom"
                 showChevron
-                onAgentChange={(agent, model) =>
+                onAgentChange={(agent) => {
+                  const status = agents.find((item) => item.name === agent) || null;
+                  const model = status?.default_model_id || status?.current_model_id || "";
                   setForm((prev) => ({
                     ...prev,
                     agent,
-                    model: model || "",
+                    model,
+                    mode: status?.current_mode_id || "",
+                    effort: modelDefaultEffort(status, model),
+                    fast_service: status?.default_fast_service === "on" ? "on" : status?.default_fast_service === "off" ? "off" : "",
+                  }));
+                }}
+              />
+              <ModelSelector
+                agent={formAgentStatus}
+                model={form.model}
+                compact
+                menuPlacement="bottom"
+                maxButtonWidth="112px"
+                onModelChange={(model) =>
+                  setForm((prev) => ({
+                    ...prev,
+                    model,
                     mode: "",
-                    effort: "",
+                    effort: modelDefaultEffort(formAgentStatus, model),
                     fast_service: "",
                   }))
                 }
-                onModeChange={(mode) =>
-                  setForm((prev) => ({ ...prev, mode: mode || "" }))
-                }
-                onEffortChange={(effort) =>
-                  setForm((prev) => ({ ...prev, effort: effort || "" }))
-                }
-                onFastServiceChange={(fastService) =>
-                  setForm((prev) => ({
-                    ...prev,
-                    fast_service: fastService || "",
-                  }))
-                }
+              />
+              <AgentModeSelector
+                agent={formAgentStatus}
+                mode={form.mode}
+                compact
+                menuPlacement="bottom"
+                maxButtonWidth="112px"
+                onModeChange={(mode) => setForm((prev) => ({ ...prev, mode: mode || "" }))}
+              />
+              <EffortSelector
+                agent={formAgentStatus}
+                model={form.model}
+                effort={form.effort}
+                compact
+                menuPlacement="bottom"
+                maxButtonWidth="112px"
+                onEffortChange={(effort) => setForm((prev) => ({ ...prev, effort: effort || "" }))}
+              />
+              <FastServiceSelector
+                agent={formAgentStatus}
+                fastService={form.fast_service}
+                compact
+                onFastServiceChange={(fastService) => setForm((prev) => ({ ...prev, fast_service: fastService || "" }))}
               />
               <label
                 style={{
