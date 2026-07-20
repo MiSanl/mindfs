@@ -2177,11 +2177,29 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 		RuntimeRootAbs: rootAbs,
 		IsInitial:      isInitial,
 	})
+	resolvedMode := resolveRuntimeMode(current, in.Mode)
+	resolvedModel := resolveRuntimeModel(current, sess, in.Model)
+	resolvedEffort := resolveRuntimeEffort(in.Agent, current, in.Effort)
+	resolvedFastService := resolveRuntimeFastService(in.Agent, current, in.FastService)
+	modelDisplayName := s.resolveExchangeModelDisplayName(in.Agent, resolvedModel)
+	turnStartedAt := time.Now().UTC()
+	if err := manager.StartPendingTurn(ctx, current,
+		session.Exchange{Seq: len(current.Exchanges) + 1, Role: "user", Agent: in.Agent, Model: resolvedModel, ModelDisplayName: modelDisplayName, Mode: resolvedMode, Effort: resolvedEffort, FastService: resolvedFastService, Content: in.Content, Timestamp: turnStartedAt},
+		session.Exchange{Seq: len(current.Exchanges) + 2, Role: "agent", Agent: in.Agent, Model: resolvedModel, ModelDisplayName: modelDisplayName, Mode: resolvedMode, Effort: resolvedEffort, FastService: resolvedFastService, Timestamp: turnStartedAt},
+	); err != nil {
+		return err
+	}
 	var responseText string
 	sawAssistantChunk := false
 	plannedAssistantSeq := len(current.Exchanges) + 2
 	auxBuffer := make([]session.ExchangeAux, 0, 8)
 	defer manager.ClearPendingExchangeAux(context.Background(), current.Key)
+	defer manager.ReleasePendingTurn(context.Background(), current.Key)
+	updatePending := func() {
+		if err := manager.UpdatePendingTurn(context.Background(), current.Key, responseText, auxBuffer); err != nil {
+			log.Printf("[session] pending.update.error root=%s session=%s err=%v", in.RootID, current.Key, err)
+		}
+	}
 	var thoughtBuffer strings.Builder
 	currentThoughtID := ""
 	flushThought := func() {
@@ -2200,6 +2218,7 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 			Thought:   thought,
 			ThoughtID: thoughtID,
 		})
+		updatePending()
 	}
 	lastResponseUpdateType := ""
 	claudeSubagents := newClaudeSubagentRouter(subagentSessionInput{
@@ -2312,6 +2331,7 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 					sawAssistantChunk = true
 					responseText = appendResponseChunk(responseText, lastResponseUpdateType, chunk.Content)
 					lastResponseUpdateType = string(update.Type)
+					updatePending()
 				}
 			} else if update.Type == agenttypes.EventTypeThoughtChunk ||
 				update.Type == agenttypes.EventTypeToolCall ||
@@ -2320,6 +2340,9 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 				update.Type == agenttypes.EventTypePlanUpdate ||
 				update.Type == agenttypes.EventTypeCompact {
 				lastResponseUpdateType = string(update.Type)
+			}
+			if update.Type != agenttypes.EventTypeMessageChunk {
+				updatePending()
 			}
 			if watcher != nil {
 				watcher.MarkSessionActive(current.Key)
@@ -2377,9 +2400,6 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 	if sendErr != nil && !isCanceledTurnError(sendErr) {
 		log.Printf("[session] turn.send.error root=%s session=%s agent=%s err=%v", in.RootID, current.Key, in.Agent, sendErr)
 	}
-	resolvedModel := resolveRuntimeModel(current, sess, in.Model)
-	resolvedEffort := resolveRuntimeEffort(in.Agent, current, in.Effort)
-	resolvedFastService := resolveRuntimeFastService(in.Agent, current, in.FastService)
 	if prefs := s.Registry.GetPreferences(); prefs != nil {
 		if changed, err := prefs.UpdateAgentDefaultsIfChanged(in.Agent, resolvedModel, resolvedEffort, resolvedFastService); err != nil {
 			log.Printf("[preferences] agent_defaults.update.error agent=%s err=%v", strings.TrimSpace(in.Agent), err)
@@ -2393,34 +2413,26 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 	if err := manager.UpdateModel(ctx, current, resolvedModel); err != nil {
 		return err
 	}
-	resolvedMode := resolveRuntimeMode(current, in.Mode)
-	modelDisplayName := s.resolveExchangeModelDisplayName(in.Agent, resolvedModel)
-	exchangeCtx := session.WithExchangeModelDisplayName(ctx, modelDisplayName)
-	if err := manager.AddExchangeForAgent(exchangeCtx, current, "user", in.Content, in.Agent, resolvedMode, resolvedEffort, resolvedFastService); err != nil {
-		log.Printf("[session] persist.user.error root=%s session=%s agent=%s err=%v", in.RootID, current.Key, in.Agent, err)
-		return err
-	}
-	if err := manager.AddExchangeForAgent(exchangeCtx, current, "agent", responseText, in.Agent, resolvedMode, resolvedEffort, resolvedFastService); err != nil {
-		log.Printf("[session] persist.agent.error root=%s session=%s agent=%s err=%v", in.RootID, current.Key, in.Agent, err)
-		return err
-	}
-	for _, aux := range dedupeExchangeAuxBuffer(auxBuffer) {
-		aux = hydratePendingToolCallAux(ctx, manager, current.Key, aux)
-		if err := manager.AddExchangeAux(ctx, current.Key, aux); err != nil {
-			return err
+	if sendErr != nil {
+		updatePending()
+		if prober := s.Registry.GetProber(); prober != nil && !isCanceledTurnError(sendErr) {
+			prober.ReportRuntimeFailure(in.Agent, sendErr)
 		}
+		return sendErr
+	}
+	for i := range auxBuffer {
+		auxBuffer[i] = hydratePendingToolCallAux(ctx, manager, current.Key, auxBuffer[i])
+	}
+	updatePending()
+	if err := manager.CompletePendingTurn(ctx, current.Key); err != nil {
+		return err
 	}
 	if err := manager.UpdateAgentState(ctx, current, in.Agent, contextLineCount(current.Exchanges), sess.SessionID()); err != nil {
 		return err
 	}
 
 	prober := s.Registry.GetProber()
-	if sendErr != nil && !isCanceledTurnError(sendErr) {
-		if prober != nil {
-			prober.ReportRuntimeFailure(in.Agent, sendErr)
-		}
-		return sendErr
-	} else if prober != nil {
+	if prober != nil {
 		prober.ReportSuccess(in.Agent)
 	}
 	return nil

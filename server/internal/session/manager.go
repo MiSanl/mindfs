@@ -31,6 +31,7 @@ const (
 	sessionDBLinkExt = ".link"
 	exchangeFileTpl  = "sessions/%s.jsonl"
 	auxFileTpl       = "sessions/%s.aux.jsonl"
+	pendingFileTpl   = "sessions/pending/%s.json"
 	selectSessionSQL = `
 	SELECT key, type, parent_session_key, parent_tool_call_id, source, task_id, model, shell, plan_mode, name, related_files_json, related_worktree_json, created_at, updated_at, closed_at
 	FROM sessions`
@@ -139,6 +140,7 @@ type Manager struct {
 	db               *sql.DB
 	sessions         map[string]*Session
 	pendingToolCalls map[string]map[string]agenttypes.ToolCall
+	activePending    map[string]bool
 	now              func() time.Time
 	idleInterval     time.Duration
 	idleFor          time.Duration
@@ -172,6 +174,14 @@ type AgentBinding struct {
 	ProviderState            string `json:"provider_state"`
 }
 
+// PendingTurn is an atomic snapshot of a streamed turn that has not yet been
+// promoted to the regular exchange logs.
+type PendingTurn struct {
+	User  Exchange      `json:"user"`
+	Agent Exchange      `json:"agent"`
+	Aux   []ExchangeAux `json:"aux,omitempty"`
+}
+
 const ProviderStateLegacyUnbound = "legacy_unbound"
 
 type ListOptions struct {
@@ -187,6 +197,7 @@ func NewManager(root fs.RootInfo, opts ...Option) *Manager {
 		root:             root,
 		sessions:         make(map[string]*Session),
 		pendingToolCalls: make(map[string]map[string]agenttypes.ToolCall),
+		activePending:    make(map[string]bool),
 		now:              time.Now,
 		idleInterval:     1 * time.Minute,
 		idleFor:          10 * time.Minute,
@@ -272,7 +283,60 @@ func (m *Manager) Create(_ context.Context, input CreateInput) (*Session, error)
 func (m *Manager) Get(_ context.Context, key string, afterSeq int) (*Session, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if !m.activePending[key] {
+		if err := m.recoverPendingTurnUnsafe(key); err != nil {
+			return nil, err
+		}
+	}
 	return m.getSessionUnsafe(key, afterSeq)
+}
+
+func (m *Manager) StartPendingTurn(_ context.Context, session *Session, user, agent Exchange) error {
+	if session == nil || strings.TrimSpace(session.Key) == "" {
+		return errors.New("session required")
+	}
+	if user.Seq <= 0 || agent.Seq != user.Seq+1 {
+		return errors.New("invalid pending turn sequence")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.activePending[session.Key] {
+		return errors.New("pending turn already active")
+	}
+	if err := m.writePendingTurnUnsafe(session.Key, PendingTurn{User: user, Agent: agent}); err != nil {
+		return err
+	}
+	m.activePending[session.Key] = true
+	return nil
+}
+
+func (m *Manager) UpdatePendingTurn(_ context.Context, sessionKey, agentContent string, aux []ExchangeAux) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	pending, err := m.readPendingTurnUnsafe(sessionKey)
+	if err != nil || pending == nil {
+		return err
+	}
+	pending.Agent.Content = agentContent
+	pending.Agent.Timestamp = m.now().UTC()
+	pending.Aux = append([]ExchangeAux(nil), aux...)
+	return m.writePendingTurnUnsafe(sessionKey, *pending)
+}
+
+func (m *Manager) CompletePendingTurn(_ context.Context, sessionKey string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	err := m.recoverPendingTurnUnsafe(sessionKey)
+	delete(m.activePending, sessionKey)
+	return err
+}
+
+// ReleasePendingTurn allows a failed or canceled live turn to be recovered by
+// the next session access without discarding its durable snapshot.
+func (m *Manager) ReleasePendingTurn(_ context.Context, sessionKey string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.activePending, sessionKey)
 }
 
 func (m *Manager) GetExchangeAux(_ context.Context, key string, afterSeq int) (map[int][]ExchangeAux, error) {
@@ -1527,6 +1591,155 @@ func (m *Manager) appendExchange(key string, exchange Exchange) error {
 		return err
 	}
 	return nil
+}
+
+func (m *Manager) pendingPath(key string) (string, error) {
+	if _, err := m.exchangePath(key); err != nil {
+		return "", err
+	}
+	return filepath.ToSlash(fmt.Sprintf(pendingFileTpl, key)), nil
+}
+
+func (m *Manager) readPendingTurnUnsafe(key string) (*PendingTurn, error) {
+	path, err := m.pendingPath(key)
+	if err != nil {
+		return nil, err
+	}
+	payload, err := m.root.ReadMetaFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var pending PendingTurn
+	if err := json.Unmarshal(payload, &pending); err != nil {
+		return nil, err
+	}
+	if pending.User.Seq <= 0 || pending.Agent.Seq != pending.User.Seq+1 {
+		return nil, errors.New("invalid pending turn")
+	}
+	return &pending, nil
+}
+
+func (m *Manager) writePendingTurnUnsafe(key string, pending PendingTurn) error {
+	path, err := m.pendingPath(key)
+	if err != nil {
+		return err
+	}
+	payload, err := json.Marshal(pending)
+	if err != nil {
+		return err
+	}
+	return m.root.WriteMetaFile(path, payload)
+}
+
+func (m *Manager) removePendingTurnUnsafe(key string) error {
+	path, err := m.pendingPath(key)
+	if err != nil {
+		return err
+	}
+	metaDir, err := m.root.EnsureMetaDir()
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(filepath.Join(metaDir, filepath.FromSlash(path))); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+func (m *Manager) recoverPendingTurnUnsafe(key string) error {
+	pending, err := m.readPendingTurnUnsafe(key)
+	if err != nil || pending == nil {
+		return err
+	}
+	current, err := m.getSessionUnsafe(key, 0)
+	if err != nil {
+		return err
+	}
+	if len(current.Exchanges) > pending.Agent.Seq {
+		return m.removePendingTurnUnsafe(key)
+	}
+	if len(current.Exchanges) < pending.User.Seq {
+		if len(current.Exchanges)+1 != pending.User.Seq {
+			return errors.New("pending turn sequence does not match session")
+		}
+		if err := m.appendExchange(key, pending.User); err != nil {
+			return err
+		}
+		current.Exchanges = append(current.Exchanges, pending.User)
+	}
+	if len(current.Exchanges) < pending.Agent.Seq {
+		if len(current.Exchanges)+1 != pending.Agent.Seq {
+			return errors.New("pending agent sequence does not match session")
+		}
+		if err := m.appendExchange(key, pending.Agent); err != nil {
+			return err
+		}
+		current.Exchanges = append(current.Exchanges, pending.Agent)
+	}
+	if !pending.Agent.Timestamp.IsZero() {
+		current.UpdatedAt = pending.Agent.Timestamp
+		if err := m.upsertSessionMetaUnsafe(current); err != nil {
+			return err
+		}
+	}
+	existingAux, err := m.loadExchangeAuxEntries(key, 0)
+	if err != nil {
+		return err
+	}
+	existing := make(map[string]struct{}, len(existingAux))
+	for _, aux := range existingAux {
+		existing[pendingAuxKey(aux)] = struct{}{}
+	}
+	for _, aux := range dedupePendingAux(pending.Aux) {
+		if aux.Seq == 0 {
+			aux.Seq = pending.Agent.Seq
+		}
+		auxKey := pendingAuxKey(aux)
+		if _, ok := existing[auxKey]; ok {
+			continue
+		}
+		if err := m.appendExchangeAux(key, aux); err != nil {
+			return err
+		}
+		existing[auxKey] = struct{}{}
+	}
+	return m.removePendingTurnUnsafe(key)
+}
+
+func dedupePendingAux(items []ExchangeAux) []ExchangeAux {
+	seen := make(map[string]struct{}, len(items))
+	out := make([]ExchangeAux, 0, len(items))
+	for _, item := range items {
+		key := pendingAuxKey(item)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, item)
+	}
+	return out
+}
+
+func pendingAuxKey(item ExchangeAux) string {
+	if item.ToolCall != nil {
+		return fmt.Sprintf("tool:%d:%s:%s", item.Seq, item.ToolCall.CallID, item.ToolCall.Status)
+	}
+	if item.Todo != nil {
+		payload, _ := json.Marshal(item.Todo)
+		return fmt.Sprintf("todo:%d:%s", item.Seq, payload)
+	}
+	if item.Plan != nil {
+		payload, _ := json.Marshal(item.Plan)
+		return fmt.Sprintf("plan:%d:%s", item.Seq, payload)
+	}
+	if item.Compact != nil {
+		payload, _ := json.Marshal(item.Compact)
+		return fmt.Sprintf("compact:%d:%s", item.Seq, payload)
+	}
+	return fmt.Sprintf("thought:%d:%d:%s:%s", item.Seq, item.Line, item.ThoughtID, item.Thought)
 }
 
 func (m *Manager) loadExchangeAux(key string, afterSeq int) (map[int][]ExchangeAux, error) {

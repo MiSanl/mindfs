@@ -141,6 +141,76 @@ func TestManagerCountsProviderBindings(t *testing.T) {
 	}
 }
 
+func TestManagerRecoversPendingTurnAfterRestart(t *testing.T) {
+	root := rootfs.NewRootInfo("pending-recovery", "pending-recovery", t.TempDir())
+	first := newTestManager(t, root)
+	created, err := first.Create(context.Background(), CreateInput{Type: TypeChat, Name: "Pending recovery"})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	now := time.Now().UTC()
+	if err := first.StartPendingTurn(context.Background(), created,
+		Exchange{Seq: 1, Role: "user", Agent: "opencode", Content: "continue", Timestamp: now},
+		Exchange{Seq: 2, Role: "agent", Agent: "opencode", Timestamp: now},
+	); err != nil {
+		t.Fatalf("start pending turn: %v", err)
+	}
+	if err := first.UpdatePendingTurn(context.Background(), created.Key, "partial answer\nwith progress", []ExchangeAux{{Seq: 2, ToolCall: &agenttypes.ToolCall{CallID: "tool-1", Title: "Run tests", Status: "complete"}}}); err != nil {
+		t.Fatalf("update pending turn: %v", err)
+	}
+	if err := first.Shutdown(); err != nil {
+		t.Fatalf("shutdown first manager: %v", err)
+	}
+
+	second := newTestManager(t, root)
+	recovered, err := second.Get(context.Background(), created.Key, 0)
+	if err != nil {
+		t.Fatalf("reopen session: %v", err)
+	}
+	if len(recovered.Exchanges) != 2 || recovered.Exchanges[0].Content != "continue" || recovered.Exchanges[1].Content != "partial answer\nwith progress" {
+		t.Fatalf("recovered exchanges = %#v", recovered.Exchanges)
+	}
+	aux, err := second.GetExchangeAux(context.Background(), created.Key, 0)
+	if err != nil {
+		t.Fatalf("read recovered aux: %v", err)
+	}
+	if len(aux[2]) != 1 || aux[2][0].ToolCall == nil || aux[2][0].ToolCall.CallID != "tool-1" {
+		t.Fatalf("recovered aux = %#v", aux)
+	}
+	if _, err := root.ReadMetaFile(filepath.ToSlash(filepath.Join("sessions", "pending", created.Key+".json"))); err == nil {
+		t.Fatal("pending file remains after recovery")
+	}
+}
+
+func TestManagerCompletesPendingTurnOnlyOnce(t *testing.T) {
+	root := rootfs.NewRootInfo("pending-complete", "pending-complete", t.TempDir())
+	manager := newTestManager(t, root)
+	created, err := manager.Create(context.Background(), CreateInput{Type: TypeChat, Name: "Pending complete"})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	now := time.Now().UTC()
+	if err := manager.StartPendingTurn(context.Background(), created,
+		Exchange{Seq: 1, Role: "user", Agent: "opencode", Content: "hello", Timestamp: now},
+		Exchange{Seq: 2, Role: "agent", Agent: "opencode", Content: "world", Timestamp: now},
+	); err != nil {
+		t.Fatalf("start pending turn: %v", err)
+	}
+	if err := manager.CompletePendingTurn(context.Background(), created.Key); err != nil {
+		t.Fatalf("complete pending turn: %v", err)
+	}
+	if err := manager.CompletePendingTurn(context.Background(), created.Key); err != nil {
+		t.Fatalf("complete pending turn twice: %v", err)
+	}
+	loaded, err := manager.Get(context.Background(), created.Key, 0)
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+	if len(loaded.Exchanges) != 2 {
+		t.Fatalf("exchange count = %d, want 2", len(loaded.Exchanges))
+	}
+}
+
 func TestOpenSessionMetaDBMigratesLegacyAgentBindings(t *testing.T) {
 	dbFile := filepath.Join(t.TempDir(), "session-list.db")
 	db, err := sql.Open("sqlite", dbFile)
