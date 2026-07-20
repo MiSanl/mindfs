@@ -189,6 +189,43 @@ func TestValidateAgentModelForProviderDoesNotUseGlobalSelection(t *testing.T) {
 	}
 }
 
+func TestResolveSessionSettingsForAgentDoesNotReuseAnotherAgent(t *testing.T) {
+	current := &session.Session{
+		Model: "claude-global",
+		Exchanges: []session.Exchange{
+			{Agent: "claude", Model: "claude-3-7", Mode: "plan", Effort: "high", FastService: "on"},
+			{Agent: "codex", Model: "gpt-5.5", Mode: "code", Effort: "medium", FastService: "off"},
+		},
+	}
+	if got := resolveSessionExchangeModelForAgent(current, "claude"); got != "claude-3-7" {
+		t.Fatalf("claude model = %q", got)
+	}
+	if got := resolveSessionExchangeModeForAgent(current, "claude"); got != "plan" {
+		t.Fatalf("claude mode = %q", got)
+	}
+	if got := resolveSessionExchangeEffortForAgent(current, "claude"); got != "high" {
+		t.Fatalf("claude effort = %q", got)
+	}
+	if got := resolveSessionExchangeFastServiceForAgent(current, "claude"); got != "on" {
+		t.Fatalf("claude fast service = %q", got)
+	}
+	if got := resolveRuntimeModel("opencode", current, nil, ""); got != "" {
+		t.Fatalf("new agent inherited model = %q", got)
+	}
+	if got := resolveRuntimeMode("opencode", current, ""); got != "" {
+		t.Fatalf("new agent inherited mode = %q", got)
+	}
+	if got := resolveRuntimeModel("codex", current, nil, ""); got != "gpt-5.5" {
+		t.Fatalf("codex fallback model = %q", got)
+	}
+	if got := resolveRuntimeEffort("opencode", current, ""); got != "" {
+		t.Fatalf("new agent inherited effort = %q", got)
+	}
+	if got := resolveRuntimeFastService("codex", current, ""); got != "off" {
+		t.Fatalf("codex fast service = %q", got)
+	}
+}
+
 // stubValidateRegistry implements Registry with only GetProber/GetPreferences meaningful.
 type stubValidateRegistry struct {
 	prober *agent.Prober

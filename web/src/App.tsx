@@ -5932,34 +5932,27 @@ export function App({ onGoHome }: AppProps) {
       if (sendSessionKey && session) {
         const targetSessionKey = sendSessionKey;
         const previousAgent = session.agent || "";
-        const useTargetSessionDefaults =
-          !!currentBoundSessionKey && currentBoundSessionKey !== targetSessionKey;
         effectiveMode = normalizeMode(session.type as any);
-        effectiveAgent =
-          (useTargetSessionDefaults ? previousAgent : agent) ||
-          previousAgent ||
-          "";
+        // The action bar selection is the source of truth for this send. A
+        // viewed session may differ from the previously bound drawer session.
+        effectiveAgent = agent || previousAgent || "";
         effectiveModel =
-          (useTargetSessionDefaults ? session.model || "" : model) ||
+          model ||
           (effectiveAgent === previousAgent ? session.model || "" : "");
         effectiveAgentMode =
-          (useTargetSessionDefaults ? (session as any).mode || "" : agentMode) ||
+          agentMode ||
           (effectiveAgent === previousAgent ? (session as any).mode || "" : "");
         effectiveEffort =
-          (useTargetSessionDefaults ? (session as any).effort || "" : effort) ||
+          effort ||
           (effectiveAgent === previousAgent ? (session as any).effort || "" : "");
         effectiveFastService =
-          (useTargetSessionDefaults
-            ? (((session as any).fast_service || "") as "" | "on" | "off")
-            : ((fastService || "") as "" | "on" | "off")) ||
+          ((fastService || "") as "" | "on" | "off") ||
           (effectiveAgent === previousAgent
             ? (((session as any).fast_service || "") as "" | "on" | "off")
             : "");
         effectiveShell =
           effectiveMode === "command"
-            ? ((useTargetSessionDefaults ? (session as any).shell || "" : shell) ||
-                (session as any).shell ||
-                "")
+            ? (shell || (session as any).shell || "")
             : "";
         updateSessionAgentForKey(
           activeRoot,

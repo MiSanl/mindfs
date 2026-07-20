@@ -1711,8 +1711,8 @@ func (s *Service) ensureAgentSession(
 	if providerConfig != nil {
 		providerRuntimeKey = agentName + ":" + providerConfig.ID + ":" + providerConfig.Revision
 	}
-	nextModel := resolveRuntimeModel(current, nil, model)
-	nextMode := resolveRuntimeMode(current, mode)
+	nextModel := resolveRuntimeModel(agentName, current, nil, model)
+	nextMode := resolveRuntimeMode(agentName, current, mode)
 	nextEffort := resolveRuntimeEffort(agentName, current, effort)
 	nextFastService := resolveRuntimeFastService(agentName, current, fastService)
 	nextPlanMode := current != nil && current.PlanMode
@@ -1722,13 +1722,13 @@ func (s *Service) ensureAgentSession(
 	currentFastService := ""
 	currentPlanMode := false
 	if current != nil {
-		currentModel = resolveSessionExchangeModel(current)
-		if currentModel == "" {
+		currentModel = resolveSessionExchangeModelForAgent(current, agentName)
+		if currentModel == "" && strings.TrimSpace(session.InferAgentFromSession(current)) == strings.TrimSpace(agentName) {
 			currentModel = strings.TrimSpace(current.Model)
 		}
-		currentMode = resolveSessionExchangeMode(current)
-		currentEffort = session.InferEffortFromSession(current)
-		currentFastService = inferFastServiceFromSession(current)
+		currentMode = resolveRuntimeMode(agentName, current, mode)
+		currentEffort = resolveSessionExchangeEffortForAgent(current, agentName)
+		currentFastService = resolveSessionExchangeFastServiceForAgent(current, agentName)
 		currentPlanMode = current.PlanMode
 	}
 	if existing, ok := pool.Get(poolSessionKey); ok && (providerRuntimeKey == "" || pool.RuntimeKey(poolSessionKey) == providerRuntimeKey) {
@@ -1989,7 +1989,7 @@ func shouldReopenSessionForSetting(pool *agent.Pool, agentName, currentValue, ne
 	return protocol == agent.ProtocolCodexSDK || protocol == agent.ProtocolClaudeSDK
 }
 
-func resolveRuntimeModel(current *session.Session, runtime agenttypes.Session, requested string) string {
+func resolveRuntimeModel(agentName string, current *session.Session, runtime agenttypes.Session, requested string) string {
 	if model := strings.TrimSpace(requested); model != "" {
 		return model
 	}
@@ -1998,10 +1998,10 @@ func resolveRuntimeModel(current *session.Session, runtime agenttypes.Session, r
 			return model
 		}
 	}
-	if model := resolveSessionExchangeModel(current); model != "" {
+	if model := resolveSessionExchangeModelForAgent(current, agentName); model != "" {
 		return model
 	}
-	if current == nil {
+	if current == nil || strings.TrimSpace(session.InferAgentFromSession(current)) != strings.TrimSpace(agentName) {
 		return ""
 	}
 	return strings.TrimSpace(current.Model)
@@ -2029,11 +2029,11 @@ func (s *Service) resolveExchangeModelDisplayName(agentName, model string) strin
 	return ""
 }
 
-func resolveRuntimeEffort(_ string, current *session.Session, requested string) string {
+func resolveRuntimeEffort(agentName string, current *session.Session, requested string) string {
 	if effort := strings.TrimSpace(requested); effort != "" {
 		return effort
 	}
-	if effort := session.InferEffortFromSession(current); effort != "" {
+	if effort := resolveSessionExchangeEffortForAgent(current, agentName); effort != "" {
 		return effort
 	}
 	return ""
@@ -2046,28 +2046,36 @@ func resolveRuntimeFastService(agentName string, current *session.Session, reque
 	if value := strings.TrimSpace(requested); value != "" {
 		return value
 	}
-	return inferFastServiceFromSession(current)
+	return resolveSessionExchangeFastServiceForAgent(current, agentName)
 }
 
 func inferFastServiceFromSession(current *session.Session) string {
 	return session.InferFastServiceFromSession(current)
 }
 
-func resolveRuntimeMode(current *session.Session, requested string) string {
+func resolveRuntimeMode(agentName string, current *session.Session, requested string) string {
 	if mode := strings.TrimSpace(requested); mode != "" {
 		return mode
 	}
-	if mode := resolveSessionExchangeMode(current); mode != "" {
+	if mode := resolveSessionExchangeModeForAgent(current, agentName); mode != "" {
 		return mode
 	}
 	return ""
 }
 
 func resolveSessionExchangeModel(current *session.Session) string {
+	return resolveSessionExchangeModelForAgent(current, "")
+}
+
+func resolveSessionExchangeModelForAgent(current *session.Session, agentName string) string {
 	if current == nil || len(current.Exchanges) == 0 {
 		return ""
 	}
+	agentName = strings.TrimSpace(agentName)
 	for i := len(current.Exchanges) - 1; i >= 0; i-- {
+		if agentName != "" && strings.TrimSpace(current.Exchanges[i].Agent) != agentName {
+			continue
+		}
 		model := strings.TrimSpace(current.Exchanges[i].Model)
 		if model != "" {
 			return model
@@ -2077,13 +2085,53 @@ func resolveSessionExchangeModel(current *session.Session) string {
 }
 
 func resolveSessionExchangeMode(current *session.Session) string {
+	return resolveSessionExchangeModeForAgent(current, "")
+}
+
+func resolveSessionExchangeModeForAgent(current *session.Session, agentName string) string {
 	if current == nil || len(current.Exchanges) == 0 {
 		return ""
 	}
+	agentName = strings.TrimSpace(agentName)
 	for i := len(current.Exchanges) - 1; i >= 0; i-- {
+		if agentName != "" && strings.TrimSpace(current.Exchanges[i].Agent) != agentName {
+			continue
+		}
 		mode := strings.TrimSpace(current.Exchanges[i].Mode)
 		if mode != "" {
 			return mode
+		}
+	}
+	return ""
+}
+
+func resolveSessionExchangeEffortForAgent(current *session.Session, agentName string) string {
+	if current == nil || len(current.Exchanges) == 0 {
+		return ""
+	}
+	agentName = strings.TrimSpace(agentName)
+	for i := len(current.Exchanges) - 1; i >= 0; i-- {
+		if agentName != "" && strings.TrimSpace(current.Exchanges[i].Agent) != agentName {
+			continue
+		}
+		if effort := strings.TrimSpace(current.Exchanges[i].Effort); effort != "" {
+			return effort
+		}
+	}
+	return ""
+}
+
+func resolveSessionExchangeFastServiceForAgent(current *session.Session, agentName string) string {
+	if current == nil || len(current.Exchanges) == 0 {
+		return ""
+	}
+	agentName = strings.TrimSpace(agentName)
+	for i := len(current.Exchanges) - 1; i >= 0; i-- {
+		if agentName != "" && strings.TrimSpace(current.Exchanges[i].Agent) != agentName {
+			continue
+		}
+		if fastService := strings.TrimSpace(current.Exchanges[i].FastService); fastService != "" {
+			return fastService
 		}
 	}
 	return ""
@@ -2139,7 +2187,7 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 	if err != nil {
 		return err
 	}
-	resolvedRequestedModel := resolveRuntimeModel(current, nil, in.Model)
+	resolvedRequestedModel := resolveRuntimeModel(in.Agent, current, nil, in.Model)
 	if err := s.validateAgentModelForProvider(in.Agent, resolvedRequestedModel, providerConfig); err != nil {
 		log.Printf("[session/model] validate.error root=%s session=%s agent=%s model=%q err=%v", in.RootID, in.Key, strings.TrimSpace(in.Agent), strings.TrimSpace(in.Model), err)
 		return err
@@ -2177,8 +2225,8 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 		RuntimeRootAbs: rootAbs,
 		IsInitial:      isInitial,
 	})
-	resolvedMode := resolveRuntimeMode(current, in.Mode)
-	resolvedModel := resolveRuntimeModel(current, sess, in.Model)
+	resolvedMode := resolveRuntimeMode(in.Agent, current, in.Mode)
+	resolvedModel := resolveRuntimeModel(in.Agent, current, sess, in.Model)
 	resolvedEffort := resolveRuntimeEffort(in.Agent, current, in.Effort)
 	resolvedFastService := resolveRuntimeFastService(in.Agent, current, in.FastService)
 	modelDisplayName := s.resolveExchangeModelDisplayName(in.Agent, resolvedModel)
