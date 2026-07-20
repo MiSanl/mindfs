@@ -164,7 +164,7 @@ func TestStreamHubFrozenQueueBlocksAutomaticPopUntilUnfrozen(t *testing.T) {
 		},
 	})
 
-	frozenQueue, frozen := hub.FreezeQueuedSessionMessages(sessionKey)
+	frozenQueue, _, frozen := hub.FreezeQueuedSessionMessages(sessionKey)
 	if !frozen {
 		t.Fatal("expected queue freeze to succeed")
 	}
@@ -207,7 +207,7 @@ func TestStreamHubUnfreezeQueueAllowsAutomaticPop(t *testing.T) {
 			Timestamp: time.Now().UTC(),
 		},
 	})
-	_, frozen := hub.FreezeQueuedSessionMessages(sessionKey)
+	_, _, frozen := hub.FreezeQueuedSessionMessages(sessionKey)
 	if !frozen {
 		t.Fatal("expected queue freeze to succeed")
 	}
@@ -228,6 +228,29 @@ func TestStreamHubUnfreezeQueueAllowsAutomaticPop(t *testing.T) {
 	}
 	if len(queue) != 0 {
 		t.Fatalf("expected empty queue, got %#v", queue)
+	}
+}
+
+func TestStreamHubFreezeGenerationDoesNotReleaseNewerFreeze(t *testing.T) {
+	hub := NewStreamHub(nil)
+	sessionKey := "session"
+	hub.EnqueueSessionMessage("root", sessionKey, "Session", QueuedUserMessage{ID: "first"})
+	_, firstFreeze, ok := hub.FreezeQueuedSessionMessages(sessionKey)
+	if !ok {
+		t.Fatal("expected initial freeze")
+	}
+	if _, changed := hub.UnfreezeQueuedSessionMessages(sessionKey); !changed {
+		t.Fatal("expected initial unfreeze")
+	}
+	_, secondFreeze, ok := hub.FreezeQueuedSessionMessages(sessionKey)
+	if !ok || secondFreeze == firstFreeze {
+		t.Fatalf("freeze ids = %d, %d", firstFreeze, secondFreeze)
+	}
+	if _, changed := hub.UnfreezeQueuedSessionMessagesIfCurrent(sessionKey, firstFreeze); changed {
+		t.Fatal("stale freeze must not release newer freeze")
+	}
+	if !hub.IsQueueFreezeCurrent(sessionKey, secondFreeze) {
+		t.Fatal("newer freeze should remain current")
 	}
 }
 

@@ -36,6 +36,8 @@ const (
 
 var upgrader = websocket.Upgrader{}
 
+const sessionQueueFreezeTimeout = 30 * time.Second
+
 // WSHandler manages JSON-RPC over WebSocket.
 type WSHandler struct {
 	AppContext      *AppContext
@@ -918,8 +920,20 @@ func (h *WSHandler) runSessionMessage(job sessionMessageJob) {
 	// Always clear replying state (via BroadcastSessionDone -> ClearSessionPending)
 	// so a failed/empty turn does not leave the session permanently "generating"
 	// and force subsequent messages into the queue.
-	h.AppContext.BroadcastSessionDone(rootID, key, requestID)
+	h.finishSessionMessage(rootID, key, requestID)
 	h.startNextQueuedSessionMessage(rootID, key)
+}
+
+func (h *WSHandler) finishSessionMessage(rootID, key, requestID string) {
+	if h == nil || h.AppContext == nil {
+		return
+	}
+	streamHub := h.AppContext.GetSessionStreamHub()
+	if queue, changed := streamHub.UnfreezeQueuedSessionMessages(key); changed {
+		log.Printf("[ws] session.queue.unfreeze root=%s session=%s reason=turn_done", rootID, key)
+		streamHub.BroadcastSessionQueueUpdated(rootID, key, queue)
+	}
+	h.AppContext.BroadcastSessionDone(rootID, key, requestID)
 }
 
 func (h *WSHandler) startNextQueuedSessionMessage(rootID, key string) {
@@ -987,9 +1001,12 @@ func (h *WSHandler) handleSessionCancel(ctx context.Context, conn *websocket.Con
 	log.Printf("[ws] session.cancel root=%s session=%s request=%s", rootID, key, req.ID)
 
 	streamHub := h.AppContext.GetSessionStreamHub()
-	if queue, ok := streamHub.FreezeQueuedSessionMessages(key); ok {
-		log.Printf("[ws] session.queue.freeze root=%s session=%s request=%s", rootID, key, req.ID)
-		streamHub.BroadcastSessionQueueUpdated(rootID, key, queue)
+	if usecase.HasActiveSessionTurn(rootID, key) {
+		if queue, freezeID, ok := streamHub.FreezeQueuedSessionMessages(key); ok {
+			log.Printf("[ws] session.queue.freeze root=%s session=%s request=%s", rootID, key, req.ID)
+			streamHub.BroadcastSessionQueueUpdated(rootID, key, queue)
+			h.scheduleFrozenQueueRecovery(rootID, key, req.ID, freezeID)
+		}
 	}
 
 	uc := &usecase.Service{Registry: h.AppContext}
@@ -1004,6 +1021,34 @@ func (h *WSHandler) handleSessionCancel(ctx context.Context, conn *websocket.Con
 		h.sendWSError(conn, clientID, req.ID, "session.cancel_failed", err.Error())
 		return
 	}
+}
+
+func (h *WSHandler) scheduleFrozenQueueRecovery(rootID, key, requestID string, freezeID uint64) {
+	if h == nil || h.AppContext == nil {
+		return
+	}
+	time.AfterFunc(sessionQueueFreezeTimeout, func() {
+		if h == nil || h.AppContext == nil {
+			return
+		}
+		streamHub := h.AppContext.GetSessionStreamHub()
+		if !streamHub.IsQueueFreezeCurrent(key, freezeID) {
+			return
+		}
+		log.Printf("[ws] session.queue.freeze_timeout root=%s session=%s request=%s", rootID, key, requestID)
+		uc := &usecase.Service{Registry: h.AppContext}
+		if err := uc.ForceCancelSessionTurn(context.Background(), usecase.CancelSessionTurnInput{RootID: rootID, Key: key}); err != nil {
+			log.Printf("[ws] session.queue.force_cancel.error root=%s session=%s request=%s err=%v", rootID, key, requestID, err)
+		}
+		if queue, changed := streamHub.UnfreezeQueuedSessionMessagesIfCurrent(key, freezeID); changed {
+			log.Printf("[ws] session.queue.unfreeze root=%s session=%s reason=cancel_timeout", rootID, key)
+			streamHub.BroadcastSessionQueueUpdated(rootID, key, queue)
+		}
+		if streamHub.IsSessionReplying(key) {
+			h.AppContext.BroadcastSessionDone(rootID, key, requestID)
+		}
+		h.startNextQueuedSessionMessage(rootID, key)
+	})
 }
 
 func (h *WSHandler) handleSessionQueueRemove(_ context.Context, conn *websocket.Conn, clientID string, req WSRequest) {

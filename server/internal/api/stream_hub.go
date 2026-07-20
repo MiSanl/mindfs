@@ -51,6 +51,7 @@ type SessionPendingState struct {
 	SessionTitle string
 	Active       bool
 	QueueFrozen  bool
+	FreezeID     uint64
 	User         *PendingUserMessage
 	Queue        []QueuedUserMessage
 	ReplyingList []StreamEvent
@@ -470,19 +471,20 @@ func (h *StreamHub) UpdateQueuedSessionMessage(sessionKey, queueID, content stri
 	return cloneQueue(state.Queue)
 }
 
-func (h *StreamHub) FreezeQueuedSessionMessages(sessionKey string) ([]QueuedUserMessage, bool) {
+func (h *StreamHub) FreezeQueuedSessionMessages(sessionKey string) ([]QueuedUserMessage, uint64, bool) {
 	if blank(sessionKey) {
-		return nil, false
+		return nil, 0, false
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	state := h.pendingSessions[sessionKey]
 	if state == nil || len(state.Queue) == 0 {
-		return nil, false
+		return nil, 0, false
 	}
 	state.QueueFrozen = true
+	state.FreezeID++
 	state.UpdatedAt = time.Now().UTC()
-	return cloneQueue(state.Queue), true
+	return cloneQueue(state.Queue), state.FreezeID, true
 }
 
 func (h *StreamHub) UnfreezeQueuedSessionMessages(sessionKey string) ([]QueuedUserMessage, bool) {
@@ -501,6 +503,31 @@ func (h *StreamHub) UnfreezeQueuedSessionMessages(sessionKey string) ([]QueuedUs
 	state.QueueFrozen = false
 	state.UpdatedAt = time.Now().UTC()
 	return cloneQueue(state.Queue), true
+}
+
+func (h *StreamHub) UnfreezeQueuedSessionMessagesIfCurrent(sessionKey string, freezeID uint64) ([]QueuedUserMessage, bool) {
+	if blank(sessionKey) || freezeID == 0 {
+		return nil, false
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	state := h.pendingSessions[sessionKey]
+	if state == nil || !state.QueueFrozen || state.FreezeID != freezeID {
+		return nil, false
+	}
+	state.QueueFrozen = false
+	state.UpdatedAt = time.Now().UTC()
+	return cloneQueue(state.Queue), true
+}
+
+func (h *StreamHub) IsQueueFreezeCurrent(sessionKey string, freezeID uint64) bool {
+	if blank(sessionKey) || freezeID == 0 {
+		return false
+	}
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	state := h.pendingSessions[sessionKey]
+	return state != nil && state.QueueFrozen && state.FreezeID == freezeID
 }
 
 func (h *StreamHub) PopQueuedSessionMessage(sessionKey, queueID string) (QueuedUserMessage, []QueuedUserMessage, bool) {

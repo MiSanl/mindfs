@@ -1202,6 +1202,12 @@ func getActiveTurn(rootID, sessionKey string) *activeTurnState {
 	return activeTurns[activeTurnKey(rootID, sessionKey)]
 }
 
+// HasActiveSessionTurn reports whether a live SendMessage call still owns this
+// session. Queue cancellation uses it to avoid freezing an already-idle queue.
+func HasActiveSessionTurn(rootID, sessionKey string) bool {
+	return getActiveTurn(rootID, sessionKey) != nil
+}
+
 func agentPoolSessionKey(sessionKey, agentName string) string {
 	trimmedSessionKey := strings.TrimSpace(sessionKey)
 	if trimmedSessionKey == "" {
@@ -4050,5 +4056,18 @@ func (s *Service) CancelSessionTurn(ctx context.Context, in CancelSessionTurnInp
 		return nil
 	}
 	active.cancel()
+	return nil
+}
+
+// ForceCancelSessionTurn cancels the Go turn context after the runtime cancel
+// grace period has elapsed. It is only used by the queue recovery watchdog.
+func (s *Service) ForceCancelSessionTurn(ctx context.Context, in CancelSessionTurnInput) error {
+	if err := s.CancelSessionTurn(ctx, in); err != nil {
+		return err
+	}
+	active := getActiveTurn(in.RootID, strings.TrimSpace(in.Key))
+	if active != nil {
+		active.cancel()
+	}
 	return nil
 }
