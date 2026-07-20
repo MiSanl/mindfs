@@ -5176,10 +5176,12 @@ export function App({ onGoHome }: AppProps) {
           typeof (fullSession as any)?.pending === "boolean"
             ? !!(fullSession as any).pending
             : undefined;
+        // A session fetch can race an active local turn. Server snapshots do
+        // not include the in-memory turn, so a false server value must not
+        // hide the cancel control or discard the optimistic pending state.
         const pending =
-          serverPending !== undefined
-            ? serverPending
-            : resolvePendingForSession(targetRoot, key, preservePending);
+          resolvePendingForSession(targetRoot, key, preservePending) ||
+          serverPending === true;
         const normalized = {
           ...(fullSession as any),
           key,
@@ -5549,9 +5551,38 @@ export function App({ onGoHome }: AppProps) {
           reportError("session.sync_failed", t("session.syncFailed"));
           return;
         }
+        // Streams can arrive while the HTTP sync is in flight, so use the
+        // most recent local state when merging the response.
+        const localSession = sessionCacheRef.current[cacheKey];
+        const localPending = resolvePendingForSession(
+          rootID,
+          sessionKey,
+          !!(session as any)?.pending,
+        );
+        const syncedExchanges = Array.isArray((synced as any)?.exchanges)
+          ? ((synced as any).exchanges as Exchange[])
+          : [];
+        const localPendingExchanges = Array.isArray((localSession as any)?.exchanges)
+          ? ((localSession as any).exchanges as Exchange[]).filter(
+              (exchange) => exchange?.pending_ack === true,
+            )
+          : [];
+        const pendingExchanges = localPendingExchanges.filter(
+          (localExchange) =>
+            !syncedExchanges.some(
+              (syncedExchange) =>
+                syncedExchange.role === localExchange.role &&
+                syncedExchange.content === localExchange.content &&
+                syncedExchange.timestamp === localExchange.timestamp,
+            ),
+        );
         const normalized = {
           ...(synced as any),
           key: sessionKey,
+          // Do not let a disk-only sync clear a turn that is still active in
+          // this browser. session.done/error remains the terminal authority.
+          pending: localPending || (synced as any)?.pending === true,
+          exchanges: [...syncedExchanges, ...pendingExchanges],
         } as Session;
         sessionCacheRef.current[cacheKey] = normalized;
         loadedSessionRef.current[cacheKey] = true;
@@ -5598,6 +5629,7 @@ export function App({ onGoHome }: AppProps) {
       bumpCacheVersion,
       clearSessionStale,
       mergeSessionItems,
+      resolvePendingForSession,
       rootSessionKey,
       setDrawerSessionForRoot,
     ],
