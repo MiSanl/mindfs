@@ -1706,6 +1706,8 @@ func TestIsNonRecoverableAgentError(t *testing.T) {
 		{errors.New("remote compaction failed while compact_remote retried"), true},
 		{errors.New("usageLimitExceeded"), true},
 		{errors.New("responseTooManyFailedAttempts"), true},
+		{errors.New("agent peer disconnected"), true},
+		{errors.New("connection reset by peer"), true},
 		{errors.New("temporary websocket EOF"), false},
 		{context.Canceled, false},
 	}

@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"net/url"
@@ -908,7 +909,7 @@ func (h *WSHandler) runSessionMessage(job sessionMessageJob) {
 			tracker.End()
 		},
 	})
-	if err != nil {
+	if err != nil && !isCanceledSessionTurnError(err) {
 		log.Printf("[ws] session.message.error root=%s session=%s request=%s err=%v", rootID, key, requestID, err)
 		// Include request_id so the optimistic "sending" bubble can clear.
 		h.AppContext.BroadcastSessionErrorWithRequest(rootID, key, requestID, err.Error())
@@ -922,6 +923,18 @@ func (h *WSHandler) runSessionMessage(job sessionMessageJob) {
 	// and force subsequent messages into the queue.
 	h.finishSessionMessage(rootID, key, requestID)
 	h.startNextQueuedSessionMessage(rootID, key)
+}
+
+func isCanceledSessionTurnError(err error) bool {
+	if err == nil {
+		return false
+	}
+	value := strings.ToLower(strings.TrimSpace(err.Error()))
+	return errors.Is(err, context.Canceled) ||
+		strings.Contains(value, "context canceled") ||
+		strings.Contains(value, "context cancelled") ||
+		strings.Contains(value, "turn canceled") ||
+		strings.Contains(value, "turn cancelled")
 }
 
 func (h *WSHandler) finishSessionMessage(rootID, key, requestID string) {

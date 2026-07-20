@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -141,6 +142,21 @@ func TestTurnUpdateTrackerWaitIdleTimesOutWhenUpdateNeverEnds(t *testing.T) {
 
 	if tracker.WaitIdle(context.Background(), 10*time.Millisecond, 30*time.Millisecond) {
 		t.Fatal("expected WaitIdle to time out while update remains in-flight")
+	}
+}
+
+func TestIsCanceledSessionTurnError(t *testing.T) {
+	for _, err := range []error{
+		context.Canceled,
+		errors.New("turn canceled"),
+		errors.New("context cancelled by caller"),
+	} {
+		if !isCanceledSessionTurnError(err) {
+			t.Fatalf("expected canceled error: %v", err)
+		}
+	}
+	if isCanceledSessionTurnError(errors.New("peer disconnected")) {
+		t.Fatal("disconnect must be reported as a failure")
 	}
 }
 

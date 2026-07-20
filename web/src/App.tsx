@@ -40,7 +40,7 @@ import {
   protectedAPIReady,
   protectedJSON as apiProtectedJSON,
 } from "./services/api";
-import { reportError } from "./services/error";
+import { reportError, type ErrorCode } from "./services/error";
 import {
   fetchFile,
   clearFileCacheForRoot,
@@ -168,6 +168,31 @@ function formatDocumentTitle(relayStatus: RelayStatusPayload | null): string {
 
 function isTopLevelSessionItem(session: SessionItem): boolean {
   return !String(session?.parent_session_key || "").trim();
+}
+
+function isCanceledSessionError(message: string): boolean {
+  const normalized = message.trim().toLowerCase();
+  return (
+    normalized.includes("turn canceled") ||
+    normalized.includes("turn cancelled") ||
+    normalized.includes("context canceled") ||
+    normalized.includes("context cancelled")
+  );
+}
+
+function sessionErrorCode(message: string): ErrorCode {
+  const normalized = message.trim().toLowerCase();
+  if (
+    normalized.includes("peer disconnected") ||
+    normalized.includes("connection closed") ||
+    normalized.includes("connection reset") ||
+    normalized.includes("broken pipe") ||
+    normalized.includes("unexpected eof") ||
+    normalized.includes("websocket: close")
+  ) {
+    return "network.disconnected";
+  }
+  return "agent.crashed";
 }
 
 function firstUserInputTemplate(template: TaskTemplate | null): string {
@@ -8947,15 +8972,15 @@ export function App({ onGoHome }: AppProps) {
             typeof event.data?.message === "string" && event.data.message.trim()
               ? event.data.message.trim()
               : t("session.messageSendFailed");
-          // Prefer a generic send/turn failure label; resume_failed was misleading
-          // when the model simply returned an error mid-turn.
-          reportError("session.resume_failed", streamErrorMessage, {
-            details: {
-              rootId: activeRoot,
-              sessionKey: streamKey,
-              eventType: event.type,
-            },
-          });
+          if (!isCanceledSessionError(streamErrorMessage)) {
+            reportError(sessionErrorCode(streamErrorMessage), streamErrorMessage, {
+              details: {
+                rootId: activeRoot,
+                sessionKey: streamKey,
+                eventType: event.type,
+              },
+            });
+          }
           skipCompletionSoundBySessionRef.current[rootSessionKey(activeRoot, streamKey)] = true;
           handleSessionStreamDone(activeRoot, streamKey);
           break;
@@ -9534,15 +9559,17 @@ export function App({ onGoHome }: AppProps) {
           const pending = requestId
             ? pendingRequestRef.current[requestId]
             : null;
-          // Always surface the failure; previously we only cleared state when
-          // request_id still matched an in-memory pending send.
-          reportError("session.resume_failed", errorMessage, {
-            details: {
-              rootId: payloadRootId || pending?.rootId || currentRootIdRef.current,
-              sessionKey: payloadSessionKey || pending?.sessionKey || null,
-              requestId: requestId || null,
-            },
-          });
+          // Always clear state, even after session.accepted removed the local
+          // pending request. Cancellation is a normal terminal outcome.
+          if (!isCanceledSessionError(errorMessage)) {
+            reportError(sessionErrorCode(errorMessage), errorMessage, {
+              details: {
+                rootId: payloadRootId || pending?.rootId || currentRootIdRef.current,
+                sessionKey: payloadSessionKey || pending?.sessionKey || null,
+                requestId: requestId || null,
+              },
+            });
+          }
           if (requestId && pending) {
             console.warn("[session/ws] error", {
               requestId,

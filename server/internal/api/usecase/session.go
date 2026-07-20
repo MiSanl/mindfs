@@ -1473,6 +1473,12 @@ func isNonRecoverableAgentError(err error) bool {
 		"remote compaction failed",
 		"compact_remote",
 		"responsetoomanyfailedattempts",
+		"peer disconnected",
+		"connection closed",
+		"connection reset",
+		"broken pipe",
+		"unexpected eof",
+		"websocket: close",
 	}
 	for _, needle := range needles {
 		if strings.Contains(value, needle) {
