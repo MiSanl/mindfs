@@ -1460,6 +1460,7 @@ export function App({ onGoHome }: AppProps) {
   const pendingDraftRef = useRef<PendingSend | null>(null);
   const pendingBySessionRef = useRef<Record<string, PendingSend>>({});
   const pendingRequestRef = useRef<Record<string, PendingSend>>({});
+  const skipCompletionSoundBySessionRef = useRef<Record<string, boolean>>({});
   const queuedMessagesBySessionRef = useRef<Record<string, SessionQueueItem[]>>({});
   const queueFrozenBySessionRef = useRef<Record<string, boolean>>({});
   const optimisticDequeuedIdsRef = useRef<Record<string, Set<string>>>({});
@@ -8936,20 +8937,24 @@ export function App({ onGoHome }: AppProps) {
           );
           tokenStationRefreshRef.current?.();
           break;
-        case "error":
-          reportError(
-            "session.resume_failed",
-            event.data?.message || t("session.resumeFailed"),
-            {
-              details: {
-                rootId: activeRoot,
-                sessionKey: streamKey,
-                eventType: event.type,
-              },
+        case "error": {
+          const streamErrorMessage =
+            typeof event.data?.message === "string" && event.data.message.trim()
+              ? event.data.message.trim()
+              : t("session.messageSendFailed");
+          // Prefer a generic send/turn failure label; resume_failed was misleading
+          // when the model simply returned an error mid-turn.
+          reportError("session.resume_failed", streamErrorMessage, {
+            details: {
+              rootId: activeRoot,
+              sessionKey: streamKey,
+              eventType: event.type,
             },
-          );
+          });
+          skipCompletionSoundBySessionRef.current[rootSessionKey(activeRoot, streamKey)] = true;
           handleSessionStreamDone(activeRoot, streamKey);
           break;
+        }
       }
     };
     const handleSlashCommandStream = (payload: any) => {
@@ -9506,39 +9511,151 @@ export function App({ onGoHome }: AppProps) {
         }
         case "session.error": {
           const requestId =
-            typeof payload?.request_id === "string" ? payload.request_id : "";
+            typeof payload?.request_id === "string"
+              ? payload.request_id
+              : typeof (payload as any)?.id === "string"
+                ? (payload as any).id
+                : "";
+          const payloadSessionKey =
+            typeof payload?.session_key === "string" ? payload.session_key : "";
+          const payloadRootId =
+            typeof payload?.root_id === "string" ? payload.root_id : "";
+          const errorMessage =
+            typeof payload?.message === "string" && payload.message.trim()
+              ? payload.message.trim()
+              : typeof (payload as any)?.error?.message === "string"
+                ? String((payload as any).error.message)
+                : t("session.messageSendFailed");
           const pending = requestId
             ? pendingRequestRef.current[requestId]
             : null;
-          if (!requestId || !pending) {
-            console.warn("[session/ws] error_without_pending", { requestId, payloadSessionKey: typeof payload?.session_key === "string" ? payload.session_key : null });
-            break;
-          }
-          console.warn("[session/ws] error", { requestId, rootId: pending.rootId, sessionKey: pending.sessionKey || null, tempKey: pending.tempKey || null });
-          delete pendingRequestRef.current[requestId];
-          const targetKey = pending.tempKey || "";
-          const failedKey = pending.sessionKey || targetKey;
-          const rootID = pending.rootId;
-          if (failedKey) {
-            setMultiProjectSessionPending(rootID, failedKey, false);
-          }
-          const latestDrawer = drawerSessionByRootRef.current[rootID];
-          if (targetKey && latestDrawer?.key === targetKey) {
-            const exchanges = Array.isArray((latestDrawer as any).exchanges)
-              ? ((latestDrawer as any).exchanges as Exchange[]).map(
-                  (exchange) =>
-                    exchange.pending_ack === true &&
-                    exchange.content === pending.message &&
-                    exchange.timestamp === pending.timestamp
+          // Always surface the failure; previously we only cleared state when
+          // request_id still matched an in-memory pending send.
+          reportError("session.resume_failed", errorMessage, {
+            details: {
+              rootId: payloadRootId || pending?.rootId || currentRootIdRef.current,
+              sessionKey: payloadSessionKey || pending?.sessionKey || null,
+              requestId: requestId || null,
+            },
+          });
+          if (requestId && pending) {
+            console.warn("[session/ws] error", {
+              requestId,
+              rootId: pending.rootId,
+              sessionKey: pending.sessionKey || null,
+              tempKey: pending.tempKey || null,
+              message: errorMessage,
+            });
+            delete pendingRequestRef.current[requestId];
+            const targetKey = pending.tempKey || "";
+            const failedKey = pending.sessionKey || targetKey || payloadSessionKey;
+            const rootID = pending.rootId || payloadRootId || currentRootIdRef.current || "";
+            if (failedKey && rootID) {
+              setMultiProjectSessionPending(rootID, failedKey, false);
+              handleSessionStreamDone(rootID, failedKey);
+              const cacheKey = rootSessionKey(rootID, failedKey);
+              const clearAck = <T,>(session: T): T => {
+                const exchanges = (session as any)?.exchanges;
+                if (!Array.isArray(exchanges)) {
+                  return session;
+                }
+                return {
+                  ...(session as any),
+                  pending: false,
+                  exchanges: exchanges.map((exchange: any) =>
+                    exchange?.pending_ack === true &&
+                    (!pending.message || exchange.content === pending.message)
                       ? { ...exchange, pending_ack: false }
                       : exchange,
-                )
-              : [];
-            setDrawerSessionForRoot(rootID, {
-              ...(latestDrawer as any),
-              pending: false,
-              exchanges,
-            } as Session);
+                  ),
+                } as T;
+              };
+              if (sessionCacheRef.current[cacheKey]) {
+                sessionCacheRef.current[cacheKey] = clearAck(sessionCacheRef.current[cacheKey]);
+              }
+              const latestDrawer = drawerSessionByRootRef.current[rootID];
+              if (latestDrawer && (latestDrawer.key === failedKey || latestDrawer.key === targetKey)) {
+                setDrawerSessionForRoot(rootID, clearAck(latestDrawer) as Session);
+              }
+              setSelectedSession((prev) => {
+                const prevKey = prev?.key || prev?.session_key;
+                if (!prev || prevKey !== failedKey) {
+                  return prev;
+                }
+                return clearAck(prev) as SessionItem;
+              });
+              setSessions((prev) =>
+                prev.map((item) => {
+                  const itemKey = item.key || item.session_key;
+                  if (itemKey !== failedKey) {
+                    return item;
+                  }
+                  return clearAck(item) as SessionItem;
+                }),
+              );
+              bumpCacheVersion();
+            }
+          } else if (payloadRootId && payloadSessionKey) {
+            console.warn("[session/ws] error_without_pending", {
+              requestId,
+              payloadSessionKey,
+              message: errorMessage,
+            });
+            // Common path: session.accepted already deleted pendingRequestRef, but
+            // we still must clear generating/pending_ack for this session.
+            setMultiProjectSessionPending(payloadRootId, payloadSessionKey, false);
+            handleSessionStreamDone(payloadRootId, payloadSessionKey);
+            const cacheKey = rootSessionKey(payloadRootId, payloadSessionKey);
+            const clearAnyAck = <T,>(session: T): T => {
+              const exchanges = (session as any)?.exchanges;
+              if (!Array.isArray(exchanges)) {
+                return { ...(session as any), pending: false } as T;
+              }
+              return {
+                ...(session as any),
+                pending: false,
+                exchanges: exchanges.map((exchange: any) =>
+                  exchange?.pending_ack === true
+                    ? { ...exchange, pending_ack: false }
+                    : exchange,
+                ),
+              } as T;
+            };
+            if (sessionCacheRef.current[cacheKey]) {
+              sessionCacheRef.current[cacheKey] = clearAnyAck(sessionCacheRef.current[cacheKey]);
+            }
+            const latestDrawer = drawerSessionByRootRef.current[payloadRootId];
+            if (latestDrawer && (latestDrawer.key === payloadSessionKey)) {
+              setDrawerSessionForRoot(payloadRootId, clearAnyAck(latestDrawer) as Session);
+            }
+            setSelectedSession((prev) => {
+              const prevKey = prev?.key || prev?.session_key;
+              if (!prev || prevKey !== payloadSessionKey) return prev;
+              return clearAnyAck(prev) as SessionItem;
+            });
+            setSessions((prev) =>
+              prev.map((item) => {
+                const itemKey = item.key || item.session_key;
+                if (itemKey !== payloadSessionKey) return item;
+                return clearAnyAck(item) as SessionItem;
+              }),
+            );
+            bumpCacheVersion();
+          } else {
+            console.warn("[session/ws] error_without_pending", {
+              requestId,
+              payloadSessionKey,
+              message: errorMessage,
+            });
+          }
+          {
+            const skipKey =
+              (pending?.sessionKey || pending?.tempKey || payloadSessionKey || "").trim();
+            const skipRoot =
+              (pending?.rootId || payloadRootId || currentRootIdRef.current || "").trim();
+            if (skipKey && skipRoot) {
+              skipCompletionSoundBySessionRef.current[rootSessionKey(skipRoot, skipKey)] = true;
+            }
           }
           break;
         }
@@ -9552,7 +9669,11 @@ export function App({ onGoHome }: AppProps) {
                 currentRootIdRef.current ||
                 "";
           if (rootID && sessionKey) {
-            if (payload?.replay !== true) {
+            const doneCacheKey = rootSessionKey(rootID, sessionKey);
+            const skipSound = !!skipCompletionSoundBySessionRef.current[doneCacheKey];
+            if (skipSound) {
+              delete skipCompletionSoundBySessionRef.current[doneCacheKey];
+            } else if (payload?.replay !== true) {
               playCompletionSound();
             }
             setMultiProjectSessionPending(rootID, sessionKey, false);
@@ -13643,6 +13764,7 @@ export function App({ onGoHome }: AppProps) {
             multiProjectSessionsEnabled={multiProjectSessionsEnabled}
             onMultiProjectSessionsChange={setMultiProjectSessionsEnabled}
             onRunAgentLifecycleCommand={handleRunAgentLifecycleCommand}
+            onAgentsChanged={() => setAgentsVersion((v) => v + 1)}
             onGoHome={onGoHome}
           />
         }

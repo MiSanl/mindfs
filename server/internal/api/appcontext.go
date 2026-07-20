@@ -757,11 +757,61 @@ func (s *AppContext) BroadcastSessionUpdate(rootID, sessionKey string, update ag
 }
 
 func (s *AppContext) BroadcastSessionError(rootID, sessionKey, message string) {
-	s.UpdateTaskSessionErrorForSession(rootID, sessionKey, message)
-	s.GetSessionStreamHub().BroadcastSessionStream(rootID, sessionKey, &StreamEvent{
+	s.BroadcastSessionErrorWithRequest(rootID, sessionKey, "", message)
+}
+
+// BroadcastSessionErrorWithRequest surfaces a terminal send/resume error to the UI.
+// requestID (when known) lets the frontend clear pending_ack for the exact outbound message.
+//
+// Emits a single session.error frame (not also a stream "error" event) to avoid
+// double toasts: App handles session.error and stream type=error both via reportError.
+func (s *AppContext) BroadcastSessionErrorWithRequest(rootID, sessionKey, requestID, message string) {
+	trimmed := strings.TrimSpace(message)
+	if trimmed == "" {
+		trimmed = "session error"
+	}
+	normalized := normalizeAgentErrorMessage(errors.New(trimmed))
+	s.UpdateTaskSessionErrorForSession(rootID, sessionKey, normalized)
+	hub := s.GetSessionStreamHub()
+	// Still append to reply event log so reconnect/replay can surface the failure.
+	hub.AppendReplyEvent(sessionKey, StreamEvent{
 		Type: "error",
-		Data: map[string]string{"message": normalizeAgentErrorMessage(errors.New(message))},
+		Data: map[string]string{"message": normalized},
 	})
+	// Explicit session.error frame carries request_id so App can drop pending_ack
+	// and stop the "sending / generating" state even when stream handlers miss it.
+	payload := map[string]any{
+		"root_id":     rootID,
+		"session_key": sessionKey,
+		"message":     normalized,
+		// Mirror stream error shape so SessionViewer/timeline can read it if needed.
+		"event": map[string]any{
+			"type": "error",
+			"data": map[string]string{"message": normalized},
+		},
+	}
+	if strings.TrimSpace(requestID) != "" {
+		payload["request_id"] = strings.TrimSpace(requestID)
+	}
+	resp := WSResponse{
+		ID:      strings.TrimSpace(requestID),
+		Type:    "session.error",
+		Payload: payload,
+		Error: &WSResponseError{
+			Code:    "session.message_failed",
+			Message: normalized,
+		},
+	}
+	// Prefer session-bound clients; fall back to all live clients so the sender
+	// still sees the failure if BindSessionClient raced.
+	clientIDs := hub.GetSessionClientIDs(sessionKey, false)
+	if len(clientIDs) == 0 {
+		hub.BroadcastAll(resp)
+		return
+	}
+	for _, clientID := range clientIDs {
+		hub.SendToClient(clientID, resp)
+	}
 }
 
 func (s *AppContext) ClearTaskAuxFlagsForSession(rootID, sessionKey string) {

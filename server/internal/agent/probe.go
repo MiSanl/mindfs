@@ -448,6 +448,15 @@ func (p *Prober) GetStatus(name string) (Status, bool) {
 	return status, ok
 }
 
+// SeedStatusForTest installs a cached agent status for unit tests that need a
+// non-empty model catalog without running a full probe.
+func (p *Prober) SeedStatusForTest(status Status) {
+	if p == nil {
+		return
+	}
+	p.setStatus(status)
+}
+
 // GetAllStatuses 获取所有缓存的 Agent 状态
 func (p *Prober) GetAllStatuses() []Status {
 	p.mu.RLock()

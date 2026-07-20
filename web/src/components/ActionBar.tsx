@@ -180,6 +180,37 @@ function getModelDefaultEffort(agent: AgentStatus | null | undefined, modelID: s
   return candidates.find((item) => item && availableEfforts.includes(item)) || availableEfforts[0] || "";
 }
 
+function matchAgentModelID(
+  models: Array<{ id?: string }> | undefined,
+  modelID: string,
+): string {
+  const id = String(modelID || "").trim();
+  if (!id || !Array.isArray(models) || models.length === 0) {
+    return "";
+  }
+  for (const model of models) {
+    const mid = String(model?.id || "").trim();
+    if (mid && mid === id) {
+      return mid;
+    }
+  }
+  for (const model of models) {
+    const mid = String(model?.id || "").trim();
+    if (!mid) {
+      continue;
+    }
+    if (mid.endsWith(`/${id}`) || id.endsWith(`/${mid}`)) {
+      return mid;
+    }
+    const bareMid = mid.includes("/") ? mid.slice(mid.lastIndexOf("/") + 1) : mid;
+    const bareID = id.includes("/") ? id.slice(id.lastIndexOf("/") + 1) : id;
+    if (bareMid && bareMid === bareID) {
+      return mid;
+    }
+  }
+  return "";
+}
+
 function buildPendingAttachment(file: File): PendingAttachment {
   const isImage = file.type.startsWith("image/");
   const fallbackExt = file.type.split("/")[1] || "png";
@@ -564,7 +595,7 @@ export function ActionBar({
     setAgent(preferred.name);
     setModel(defaults.model);
     setAgentMode("");
-    setEffort(defaults.effort);
+    setEffort(getModelDefaultEffort(preferred, defaults.model));
     setFastService(defaults.fastService);
   }, [agent, agents, currentSession]);
 
@@ -576,8 +607,36 @@ export function ActionBar({
     if (!selectedAgent) {
       return;
     }
-    const hasModel = (selectedAgent.models ?? []).some((item) => item.id === model);
-    if (!hasModel) {
+    const catalog = selectedAgent.models ?? [];
+    if (catalog.some((item) => item.id === model)) {
+      return;
+    }
+    // During provider switch / delayed refresh the catalog can briefly be
+    // empty or native-only. Do not clobber a still-valid user selection then.
+    if (catalog.length === 0) {
+      return;
+    }
+    // Remap after provider overlay/catalog churn instead of wiping to ""
+    // (which would silently drop model on the next send).
+    const remapped =
+      matchAgentModelID(catalog, model)
+      || selectedAgent.current_model_id
+      || selectedAgent.default_model_id
+      || catalog[0]?.id
+      || "";
+    // Prefer suffix remap; only fall back to current/default/first when the
+    // catalog is non-empty and clearly no longer contains the selection.
+    if (remapped && remapped !== model) {
+      const remappedInCatalog = catalog.some((item) => item.id === remapped);
+      if (remappedInCatalog || matchAgentModelID(catalog, model)) {
+        setModel(matchAgentModelID(catalog, model) || remapped);
+        return;
+      }
+      // Catalog changed for real (e.g. new provider); accept fallback.
+      setModel(remapped);
+      return;
+    }
+    if (!remapped) {
       setModel("");
     }
   }, [agent, model, agents]);
@@ -1097,7 +1156,7 @@ export function ActionBar({
     setAgent(nextAgent.name);
     setModel(defaults.model);
     setAgentMode("");
-    setEffort(defaults.effort);
+    setEffort(getModelDefaultEffort(nextAgent, defaults.model));
     setFastService(defaults.fastService);
     syncedSessionSignatureRef.current = "";
   }, [agent, agents]);

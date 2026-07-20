@@ -113,6 +113,37 @@ export async function createAgentAPIProvider(input: {
   });
 }
 
+export async function updateAgentAPIProvider(
+  id: string,
+  input: {
+    name: string;
+    baseUrl: string;
+    apiKey?: string;
+    models?: string[];
+    reprobe?: boolean;
+  },
+): Promise<AgentAPIProvider> {
+  const params = new URLSearchParams({ id });
+  const body: Record<string, unknown> = {
+    name: input.name,
+    baseUrl: input.baseUrl,
+  };
+  if (typeof input.apiKey === "string" && input.apiKey.trim()) {
+    body.apiKey = input.apiKey.trim();
+  }
+  if (Array.isArray(input.models)) {
+    body.models = input.models;
+  }
+  if (input.reprobe) {
+    body.reprobe = true;
+  }
+  return protectedJSON<AgentAPIProvider>(appPath(`/api/agent-api-providers?${params.toString()}`), {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
 export async function syncAgentAPIProviders(input: Array<{
   name: string;
   baseUrl: string;

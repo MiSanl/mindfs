@@ -3660,16 +3660,65 @@ func (s *Service) validateAgentModel(agentName, model string) error {
 		return nil
 	}
 	status, ok := prober.GetStatus(agentName)
-	if !ok || len(status.Models) == 0 {
+	if !ok {
 		return nil
 	}
-	for _, item := range status.Models {
-		if strings.TrimSpace(item.ID) == model {
-			return nil
+	// Preferences attach last_config_selection; probe cache alone may still hold
+	// the previous provider's native catalog after an API-provider switch.
+	if prefs := s.Registry.GetPreferences(); prefs != nil {
+		statuses := prefs.ApplyAgentDefaults([]agent.Status{status})
+		if len(statuses) > 0 {
+			status = statuses[0]
 		}
+	}
+	if modelIDInCatalog(status.Models, model) {
+		return nil
+	}
+	// Custom API providers (e.g. grok-4.5 via OpenAI-compatible base URL) are
+	// stored in api-providers.json and overlaid on GET /api/agents, but the
+	// probe ListModels catalog often lags or never lists those IDs. Allow the
+	// active provider catalog so send/resume is not blocked incorrectly.
+	if AgentAPIProviderModelAllowed != nil && AgentAPIProviderModelAllowed(agentName, model, status.LastConfigSelection) {
+		return nil
+	}
+	// Empty probe catalog: do not hard-fail (legacy behavior).
+	if len(status.Models) == 0 {
+		return nil
 	}
 	return fmt.Errorf("model %q is not supported by agent %q", model, agentName)
 }
+
+func modelIDInCatalog(models []agenttypes.ModelInfo, model string) bool {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return false
+	}
+	for _, item := range models {
+		id := strings.TrimSpace(item.ID)
+		if id == "" {
+			continue
+		}
+		if id == model {
+			return true
+		}
+		// provider/model vs bare model (opencode-style catalogs)
+		if strings.HasSuffix(id, "/"+model) || strings.HasSuffix(model, "/"+id) {
+			return true
+		}
+		if i := strings.LastIndex(id, "/"); i >= 0 && id[i+1:] == model {
+			return true
+		}
+		if i := strings.LastIndex(model, "/"); i >= 0 && model[i+1:] == id {
+			return true
+		}
+	}
+	return false
+}
+
+// AgentAPIProviderModelAllowed is set by package api (init) to check models
+// against the active provider catalog without a circular import.
+// Signature: (agentName, model, lastConfigSelection) -> allowed
+var AgentAPIProviderModelAllowed func(agentName, model string, lastConfig any) bool
 
 func (s *Service) CancelSessionTurn(ctx context.Context, in CancelSessionTurnInput) error {
 	if err := s.ensureRegistry(); err != nil {

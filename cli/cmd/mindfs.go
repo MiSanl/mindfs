@@ -484,7 +484,7 @@ func startBackgroundProcess(logPath string) error {
 	if err := rotateLogIfNeeded(logPath, maxLogSizeBytes, maxLogBackups); err != nil {
 		return err
 	}
-	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	logFile, err := openMindFSLogFile(logPath)
 	if err != nil {
 		return err
 	}
@@ -499,6 +499,31 @@ func startBackgroundProcess(logPath string) error {
 		return err
 	}
 	return logFile.Close()
+}
+
+// openMindFSLogFile opens the service log for append and, on a brand-new file,
+// writes a UTF-8 BOM so Windows tools (Notepad, some PowerShell viewers) do not
+// mis-decode Chinese agent/provider messages as mojibake.
+func openMindFSLogFile(logPath string) (*os.File, error) {
+	info, err := os.Stat(logPath)
+	createFresh := err != nil && errors.Is(err, os.ErrNotExist)
+	if err != nil && !createFresh {
+		// Still try to open; OpenFile will surface the real error.
+		createFresh = false
+	} else if err == nil && info.Size() == 0 {
+		createFresh = true
+	}
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	if createFresh {
+		if _, err := logFile.Write([]byte{0xEF, 0xBB, 0xBF}); err != nil {
+			logFile.Close()
+			return nil, err
+		}
+	}
+	return logFile, nil
 }
 
 func rotateLogIfNeeded(path string, maxSize int64, backups int) error {

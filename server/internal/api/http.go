@@ -372,6 +372,7 @@ func (h *HTTPHandler) Routes() http.Handler {
 	r.Post("/api/agent-config/switch", h.protectedEndpoint(h.handleAgentConfigSwitch))
 	r.Get("/api/agent-api-providers", h.protectedEndpoint(h.handleAgentAPIProvidersList))
 	r.Post("/api/agent-api-providers", h.protectedEndpoint(h.handleAgentAPIProviderCreate))
+	r.Put("/api/agent-api-providers", h.protectedEndpoint(h.handleAgentAPIProviderUpdate))
 	r.Post("/api/agent-api-providers/sync", h.protectedEndpoint(h.handleAgentAPIProvidersSync))
 	r.Delete("/api/agent-api-providers", h.protectedEndpoint(h.handleAgentAPIProviderDelete))
 	r.Post("/api/agent-api-providers/switch", h.protectedEndpoint(h.handleAgentAPIProviderSwitch))

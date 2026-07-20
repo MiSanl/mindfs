@@ -899,12 +899,16 @@ func (h *WSHandler) runSessionMessage(job sessionMessageJob) {
 	})
 	if err != nil {
 		log.Printf("[ws] session.message.error root=%s session=%s request=%s err=%v", rootID, key, requestID, err)
-		h.AppContext.BroadcastSessionError(rootID, key, err.Error())
+		// Include request_id so the optimistic "sending" bubble can clear.
+		h.AppContext.BroadcastSessionErrorWithRequest(rootID, key, requestID, err.Error())
 	}
 	if ok := updateTracker.WaitIdle(msgCtx, sessionDoneSettleWindow, sessionDoneMaxWait); !ok {
 		log.Printf("[ws] session.done.wait_timeout root=%s session=%s request=%s", rootID, key, requestID)
 	}
 	log.Printf("[ws] session.done root=%s session=%s request=%s", rootID, key, requestID)
+	// Always clear replying state (via BroadcastSessionDone -> ClearSessionPending)
+	// so a failed/empty turn does not leave the session permanently "generating"
+	// and force subsequent messages into the queue.
 	h.AppContext.BroadcastSessionDone(rootID, key, requestID)
 	h.startNextQueuedSessionMessage(rootID, key)
 }

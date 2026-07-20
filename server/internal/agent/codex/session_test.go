@@ -82,6 +82,55 @@ func TestListModelsPreservesPerModelReasoningEfforts(t *testing.T) {
 	}
 }
 
+func TestMapCodexModelEmptyEffortsDisablesSupport(t *testing.T) {
+	// Explicit empty SupportedReasoningEfforts means model does not support effort.
+	empty := []codextypes.ReasoningEffortOption{}
+	got := mapCodexModel(codextypes.Model{
+		Model:                     "no-effort",
+		DisplayName:               "No Effort",
+		SupportedReasoningEfforts: empty,
+		DefaultReasoningEffort:    codextypes.ReasoningEffort("LOW"),
+	})
+	if got.SupportEffort {
+		t.Fatalf("SupportEffort = true for empty efforts: %#v", got)
+	}
+	if len(got.Efforts) != 0 {
+		t.Fatalf("efforts = %#v", got.Efforts)
+	}
+	if got.DefaultEffort != "low" {
+		t.Fatalf("DefaultEffort should be lowercased, got %q", got.DefaultEffort)
+	}
+}
+
+func TestMapCodexModelFiltersNoneEffort(t *testing.T) {
+	got := mapCodexModel(codextypes.Model{
+		Model:       "with-none",
+		DisplayName: "With None",
+		SupportedReasoningEfforts: []codextypes.ReasoningEffortOption{
+			{ReasoningEffort: codextypes.ReasoningEffort("none")},
+			{ReasoningEffort: codextypes.ReasoningEffort("MEDIUM")},
+			{ReasoningEffort: codextypes.ReasoningEffort("")},
+		},
+	})
+	if !reflect.DeepEqual(got.Efforts, []string{"medium"}) {
+		t.Fatalf("efforts = %#v, want [medium]", got.Efforts)
+	}
+	if !got.SupportEffort {
+		t.Fatal("SupportEffort should be true when non-empty efforts remain")
+	}
+}
+
+func TestMapCodexModelNilEffortsKeepsLegacySupport(t *testing.T) {
+	got := mapCodexModel(codextypes.Model{
+		Model:                     "legacy",
+		DisplayName:               "Legacy",
+		SupportedReasoningEfforts: nil,
+	})
+	if !got.SupportEffort {
+		t.Fatalf("nil SupportedReasoningEfforts should keep legacy SupportEffort: %#v", got)
+	}
+}
+
 func TestHandleRawEventPlanDeltaAggregatesPlanUpdates(t *testing.T) {
 	s := &session{}
 	var updates []agenttypes.Event
