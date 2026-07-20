@@ -7,15 +7,52 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 )
 
+func TestMain(m *testing.M) {
+	root, err := os.MkdirTemp("", "mindfs-relay-test-")
+	if err != nil {
+		panic(err)
+	}
+	for key, value := range map[string]string{
+		"APPDATA":         root,
+		"AppData":         root,
+		"LOCALAPPDATA":    filepath.Join(root, "local"),
+		"USERPROFILE":     filepath.Join(root, "home"),
+		"HOME":            filepath.Join(root, "home"),
+		"XDG_CONFIG_HOME": filepath.Join(root, "config"),
+	} {
+		if err := os.Setenv(key, value); err != nil {
+			panic(err)
+		}
+	}
+	if err := os.Unsetenv("MINDFS_RELAY_BASE_URL"); err != nil {
+		panic(err)
+	}
+	code := m.Run()
+	_ = os.RemoveAll(root)
+	os.Exit(code)
+}
+
+func setRelayTestConfigHome(t *testing.T, dir string) {
+	t.Helper()
+	t.Setenv("APPDATA", dir)
+	t.Setenv("AppData", dir)
+	t.Setenv("LOCALAPPDATA", filepath.Join(dir, "local"))
+	t.Setenv("USERPROFILE", filepath.Join(dir, "home"))
+	t.Setenv("HOME", filepath.Join(dir, "home"))
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(dir, "config"))
+	t.Setenv("MINDFS_RELAY_BASE_URL", "")
+}
+
 func TestGetOrCreateDeviceIDStable(t *testing.T) {
 	configRoot := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", configRoot)
-	t.Setenv("HOME", configRoot)
+	setRelayTestConfigHome(t, configRoot)
 
 	first, err := getOrCreateDeviceID()
 	if err != nil {
@@ -36,8 +73,7 @@ func TestGetOrCreateDeviceIDStable(t *testing.T) {
 
 func TestCredentialsStoreSaveLoad(t *testing.T) {
 	configRoot := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", configRoot)
-	t.Setenv("HOME", configRoot)
+	setRelayTestConfigHome(t, configRoot)
 
 	store, err := NewCredentialsStore()
 	if err != nil {
@@ -68,15 +104,14 @@ func TestCredentialsStoreSaveLoad(t *testing.T) {
 	if err != nil {
 		t.Fatalf("credentials file missing: %v", err)
 	}
-	if info.Mode().Perm() != 0o600 {
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
 		t.Fatalf("credentials file mode = %o, want 0600", info.Mode().Perm())
 	}
 }
 
 func TestCredentialsStoreClear(t *testing.T) {
 	configRoot := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", configRoot)
-	t.Setenv("HOME", configRoot)
+	setRelayTestConfigHome(t, configRoot)
 
 	store, err := NewCredentialsStore()
 	if err != nil {
@@ -165,8 +200,7 @@ func TestPrepareLocalProxyHeadersKeepsRelayedHeaderForNodeProxy(t *testing.T) {
 
 func TestServicePollBind(t *testing.T) {
 	configRoot := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", configRoot)
-	t.Setenv("HOME", configRoot)
+	setRelayTestConfigHome(t, configRoot)
 
 	svc, err := NewService(":7331", false)
 	if err != nil {
@@ -206,8 +240,7 @@ func TestServicePollBind(t *testing.T) {
 
 func TestServiceStoreRelayNodeNameFromHandshake(t *testing.T) {
 	configRoot := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", configRoot)
-	t.Setenv("HOME", configRoot)
+	setRelayTestConfigHome(t, configRoot)
 
 	svc, err := NewService(":7331", false)
 	if err != nil {
@@ -234,8 +267,7 @@ func TestServiceStoreRelayNodeNameFromHandshake(t *testing.T) {
 
 func TestManagerStartBindingGeneratesPendingCode(t *testing.T) {
 	configRoot := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", configRoot)
-	t.Setenv("HOME", configRoot)
+	setRelayTestConfigHome(t, configRoot)
 
 	manager, err := NewManager(":7331", false, "https://relay.example.com", false)
 	if err != nil {
@@ -270,8 +302,7 @@ func TestManagerStartBindingGeneratesPendingCode(t *testing.T) {
 
 func TestManagerNoRelayerDoesNotGeneratePendingCode(t *testing.T) {
 	configRoot := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", configRoot)
-	t.Setenv("HOME", configRoot)
+	setRelayTestConfigHome(t, configRoot)
 
 	manager, err := NewManager(":7331", true, "https://relay.example.com", false)
 	if err != nil {
@@ -293,8 +324,7 @@ func TestManagerNoRelayerDoesNotGeneratePendingCode(t *testing.T) {
 
 func TestManagerPollConfirmedStartsRelay(t *testing.T) {
 	configRoot := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", configRoot)
-	t.Setenv("HOME", configRoot)
+	setRelayTestConfigHome(t, configRoot)
 
 	manager, err := NewManager(":7331", false, "https://relay.example.com", false)
 	if err != nil {
@@ -360,8 +390,7 @@ func TestManagerPollConfirmedStartsRelay(t *testing.T) {
 
 func TestManagerPollTerminalBindStatusStopsPolling(t *testing.T) {
 	configRoot := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", configRoot)
-	t.Setenv("HOME", configRoot)
+	setRelayTestConfigHome(t, configRoot)
 
 	manager, err := NewManager(":7331", false, "https://relay.example.com", false)
 	if err != nil {
@@ -417,8 +446,7 @@ func TestManagerPollTerminalBindStatusStopsPolling(t *testing.T) {
 
 func TestManagerDefaultsRelayBaseToLocalhost(t *testing.T) {
 	configRoot := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", configRoot)
-	t.Setenv("HOME", configRoot)
+	setRelayTestConfigHome(t, configRoot)
 
 	manager, err := NewManager(":7331", false, "", false)
 	if err != nil {
@@ -440,8 +468,7 @@ func TestManagerDefaultsRelayBaseToLocalhost(t *testing.T) {
 
 func TestManagerPermanentRelayErrorClearsCredentialsAndWaitsForExplicitRebind(t *testing.T) {
 	configRoot := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", configRoot)
-	t.Setenv("HOME", configRoot)
+	setRelayTestConfigHome(t, configRoot)
 
 	manager, err := NewManager(":7331", false, "https://relay.example.com", false)
 	if err != nil {
@@ -501,8 +528,7 @@ func TestManagerPermanentRelayErrorClearsCredentialsAndWaitsForExplicitRebind(t 
 
 func TestManagerStartClearsCredentialsWhenRelayBaseChanges(t *testing.T) {
 	configRoot := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", configRoot)
-	t.Setenv("HOME", configRoot)
+	setRelayTestConfigHome(t, configRoot)
 
 	manager, err := NewManager(":7331", false, "https://relay-new.example.com", false)
 	if err != nil {

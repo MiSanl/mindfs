@@ -28,6 +28,7 @@ type OpenOptions struct {
 	Command          string
 	Args             []string
 	Env              map[string]string
+	RuntimeKey       string
 	ResumeSessionID  string
 	ForkSessionID    string
 	CodexUserOrdinal *int
@@ -147,26 +148,43 @@ func (r *Runtime) CloseAll() {
 
 func (r *Runtime) Close(agentName string) error {
 	r.mu.Lock()
-	client, ok := r.clients[agentName]
-	if ok {
-		delete(r.clients, agentName)
+	clients := make([]*codexsdk.Codex, 0)
+	for key, client := range r.clients {
+		if key != agentName && !strings.HasPrefix(key, agentName+":") {
+			continue
+		}
+		delete(r.clients, key)
+		if client != nil {
+			clients = append(clients, client)
+		}
 	}
 	r.mu.Unlock()
 
-	if !ok || client == nil {
-		return nil
+	var firstErr error
+	for _, client := range clients {
+		if err := client.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
 	}
-	return client.Close()
+	return firstErr
+}
+
+func (r *Runtime) clientKey(opts OpenOptions) string {
+	if key := strings.TrimSpace(opts.RuntimeKey); key != "" {
+		return key
+	}
+	return strings.TrimSpace(opts.AgentName)
 }
 
 func (r *Runtime) getOrCreateClient(opts OpenOptions) *codexsdk.Codex {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if client, ok := r.clients[opts.AgentName]; ok {
+	key := r.clientKey(opts)
+	if client, ok := r.clients[key]; ok {
 		return client
 	}
 	client := newClient(opts)
-	r.clients[opts.AgentName] = client
+	r.clients[key] = client
 	return client
 }
 

@@ -675,6 +675,71 @@ func TestUpdateAgentAPIProviderURLChangeRefreshesProtocolsWithCuratedModels(t *t
 	}
 }
 
+func TestResolveSessionProviderConfigUsesStableIDAndRedactedRevision(t *testing.T) {
+	restore := withTempProviderStore(t)
+	defer restore()
+	provider := agentAPIProvider{
+		ID:        "api-stable",
+		Name:      "Renamed provider",
+		BaseURL:   "https://relay.example/v1",
+		APIKey:    "secret-token",
+		Protocols: []string{apiProviderProtocolOpenAICompatible},
+		Models:    []string{"grok-4.5"},
+	}
+	if err := writeAgentAPIProviders([]agentAPIProvider{provider}); err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := resolveSessionProviderConfig("codex", "api-stable")
+	if err != nil {
+		t.Fatalf("resolve provider: %v", err)
+	}
+	if resolved.ID != provider.ID || resolved.Protocol != apiProviderProtocolOpenAICompatible {
+		t.Fatalf("resolved identity = %#v", resolved)
+	}
+	if resolved.Revision == "" || strings.Contains(resolved.Revision, provider.APIKey) {
+		t.Fatalf("revision must be non-empty and non-secret: %q", resolved.Revision)
+	}
+	if resolved.Env["OPENAI_API_KEY"] != provider.APIKey {
+		t.Fatal("runtime environment must receive the provider key")
+	}
+	if _, err := resolveSessionProviderConfig("claude", provider.ID); err == nil {
+		t.Fatal("incompatible agent must be rejected")
+	}
+	if _, err := resolveSessionProviderConfig("codex", "api-deleted"); err == nil {
+		t.Fatal("deleted provider must be rejected")
+	}
+}
+
+func TestNormalizeAPIProviderBaseURLRejectsCredentialBearingComponents(t *testing.T) {
+	for _, raw := range []string{
+		"https://token@relay.example/v1",
+		"https://relay.example/v1?api_key=token",
+		"https://relay.example/v1#token",
+	} {
+		if _, err := normalizeAPIProviderBaseURL(raw); err == nil {
+			t.Fatalf("base URL %q must be rejected", raw)
+		}
+	}
+	if got, err := normalizeAPIProviderBaseURL("https://relay.example/v1"); err != nil || got != "https://relay.example/v1" {
+		t.Fatalf("safe base URL = %q, %v", got, err)
+	}
+}
+
+func TestSessionProviderRevisionDoesNotDeriveFromAPIKey(t *testing.T) {
+	base := agentAPIProvider{
+		BaseURL:   "https://relay.example/v1",
+		Protocols: []string{apiProviderProtocolOpenAICompatible},
+		Models:    []string{"grok-4.5"},
+		UpdatedAt: "2026-07-20T00:00:00Z",
+		APIKey:    "key-one",
+	}
+	changedKey := base
+	changedKey.APIKey = "key-two"
+	if sessionProviderRevision(base) != sessionProviderRevision(changedKey) {
+		t.Fatal("provider revision must not expose or derive from the API key")
+	}
+}
+
 func TestProviderModelsSuggestAnthropicRejectsBareOpusHaiku(t *testing.T) {
 	if providerModelsSuggestAnthropic([]string{"router-opus-v2"}) {
 		t.Fatal("router-opus-v2 must not promote")

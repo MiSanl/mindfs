@@ -463,12 +463,15 @@ export function TaskTemplateDialog({ open, agents, template, onClose, onSaved }:
                         maxButtonWidth="132px"
                         onEffortChange={(effort) => updateStage(index, { effort: effort || "" })}
                       />
-                    <FastServiceSelector
+                      <FastServiceSelector
                       agent={selectedAgentStatus}
                       fastService={toFastService(snapshot.fast_service)}
                       compact
                       onFastServiceChange={(fastService) => updateStage(index, { fast_service: fastService || "" })}
-                    />
+                      />
+                      <span style={{ fontSize: "11px", color: "var(--text-secondary)", flex: "1 1 180px" }}>
+                        Uses the current global agent configuration and its official login or backup settings. Session API providers are not supported for Kanban stages.
+                      </span>
                     </>
                   ) : null}
                   <StageOptionsMenu

@@ -524,6 +524,11 @@ export function ScheduledAgentTaskDialog({
         task_cron: form.task_cron,
         agent: form.agent,
         model: form.model,
+        provider_id:
+          (selected?.agent === form.agent ? selected.provider_id : "") ||
+          (agents.find((item) => item.name === form.agent)?.last_config_selection?.type === "api_provider"
+            ? agents.find((item) => item.name === form.agent)?.last_config_selection?.id || ""
+            : ""),
         mode: form.mode,
         effort: form.effort,
         fast_service: form.fast_service,

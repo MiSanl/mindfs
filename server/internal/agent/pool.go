@@ -31,6 +31,7 @@ type sessionEntry struct {
 	agentName  string
 	sessionKey string
 	protocol   Protocol
+	runtimeKey string
 	session    agenttypes.Session
 }
 
@@ -60,9 +61,15 @@ func (p *Pool) GetOrCreate(ctx context.Context, in agenttypes.OpenSessionInput) 
 		p.mu.Unlock()
 		return nil, errors.New("agent pool closed")
 	}
-	if entry, ok := p.sessions[in.SessionKey]; ok {
+	if entry, ok := p.sessions[in.SessionKey]; ok && (in.RuntimeKey == "" || entry.runtimeKey == in.RuntimeKey) {
 		p.mu.Unlock()
 		return entry.session, nil
+	}
+	if entry, ok := p.sessions[in.SessionKey]; ok {
+		delete(p.sessions, in.SessionKey)
+		p.mu.Unlock()
+		_ = entry.session.Close()
+		p.mu.Lock()
 	}
 	def, ok := p.cfg.GetAgent(in.AgentName)
 	if !ok {
@@ -88,7 +95,7 @@ func (p *Pool) GetOrCreate(ctx context.Context, in agenttypes.OpenSessionInput) 
 		return nil, errors.New("agent pool closed")
 	}
 	// Another goroutine may have created the same session while the lock was released.
-	if entry, ok := p.sessions[in.SessionKey]; ok {
+	if entry, ok := p.sessions[in.SessionKey]; ok && (in.RuntimeKey == "" || entry.runtimeKey == in.RuntimeKey) {
 		existing := entry.session
 		p.mu.Unlock()
 		if protocol != ProtocolACP {
@@ -96,17 +103,32 @@ func (p *Pool) GetOrCreate(ctx context.Context, in agenttypes.OpenSessionInput) 
 		}
 		return existing, nil
 	}
+	var replaced *sessionEntry
+	if entry, ok := p.sessions[in.SessionKey]; ok {
+		replaced = entry
+		delete(p.sessions, in.SessionKey)
+	}
 	p.sessions[in.SessionKey] = &sessionEntry{
 		agentName:  in.AgentName,
 		sessionKey: in.SessionKey,
 		protocol:   protocol,
+		runtimeKey: in.RuntimeKey,
 		session:    sess,
 	}
 	p.mu.Unlock()
+	if replaced != nil && replaced.session != nil {
+		_ = replaced.session.Close()
+	}
 	return sess, nil
 }
 
 func (p *Pool) openSession(ctx context.Context, protocol Protocol, def Definition, in agenttypes.OpenSessionInput) (agenttypes.Session, error) {
+	env := cloneEnv(def.Env)
+	if in.RuntimeEnv != nil {
+		env = cloneEnv(in.RuntimeEnv)
+	}
+	args := append([]string{}, def.Args...)
+	args = append(args, in.RuntimeArgs...)
 	switch protocol {
 	case ProtocolClaudeSDK:
 		return p.claude.OpenSession(ctx, claude.OpenOptions{
@@ -117,8 +139,8 @@ func (p *Pool) openSession(ctx context.Context, protocol Protocol, def Definitio
 			PlanMode:        in.PlanMode,
 			RootPath:        in.RootPath,
 			Command:         def.Command,
-			Args:            append([]string{}, def.Args...),
-			Env:             cloneEnv(def.Env),
+			Args:            args,
+			Env:             env,
 			ResumeSessionID: in.AgentSessionID,
 			ForkSessionID:   in.ForkPoint.AgentSessionID,
 			ResumeMessageID: in.ForkPoint.ClaudeMessageUUID,
@@ -139,8 +161,9 @@ func (p *Pool) openSession(ctx context.Context, protocol Protocol, def Definitio
 			Probe:            in.Probe,
 			RootPath:         in.RootPath,
 			Command:          def.Command,
-			Args:             append([]string{}, def.Args...),
-			Env:              cloneEnv(def.Env),
+			Args:             args,
+			Env:              env,
+			RuntimeKey:       in.RuntimeKey,
 			ResumeSessionID:  in.AgentSessionID,
 			ForkSessionID:    in.ForkPoint.AgentSessionID,
 			CodexUserOrdinal: codexUserOrdinal,
@@ -156,8 +179,8 @@ func (p *Pool) openSession(ctx context.Context, protocol Protocol, def Definitio
 			Effort:          in.Effort,
 			RootPath:        in.RootPath,
 			Command:         def.Command,
-			Args:            def.BuildArgs(in.RootPath),
-			Env:             cloneEnv(def.Env),
+			Args:            append(def.BuildArgs(in.RootPath), in.RuntimeArgs...),
+			Env:             env,
 			Cwd:             def.ResolveCwd(in.RootPath),
 			ResumeSessionID: in.AgentSessionID,
 		})
@@ -313,6 +336,15 @@ func (p *Pool) Get(sessionKey string) (agenttypes.Session, bool) {
 		return nil, false
 	}
 	return entry.session, true
+}
+
+func (p *Pool) RuntimeKey(sessionKey string) string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if entry := p.sessions[sessionKey]; entry != nil {
+		return entry.runtimeKey
+	}
+	return ""
 }
 
 // Context returns the pool lifecycle context (read-only).

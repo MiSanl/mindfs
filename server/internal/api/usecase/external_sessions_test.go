@@ -41,7 +41,7 @@ func TestExternalSessionDeltaAfterCtxSeqReturnsEmptyWhenFullySynced(t *testing.T
 
 func TestSyncExternalSessionDeltaFastDoesNotApplyCtxSeqToFilteredImport(t *testing.T) {
 	root := fs.NewRootInfo("root", "Root", t.TempDir())
-	manager := session.NewManager(root)
+	manager := newTestSessionManager(t, root)
 	created, err := manager.Create(context.Background(), session.CreateInput{
 		Type:  session.TypeChat,
 		Agent: "codex",

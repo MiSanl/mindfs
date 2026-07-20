@@ -83,6 +83,11 @@ CREATE TABLE IF NOT EXISTS session_agent_bindings (
 	agent TEXT NOT NULL,
 	agent_session_id TEXT NOT NULL,
 	agent_ctx_seq INTEGER NOT NULL DEFAULT 0,
+	provider_id TEXT NOT NULL DEFAULT '',
+	provider_revision TEXT NOT NULL DEFAULT '',
+	provider_endpoint_revision TEXT NOT NULL DEFAULT '',
+	provider_protocol TEXT NOT NULL DEFAULT '',
+	provider_state TEXT NOT NULL DEFAULT 'legacy_unbound',
 	PRIMARY KEY (session_key, agent)
 );`
 	upsertAgentBindingSQL = `
@@ -92,16 +97,30 @@ INSERT INTO session_agent_bindings (
 ON CONFLICT(session_key, agent) DO UPDATE SET
 	agent_session_id = excluded.agent_session_id,
 	agent_ctx_seq = excluded.agent_ctx_seq`
+	bindProviderIfUnboundSQL = `
+INSERT INTO session_agent_bindings (
+	session_key, agent, agent_session_id, agent_ctx_seq, provider_id, provider_revision, provider_endpoint_revision, provider_protocol, provider_state
+) VALUES (?, ?, '', 0, ?, ?, ?, ?, ?)
+ON CONFLICT(session_key, agent) DO UPDATE SET
+	provider_id = CASE WHEN session_agent_bindings.provider_id = '' THEN excluded.provider_id ELSE session_agent_bindings.provider_id END,
+	provider_revision = CASE WHEN session_agent_bindings.provider_id = '' THEN excluded.provider_revision ELSE session_agent_bindings.provider_revision END,
+	provider_endpoint_revision = CASE WHEN session_agent_bindings.provider_id = '' THEN excluded.provider_endpoint_revision ELSE session_agent_bindings.provider_endpoint_revision END,
+	provider_protocol = CASE WHEN session_agent_bindings.provider_id = '' THEN excluded.provider_protocol ELSE session_agent_bindings.provider_protocol END,
+	provider_state = CASE WHEN session_agent_bindings.provider_id = '' THEN excluded.provider_state ELSE session_agent_bindings.provider_state END`
+	updateProviderBindingSQL = `
+UPDATE session_agent_bindings
+SET provider_revision = ?, provider_endpoint_revision = ?, provider_protocol = ?, provider_state = ?
+WHERE session_key = ? AND agent = ? AND provider_id = ?`
 	selectAgentBindingSQL = `
-SELECT session_key, agent, agent_session_id, agent_ctx_seq
+SELECT session_key, agent, agent_session_id, agent_ctx_seq, provider_id, provider_revision, provider_endpoint_revision, provider_protocol, provider_state
 FROM session_agent_bindings
 WHERE session_key = ? AND agent = ?`
 	selectAgentBindingsBySessionSQL = `
-SELECT session_key, agent, agent_session_id, agent_ctx_seq
+SELECT session_key, agent, agent_session_id, agent_ctx_seq, provider_id, provider_revision, provider_endpoint_revision, provider_protocol, provider_state
 FROM session_agent_bindings
 WHERE session_key = ?`
 	selectBindingByAgentSessionSQL = `
-SELECT session_key, agent, agent_session_id, agent_ctx_seq
+SELECT session_key, agent, agent_session_id, agent_ctx_seq, provider_id, provider_revision, provider_endpoint_revision, provider_protocol, provider_state
 FROM session_agent_bindings
 WHERE agent = ? AND agent_session_id = ?
 LIMIT 1`
@@ -142,11 +161,18 @@ type CreateInput struct {
 }
 
 type AgentBinding struct {
-	SessionKey     string `json:"session_key"`
-	Agent          string `json:"agent"`
-	AgentSessionID string `json:"agent_session_id"`
-	AgentCtxSeq    int    `json:"agent_ctx_seq"`
+	SessionKey               string `json:"session_key"`
+	Agent                    string `json:"agent"`
+	AgentSessionID           string `json:"agent_session_id"`
+	AgentCtxSeq              int    `json:"agent_ctx_seq"`
+	ProviderID               string `json:"provider_id,omitempty"`
+	ProviderRevision         string `json:"provider_revision,omitempty"`
+	ProviderEndpointRevision string `json:"provider_endpoint_revision,omitempty"`
+	ProviderProtocol         string `json:"provider_protocol,omitempty"`
+	ProviderState            string `json:"provider_state"`
 }
+
+const ProviderStateLegacyUnbound = "legacy_unbound"
 
 type ListOptions struct {
 	BeforeTime       time.Time
@@ -737,7 +763,7 @@ func (m *Manager) UpdateAgentState(_ context.Context, session *Session, agent st
 	if strings.TrimSpace(agentSessionID) == "" {
 		return nil
 	}
-	return m.upsertAgentBindingUnsafe(AgentBinding{
+	return m.updateAgentRuntimeStateUnsafe(AgentBinding{
 		SessionKey:     strings.TrimSpace(session.Key),
 		Agent:          strings.TrimSpace(agent),
 		AgentSessionID: strings.TrimSpace(agentSessionID),
@@ -757,7 +783,74 @@ func (m *Manager) UpsertAgentBinding(_ context.Context, binding AgentBinding) er
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.upsertAgentBindingUnsafe(binding)
+	return m.updateAgentRuntimeStateUnsafe(binding)
+}
+
+// BindProviderIfUnbound stores a provider identity before a native runtime is opened.
+// Runtime state updates deliberately cannot overwrite this provider metadata.
+func (m *Manager) BindProviderIfUnbound(_ context.Context, binding AgentBinding) (*AgentBinding, error) {
+	if strings.TrimSpace(binding.SessionKey) == "" {
+		return nil, errors.New("session key required")
+	}
+	if strings.TrimSpace(binding.Agent) == "" {
+		return nil, errors.New("agent required")
+	}
+	if strings.TrimSpace(binding.ProviderID) == "" {
+		return nil, errors.New("provider id required")
+	}
+	if strings.TrimSpace(binding.ProviderState) == "" {
+		binding.ProviderState = "available"
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	db, err := m.ensureSessionMetaDBUnsafe()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := db.Exec(bindProviderIfUnboundSQL,
+		strings.TrimSpace(binding.SessionKey),
+		strings.TrimSpace(binding.Agent),
+		strings.TrimSpace(binding.ProviderID),
+		strings.TrimSpace(binding.ProviderRevision),
+		strings.TrimSpace(binding.ProviderEndpointRevision),
+		strings.TrimSpace(binding.ProviderProtocol),
+		strings.TrimSpace(binding.ProviderState),
+	); err != nil {
+		return nil, err
+	}
+	return m.getAgentBindingUnsafe(binding.SessionKey, binding.Agent)
+}
+
+func (m *Manager) UpdateBoundProvider(_ context.Context, binding AgentBinding) error {
+	if strings.TrimSpace(binding.SessionKey) == "" || strings.TrimSpace(binding.Agent) == "" || strings.TrimSpace(binding.ProviderID) == "" {
+		return errors.New("session key, agent and provider id required")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	db, err := m.ensureSessionMetaDBUnsafe()
+	if err != nil {
+		return err
+	}
+	result, err := db.Exec(updateProviderBindingSQL,
+		strings.TrimSpace(binding.ProviderRevision),
+		strings.TrimSpace(binding.ProviderEndpointRevision),
+		strings.TrimSpace(binding.ProviderProtocol),
+		strings.TrimSpace(binding.ProviderState),
+		strings.TrimSpace(binding.SessionKey),
+		strings.TrimSpace(binding.Agent),
+		strings.TrimSpace(binding.ProviderID),
+	)
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed == 0 {
+		return errSessionNotFound
+	}
+	return nil
 }
 
 func (m *Manager) GetAgentBinding(_ context.Context, sessionKey, agent string) (*AgentBinding, error) {
@@ -769,19 +862,7 @@ func (m *Manager) GetAgentBinding(_ context.Context, sessionKey, agent string) (
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	db, err := m.ensureSessionMetaDBUnsafe()
-	if err != nil {
-		return nil, err
-	}
-	row := db.QueryRow(selectAgentBindingSQL, strings.TrimSpace(sessionKey), strings.TrimSpace(agent))
-	var binding AgentBinding
-	if err := row.Scan(&binding.SessionKey, &binding.Agent, &binding.AgentSessionID, &binding.AgentCtxSeq); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, errSessionNotFound
-		}
-		return nil, err
-	}
-	return &binding, nil
+	return m.getAgentBindingUnsafe(sessionKey, agent)
 }
 
 func (m *Manager) FindAgentBinding(ctx context.Context, sessionKey, agent string) (*AgentBinding, error) {
@@ -790,6 +871,33 @@ func (m *Manager) FindAgentBinding(ctx context.Context, sessionKey, agent string
 		return nil, nil
 	}
 	return binding, err
+}
+
+func (m *Manager) ListAgentBindings(_ context.Context, sessionKey string) ([]AgentBinding, error) {
+	if strings.TrimSpace(sessionKey) == "" {
+		return nil, errors.New("session key required")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.listAgentBindingsUnsafe(sessionKey)
+}
+
+func (m *Manager) CountProviderBindings(_ context.Context, providerID string) (int, error) {
+	providerID = strings.TrimSpace(providerID)
+	if providerID == "" {
+		return 0, errors.New("provider id required")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.db == nil {
+		return 0, nil
+	}
+	db := m.db
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM session_agent_bindings WHERE provider_id = ?`, providerID).Scan(&count); err != nil {
+		return 0, err
+	}
+	return count, nil
 }
 
 func (m *Manager) FindAgentBindingByAgentSession(_ context.Context, agent, agentSessionID string) (*AgentBinding, error) {
@@ -810,7 +918,7 @@ func (m *Manager) FindAgentBindingByAgentSession(_ context.Context, agent, agent
 		selectBindingByAgentSessionSQL,
 		strings.TrimSpace(agent),
 		strings.TrimSpace(agentSessionID),
-	).Scan(&binding.SessionKey, &binding.Agent, &binding.AgentSessionID, &binding.AgentCtxSeq)
+	).Scan(&binding.SessionKey, &binding.Agent, &binding.AgentSessionID, &binding.AgentCtxSeq, &binding.ProviderID, &binding.ProviderRevision, &binding.ProviderEndpointRevision, &binding.ProviderProtocol, &binding.ProviderState)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -842,7 +950,7 @@ func (m *Manager) listAgentBindingsUnsafe(sessionKey string) ([]AgentBinding, er
 	bindings := make([]AgentBinding, 0)
 	for rows.Next() {
 		var binding AgentBinding
-		if err := rows.Scan(&binding.SessionKey, &binding.Agent, &binding.AgentSessionID, &binding.AgentCtxSeq); err != nil {
+		if err := rows.Scan(&binding.SessionKey, &binding.Agent, &binding.AgentSessionID, &binding.AgentCtxSeq, &binding.ProviderID, &binding.ProviderRevision, &binding.ProviderEndpointRevision, &binding.ProviderProtocol, &binding.ProviderState); err != nil {
 			return nil, err
 		}
 		bindings = append(bindings, binding)
@@ -853,7 +961,32 @@ func (m *Manager) listAgentBindingsUnsafe(sessionKey string) ([]AgentBinding, er
 	return bindings, nil
 }
 
-func (m *Manager) upsertAgentBindingUnsafe(binding AgentBinding) error {
+func (m *Manager) getAgentBindingUnsafe(sessionKey, agent string) (*AgentBinding, error) {
+	db, err := m.ensureSessionMetaDBUnsafe()
+	if err != nil {
+		return nil, err
+	}
+	var binding AgentBinding
+	if err := db.QueryRow(selectAgentBindingSQL, strings.TrimSpace(sessionKey), strings.TrimSpace(agent)).Scan(
+		&binding.SessionKey,
+		&binding.Agent,
+		&binding.AgentSessionID,
+		&binding.AgentCtxSeq,
+		&binding.ProviderID,
+		&binding.ProviderRevision,
+		&binding.ProviderEndpointRevision,
+		&binding.ProviderProtocol,
+		&binding.ProviderState,
+	); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, errSessionNotFound
+		}
+		return nil, err
+	}
+	return &binding, nil
+}
+
+func (m *Manager) updateAgentRuntimeStateUnsafe(binding AgentBinding) error {
 	db, err := m.ensureSessionMetaDBUnsafe()
 	if err != nil {
 		return err
@@ -1635,6 +1768,10 @@ func openSessionMetaDB(dbFile string) (db *sql.DB, err error) {
 		db.Close()
 		return nil, err
 	}
+	if err := migrateAgentBindingTable(db); err != nil {
+		db.Close()
+		return nil, err
+	}
 	if _, err := db.Exec(`ALTER TABLE sessions ADD COLUMN model TEXT NOT NULL DEFAULT ''`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
 		db.Close()
 		return nil, err
@@ -1660,6 +1797,56 @@ func openSessionMetaDB(dbFile string) (db *sql.DB, err error) {
 		}
 	}
 	return db, nil
+}
+
+func migrateAgentBindingTable(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	rows, err := tx.Query(`PRAGMA table_info(session_agent_bindings)`)
+	if err != nil {
+		return err
+	}
+	columns := map[string]bool{}
+	for rows.Next() {
+		var cid int
+		var name, columnType string
+		var notNull, primaryKey int
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			rows.Close()
+			return err
+		}
+		columns[strings.ToLower(name)] = true
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	for _, migration := range []struct {
+		column string
+		stmt   string
+	}{
+		{"provider_id", `ALTER TABLE session_agent_bindings ADD COLUMN provider_id TEXT NOT NULL DEFAULT ''`},
+		{"provider_revision", `ALTER TABLE session_agent_bindings ADD COLUMN provider_revision TEXT NOT NULL DEFAULT ''`},
+		{"provider_endpoint_revision", `ALTER TABLE session_agent_bindings ADD COLUMN provider_endpoint_revision TEXT NOT NULL DEFAULT ''`},
+		{"provider_protocol", `ALTER TABLE session_agent_bindings ADD COLUMN provider_protocol TEXT NOT NULL DEFAULT ''`},
+		{"provider_state", `ALTER TABLE session_agent_bindings ADD COLUMN provider_state TEXT NOT NULL DEFAULT 'legacy_unbound'`},
+	} {
+		if columns[migration.column] {
+			continue
+		}
+		if _, err := tx.Exec(migration.stmt); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func readSessionDBLink(linkFile string) (string, bool, error) {

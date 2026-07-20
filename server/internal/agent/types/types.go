@@ -115,6 +115,15 @@ type OpenSessionInput struct {
 	AgentSessionID string
 	AgentCtxSeq    int
 	ForkPoint      ResolveForkPointOutput
+	// RuntimeEnv is an in-memory override for a session-bound provider. It is
+	// never persisted in session metadata or sent to the browser.
+	RuntimeEnv map[string]string
+	// RuntimeArgs are non-secret app-server overrides for a session-bound
+	// provider. Secrets must remain in RuntimeEnv.
+	RuntimeArgs []string
+	// RuntimeKey separates shared runtime clients initialized with different
+	// provider identities or revisions.
+	RuntimeKey string
 }
 
 type RuntimeDefaults struct {
@@ -188,11 +197,11 @@ type StreamingExternalSessionImporter interface {
 }
 
 type ModelInfo struct {
-	ID            string   `json:"id"`
-	Name          string   `json:"name"`
-	Description   string   `json:"description,omitempty"`
-	Hidden        bool     `json:"hidden,omitempty"`
-	SupportEffort bool     `json:"supportEffort,omitempty"`
+	ID            string `json:"id"`
+	Name          string `json:"name"`
+	Description   string `json:"description,omitempty"`
+	Hidden        bool   `json:"hidden,omitempty"`
+	SupportEffort bool   `json:"supportEffort,omitempty"`
 	// Efforts 和 DefaultEffort 来自模型目录，避免把不同模型的思考等级混成 Agent 全局能力。
 	Efforts       []string `json:"efforts,omitempty"`
 	DefaultEffort string   `json:"default_effort,omitempty"`

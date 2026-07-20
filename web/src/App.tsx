@@ -306,7 +306,8 @@ export type SessionItem = {
   updated_at?: string;
   closed_at?: string;
   title?: string;
-  agent_session_id?: string;
+	agent_session_id?: string;
+	agent_bindings?: Array<{ agent?: string; agent_session_id?: string }>;
   context_window?: {
     totalTokens: number;
     modelContextWindow: number;
@@ -449,7 +450,8 @@ function toSessionItem(
       typeof session?.agent === "string" && session.agent.trim()
         ? session.agent
         : latestExchangeText(session?.exchanges, "agent"),
-    model: typeof session?.model === "string" ? session.model : "",
+		model: typeof session?.model === "string" ? session.model : "",
+		agent_bindings: Array.isArray(session?.agent_bindings) ? session.agent_bindings : undefined,
     shell: typeof session?.shell === "string" ? session.shell : "",
     mode:
       typeof session?.mode === "string" && session.mode.trim()
@@ -6306,6 +6308,15 @@ export function App({ onGoHome }: AppProps) {
       if (applyPendingPlanPrefix) {
         outgoingMessage = `/plan ${outgoingMessage}`;
       }
+      const selectedProvider = availableAgents.find(
+        (item) => item.name === effectiveAgent,
+      )?.last_config_selection;
+      const effectiveProviderID =
+        (effectiveAgent === "claude" || effectiveAgent === "codex") &&
+        !sendSessionKey &&
+        selectedProvider?.type === "api_provider"
+          ? selectedProvider.id || undefined
+          : undefined;
       const sent = await sessionService.sendMessage(
         activeRoot,
         sendSessionKey || undefined,
@@ -6313,6 +6324,7 @@ export function App({ onGoHome }: AppProps) {
         effectiveMode,
         effectiveAgent,
         effectiveModel || undefined,
+        effectiveProviderID,
         effectiveAgentMode || undefined,
         effectiveEffort || undefined,
         effectiveFastService,

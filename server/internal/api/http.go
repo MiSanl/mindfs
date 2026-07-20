@@ -786,7 +786,7 @@ func (h *HTTPHandler) handleSessionGet(w http.ResponseWriter, r *http.Request) {
 		Key:    key,
 		Seq:    afterSeq,
 	})
-	respondJSON(w, http.StatusOK, h.sessionResponse(out, pendingUser, contextWindow, exchangeAux))
+	respondJSON(w, http.StatusOK, h.sessionResponseWithBindings(r.Context(), rootID, key, out, pendingUser, contextWindow, exchangeAux))
 }
 
 func (h *HTTPHandler) handleSessionSync(w http.ResponseWriter, r *http.Request) {
@@ -828,7 +828,30 @@ func (h *HTTPHandler) handleSessionSync(w http.ResponseWriter, r *http.Request) 
 		Key:    key,
 		Seq:    afterSeq,
 	})
-	respondJSON(w, http.StatusOK, h.sessionResponse(out, nil, contextWindow, exchangeAux))
+	respondJSON(w, http.StatusOK, h.sessionResponseWithBindings(r.Context(), rootID, key, out, nil, contextWindow, exchangeAux))
+}
+
+func (h *HTTPHandler) sessionResponseWithBindings(ctx context.Context, rootID, key string, s *session.Session, pendingUser *session.Exchange, contextWindow agenttypes.ContextWindow, exchangeAux map[int][]session.ExchangeAux) map[string]any {
+	response := h.sessionResponse(s, pendingUser, contextWindow, exchangeAux)
+	if h == nil || h.AppContext == nil {
+		return response
+	}
+	manager, err := h.AppContext.GetSessionManager(rootID)
+	if err != nil {
+		return response
+	}
+	bindings, err := manager.ListAgentBindings(ctx, key)
+	if err != nil {
+		return response
+	}
+	public := make([]map[string]string, 0, len(bindings))
+	for _, binding := range bindings {
+		if strings.TrimSpace(binding.AgentSessionID) != "" {
+			public = append(public, map[string]string{"agent": binding.Agent, "agent_session_id": binding.AgentSessionID})
+		}
+	}
+	response["agent_bindings"] = public
+	return response
 }
 
 func (h *HTTPHandler) handleSessionToolCallGet(w http.ResponseWriter, r *http.Request) {

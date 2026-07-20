@@ -22,6 +22,46 @@ func TestCodexListModelsParamsIncludesHiddenModels(t *testing.T) {
 	}
 }
 
+func TestRuntimeClientKeyIncludesProviderRevision(t *testing.T) {
+	runtime := NewRuntime()
+	first := OpenOptions{AgentName: "codex", RuntimeKey: "codex:api-one:rev-1"}
+	second := OpenOptions{AgentName: "codex", RuntimeKey: "codex:api-two:rev-1"}
+	changed := OpenOptions{AgentName: "codex", RuntimeKey: "codex:api-one:rev-2"}
+	if runtime.clientKey(first) != first.RuntimeKey {
+		t.Fatalf("client key = %q", runtime.clientKey(first))
+	}
+	if runtime.clientKey(first) == runtime.clientKey(second) {
+		t.Fatal("different providers must not share a client key")
+	}
+	if runtime.clientKey(first) == runtime.clientKey(changed) {
+		t.Fatal("provider revision change must not share a client key")
+	}
+	if got := runtime.clientKey(OpenOptions{AgentName: "codex"}); got != "codex" {
+		t.Fatalf("legacy client key = %q, want codex", got)
+	}
+}
+
+func TestRuntimeCloseMatchesRevisionScopedAgentKeys(t *testing.T) {
+	runtime := NewRuntime()
+	runtime.clients = map[string]*codexsdk.Codex{
+		"codex:api-one:rev-1":  nil,
+		"codex:api-two:rev-2":  nil,
+		"claude:api-one:rev-1": nil,
+	}
+	if err := runtime.Close("codex"); err != nil {
+		t.Fatalf("close codex: %v", err)
+	}
+	if _, ok := runtime.clients["codex:api-one:rev-1"]; ok {
+		t.Fatal("first codex provider client was retained")
+	}
+	if _, ok := runtime.clients["codex:api-two:rev-2"]; ok {
+		t.Fatal("second codex provider client was retained")
+	}
+	if _, ok := runtime.clients["claude:api-one:rev-1"]; !ok {
+		t.Fatal("other agent client was removed")
+	}
+}
+
 type modelListExecStub struct {
 	params   codextypes.ModelListParams
 	response *codextypes.ModelListResponse

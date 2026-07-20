@@ -53,6 +53,7 @@ type SharedFileWatcher struct {
 	sessionStore SessionFileRecorder
 
 	mu                sync.RWMutex
+	watchMu           sync.Mutex
 	sessions          map[string]*sessionInfo
 	watchedDirs       map[string]struct{}
 	pendingWrites     map[string]string
@@ -346,7 +347,9 @@ func (sw *SharedFileWatcher) Close() {
 	}
 	sw.mu.Unlock()
 	sw.flushFileChangeBatch(0)
+	sw.watchMu.Lock()
 	sw.watcher.Close()
+	sw.watchMu.Unlock()
 }
 
 func (sw *SharedFileWatcher) run() {
@@ -393,7 +396,9 @@ func (sw *SharedFileWatcher) run() {
 					Op:     event.Op.String(),
 					IsDir:  true,
 				})
-				_ = sw.WatchDir(rel)
+				// fsnotify.Add can wait for the Windows event reader. Keep this
+				// loop available to consume those events while the new watch starts.
+				go func(dir string) { _ = sw.WatchDir(dir) }(rel)
 				continue
 			}
 			sw.emitFileChange(FileChangeEvent{
@@ -557,21 +562,36 @@ func (sw *SharedFileWatcher) WatchDir(dirRel string) error {
 		return nil
 	}
 	clean := filepath.Clean(dirAbs)
+	sw.watchMu.Lock()
+	defer sw.watchMu.Unlock()
+	sw.mu.Lock()
+	select {
+	case <-sw.done:
+		sw.mu.Unlock()
+		return nil
+	default:
+	}
+	if _, ok := sw.watchedDirs[clean]; ok {
+		sw.mu.Unlock()
+		return nil
+	}
+	if len(sw.watchedDirs) >= maxWatchDirs {
+		sw.mu.Unlock()
+		return nil
+	}
+	sw.mu.Unlock()
+
+	// fsnotify.Add can synchronously dispatch Windows events, so it must not run
+	// while holding sw.mu; the event loop also needs that lock.
+	if err := sw.watcher.Add(clean); err != nil {
+		return err
+	}
 	sw.mu.Lock()
 	defer sw.mu.Unlock()
 	select {
 	case <-sw.done:
 		return nil
 	default:
-	}
-	if _, ok := sw.watchedDirs[clean]; ok {
-		return nil
-	}
-	if len(sw.watchedDirs) >= maxWatchDirs {
-		return nil
-	}
-	if err := sw.watcher.Add(clean); err != nil {
-		return err
 	}
 	sw.watchedDirs[clean] = struct{}{}
 	return nil

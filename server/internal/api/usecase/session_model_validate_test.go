@@ -178,6 +178,17 @@ func TestValidateAgentModelBackupLastConfigDoesNotAllowViaHook(t *testing.T) {
 	}
 }
 
+func TestValidateAgentModelForProviderDoesNotUseGlobalSelection(t *testing.T) {
+	svc := &Service{}
+	provider := &SessionProviderConfig{ID: "api-bound", Models: []string{"grok-4.5"}}
+	if err := svc.validateAgentModelForProvider("codex", "grok-4.5", provider); err != nil {
+		t.Fatalf("bound provider model rejected: %v", err)
+	}
+	if err := svc.validateAgentModelForProvider("codex", "gpt-5.5", provider); err == nil {
+		t.Fatal("model absent from bound provider must be rejected")
+	}
+}
+
 // stubValidateRegistry implements Registry with only GetProber/GetPreferences meaningful.
 type stubValidateRegistry struct {
 	prober *agent.Prober
@@ -199,13 +210,13 @@ func (r stubValidateRegistry) RemoveRoot(string) (rootfs.RootInfo, error) {
 func (r stubValidateRegistry) RenameRoot(string, string, string) (rootfs.RootInfo, error) {
 	return rootfs.RootInfo{}, errors.New("not implemented")
 }
-func (r stubValidateRegistry) ListRoots() []rootfs.RootInfo           { return nil }
-func (r stubValidateRegistry) GetAgentPool() *agent.Pool              { return nil }
-func (r stubValidateRegistry) GetPreferences() *preferences.Store     { return r.prefs }
+func (r stubValidateRegistry) ListRoots() []rootfs.RootInfo       { return nil }
+func (r stubValidateRegistry) GetAgentPool() *agent.Pool          { return nil }
+func (r stubValidateRegistry) GetPreferences() *preferences.Store { return r.prefs }
 func (r stubValidateRegistry) GetExternalSessionImporter(string) (agenttypes.ExternalSessionImporter, error) {
 	return nil, errors.New("not implemented")
 }
-func (r stubValidateRegistry) GetProber() *agent.Prober               { return r.prober }
+func (r stubValidateRegistry) GetProber() *agent.Prober { return r.prober }
 func (r stubValidateRegistry) GetCandidateRegistry() *CandidateRegistry {
 	return nil
 }

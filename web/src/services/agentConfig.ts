@@ -156,9 +156,9 @@ export async function syncAgentAPIProviders(input: Array<{
   });
 }
 
-export async function deleteAgentAPIProvider(id: string): Promise<{ deleted: boolean; id: string; providers?: AgentAPIProvider[] }> {
-  const params = new URLSearchParams({ id });
-  return protectedJSON<{ deleted: boolean; id: string; providers?: AgentAPIProvider[] }>(appPath(`/api/agent-api-providers?${params.toString()}`), {
+export async function deleteAgentAPIProvider(id: string): Promise<{ deleted: boolean; id: string; providers?: AgentAPIProvider[]; loaded_affected_sessions?: number }> {
+	const params = new URLSearchParams({ id });
+	return protectedJSON<{ deleted: boolean; id: string; providers?: AgentAPIProvider[]; loaded_affected_sessions?: number }>(appPath(`/api/agent-api-providers?${params.toString()}`), {
     method: "DELETE",
   });
 }

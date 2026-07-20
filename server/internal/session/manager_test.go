@@ -13,10 +13,17 @@ import (
 	rootfs "mindfs/server/internal/fs"
 )
 
+func newTestManager(t *testing.T, root rootfs.RootInfo) *Manager {
+	t.Helper()
+	manager := NewManager(root)
+	t.Cleanup(func() { _ = manager.Shutdown() })
+	return manager
+}
+
 func TestManagerUsesSessionDBLink(t *testing.T) {
 	rootDir := t.TempDir()
 	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
-	manager := NewManager(root)
+	manager := newTestManager(t, root)
 
 	linkedDB := filepath.Join(t.TempDir(), "session-list.db")
 	linkFile := filepath.Join(root.MetaDir(), "sessions", "session-list.db.link")
@@ -35,10 +42,188 @@ func TestManagerUsesSessionDBLink(t *testing.T) {
 	}
 }
 
+func TestManagerProviderBindingSurvivesRuntimeStateUpdates(t *testing.T) {
+	root := rootfs.NewRootInfo("provider-binding", "provider-binding", t.TempDir())
+	manager := newTestManager(t, root)
+	created, err := manager.Create(context.Background(), CreateInput{Type: TypeChat, Name: "Provider binding"})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	bound, err := manager.BindProviderIfUnbound(context.Background(), AgentBinding{
+		SessionKey:               created.Key,
+		Agent:                    "codex",
+		ProviderID:               "api-example",
+		ProviderRevision:         "revision-1",
+		ProviderEndpointRevision: "endpoint-1",
+		ProviderProtocol:         "openai-compatible",
+		ProviderState:            "available",
+	})
+	if err != nil {
+		t.Fatalf("bind provider: %v", err)
+	}
+	if bound.ProviderID != "api-example" || bound.ProviderState != "available" {
+		t.Fatalf("bound provider = %#v", bound)
+	}
+
+	if err := manager.UpdateAgentState(context.Background(), created, "codex", 7, "thread-1"); err != nil {
+		t.Fatalf("update runtime state: %v", err)
+	}
+	loaded, err := manager.GetAgentBinding(context.Background(), created.Key, "codex")
+	if err != nil {
+		t.Fatalf("get binding: %v", err)
+	}
+	if loaded.AgentSessionID != "thread-1" || loaded.AgentCtxSeq != 7 {
+		t.Fatalf("runtime state = %#v", loaded)
+	}
+	if loaded.ProviderID != "api-example" || loaded.ProviderRevision != "revision-1" || loaded.ProviderEndpointRevision != "endpoint-1" || loaded.ProviderProtocol != "openai-compatible" || loaded.ProviderState != "available" {
+		t.Fatalf("provider state was overwritten: %#v", loaded)
+	}
+
+	bound, err = manager.BindProviderIfUnbound(context.Background(), AgentBinding{
+		SessionKey: created.Key,
+		Agent:      "codex",
+		ProviderID: "api-other",
+	})
+	if err != nil {
+		t.Fatalf("bind existing provider: %v", err)
+	}
+	if bound.ProviderID != "api-example" {
+		t.Fatalf("provider id = %q, want original binding", bound.ProviderID)
+	}
+}
+
+func TestManagerListsOnlyNonSecretProviderBindings(t *testing.T) {
+	root := rootfs.NewRootInfo("provider-binding-list", "provider-binding-list", t.TempDir())
+	manager := newTestManager(t, root)
+	created, err := manager.Create(context.Background(), CreateInput{Type: TypeChat, Name: "Provider bindings"})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if _, err := manager.BindProviderIfUnbound(context.Background(), AgentBinding{
+		SessionKey:               created.Key,
+		Agent:                    "claude",
+		ProviderID:               "api-claude",
+		ProviderRevision:         "revision",
+		ProviderEndpointRevision: "endpoint",
+		ProviderProtocol:         "anthropic-compatible",
+		ProviderState:            "available",
+	}); err != nil {
+		t.Fatalf("bind provider: %v", err)
+	}
+	if err := manager.UpdateAgentState(context.Background(), created, "claude", 2, "claude-native-session"); err != nil {
+		t.Fatalf("update runtime state: %v", err)
+	}
+	bindings, err := manager.ListAgentBindings(context.Background(), created.Key)
+	if err != nil {
+		t.Fatalf("list bindings: %v", err)
+	}
+	if len(bindings) != 1 {
+		t.Fatalf("bindings = %#v", bindings)
+	}
+	if got := bindings[0]; got.Agent != "claude" || got.AgentSessionID != "claude-native-session" || got.ProviderID != "api-claude" {
+		t.Fatalf("binding = %#v", got)
+	}
+}
+
+func TestManagerCountsProviderBindings(t *testing.T) {
+	root := rootfs.NewRootInfo("provider-count", "provider-count", t.TempDir())
+	manager := newTestManager(t, root)
+	created, err := manager.Create(context.Background(), CreateInput{Type: TypeChat, Name: "Provider count"})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if _, err := manager.BindProviderIfUnbound(context.Background(), AgentBinding{SessionKey: created.Key, Agent: "codex", ProviderID: "api-count"}); err != nil {
+		t.Fatalf("bind provider: %v", err)
+	}
+	if count, err := manager.CountProviderBindings(context.Background(), "api-count"); err != nil || count != 1 {
+		t.Fatalf("count = %d, %v; want 1, nil", count, err)
+	}
+}
+
+func TestOpenSessionMetaDBMigratesLegacyAgentBindings(t *testing.T) {
+	dbFile := filepath.Join(t.TempDir(), "session-list.db")
+	db, err := sql.Open("sqlite", dbFile)
+	if err != nil {
+		t.Fatalf("open legacy db: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE session_agent_bindings (
+		session_key TEXT NOT NULL,
+		agent TEXT NOT NULL,
+		agent_session_id TEXT NOT NULL,
+		agent_ctx_seq INTEGER NOT NULL DEFAULT 0,
+		PRIMARY KEY (session_key, agent)
+	)`); err != nil {
+		db.Close()
+		t.Fatalf("create legacy table: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO session_agent_bindings (session_key, agent, agent_session_id, agent_ctx_seq) VALUES ('legacy', 'claude', 'native-1', 3)`); err != nil {
+		db.Close()
+		t.Fatalf("insert legacy binding: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close legacy db: %v", err)
+	}
+
+	migrated, err := openSessionMetaDB(dbFile)
+	if err != nil {
+		t.Fatalf("migrate db: %v", err)
+	}
+	defer migrated.Close()
+	var binding AgentBinding
+	if err := migrated.QueryRow(selectAgentBindingSQL, "legacy", "claude").Scan(
+		&binding.SessionKey,
+		&binding.Agent,
+		&binding.AgentSessionID,
+		&binding.AgentCtxSeq,
+		&binding.ProviderID,
+		&binding.ProviderRevision,
+		&binding.ProviderEndpointRevision,
+		&binding.ProviderProtocol,
+		&binding.ProviderState,
+	); err != nil {
+		t.Fatalf("read migrated binding: %v", err)
+	}
+	if binding.ProviderID != "" || binding.ProviderRevision != "" || binding.ProviderEndpointRevision != "" || binding.ProviderProtocol != "" || binding.ProviderState != ProviderStateLegacyUnbound {
+		t.Fatalf("legacy provider binding = %#v", binding)
+	}
+}
+
+func TestAgentBindingSchemaRemainsReadableByPreviousColumns(t *testing.T) {
+	dbFile := filepath.Join(t.TempDir(), "session-list.db")
+	db, err := openSessionMetaDB(dbFile)
+	if err != nil {
+		t.Fatalf("open upgraded db: %v", err)
+	}
+	if _, err := db.Exec(bindProviderIfUnboundSQL, "session", "codex", "api-current", "revision", "endpoint", "openai-compatible", "available"); err != nil {
+		db.Close()
+		t.Fatalf("write new binding: %v", err)
+	}
+	if _, err := db.Exec(upsertAgentBindingSQL, "session", "codex", "thread-1", 4); err != nil {
+		db.Close()
+		t.Fatalf("write runtime state: %v", err)
+	}
+	// This is the SELECT shape used by the pre-provider-binding binary. SQLite
+	// accepts added columns, so a downgrade can still read its original state.
+	var sessionKey, agent, nativeID string
+	var contextSeq int
+	if err := db.QueryRow(`SELECT session_key, agent, agent_session_id, agent_ctx_seq FROM session_agent_bindings WHERE session_key = ? AND agent = ?`, "session", "codex").Scan(&sessionKey, &agent, &nativeID, &contextSeq); err != nil {
+		db.Close()
+		t.Fatalf("read old column set: %v", err)
+	}
+	if sessionKey != "session" || agent != "codex" || nativeID != "thread-1" || contextSeq != 4 {
+		db.Close()
+		t.Fatalf("old column values = %q %q %q %d", sessionKey, agent, nativeID, contextSeq)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+}
+
 func TestManagerRecordRelatedWorktreeDoesNotOverwriteExisting(t *testing.T) {
 	rootDir := t.TempDir()
 	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
-	manager := NewManager(root)
+	manager := newTestManager(t, root)
 
 	created, err := manager.Create(context.Background(), CreateInput{Type: TypeChat, Name: "Worktree"})
 	if err != nil {
@@ -75,7 +260,7 @@ func TestManagerRecordRelatedWorktreeDoesNotOverwriteExisting(t *testing.T) {
 func TestManagerRelatedFilesAreScopedByRepoHeadAndPath(t *testing.T) {
 	rootDir := t.TempDir()
 	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
-	manager := NewManager(root)
+	manager := newTestManager(t, root)
 
 	created, err := manager.Create(context.Background(), CreateInput{Type: TypeChat, Name: "Related repos"})
 	if err != nil {
@@ -118,7 +303,7 @@ func TestManagerRelatedFilesAreScopedByRepoHeadAndPath(t *testing.T) {
 func TestManagerRecordsSubSessionRelatedFileOnParent(t *testing.T) {
 	rootDir := t.TempDir()
 	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
-	manager := NewManager(root)
+	manager := newTestManager(t, root)
 
 	parent, err := manager.Create(context.Background(), CreateInput{Type: TypeChat, Name: "Parent"})
 	if err != nil {
@@ -162,7 +347,7 @@ func TestManagerRecordsSubSessionRelatedFileOnParent(t *testing.T) {
 func TestManagerFallsBackToUserDataSessionDBOnSQLitePanic(t *testing.T) {
 	rootDir := t.TempDir()
 	root := rootfs.NewRootInfo("panic-root", "panic-root", rootDir)
-	manager := NewManager(root)
+	manager := newTestManager(t, root)
 
 	originalOpen := openSQLiteDB
 	originalConfigDir := mindFSConfigDir
@@ -206,7 +391,7 @@ func TestManagerFallsBackToUserDataSessionDBOnSQLitePanic(t *testing.T) {
 
 func TestManagerPersistsParentSessionMetadata(t *testing.T) {
 	root := rootfs.NewRootInfo("mindfs", "mindfs", t.TempDir())
-	manager := NewManager(root)
+	manager := newTestManager(t, root)
 
 	created, err := manager.Create(context.Background(), CreateInput{
 		Type:             TypeChat,
@@ -234,7 +419,7 @@ func TestManagerPersistsParentSessionMetadata(t *testing.T) {
 
 func TestManagerPersistsExchangeModelDisplayName(t *testing.T) {
 	root := rootfs.NewRootInfo("mindfs", "mindfs", t.TempDir())
-	manager := NewManager(root)
+	manager := newTestManager(t, root)
 
 	created, err := manager.Create(context.Background(), CreateInput{
 		Type:  TypeChat,
@@ -267,7 +452,7 @@ func TestManagerPersistsExchangeModelDisplayName(t *testing.T) {
 
 func TestManagerStoresFullToolCallAndReturnsCompactedAux(t *testing.T) {
 	root := rootfs.NewRootInfo("mindfs", "mindfs", t.TempDir())
-	manager := NewManager(root)
+	manager := newTestManager(t, root)
 
 	created, err := manager.Create(context.Background(), CreateInput{
 		Type: TypeChat,
@@ -325,7 +510,7 @@ func TestManagerStoresFullToolCallAndReturnsCompactedAux(t *testing.T) {
 
 func TestManagerStoresPlanAndCompactAux(t *testing.T) {
 	root := rootfs.NewRootInfo("mindfs", "mindfs", t.TempDir())
-	manager := NewManager(root)
+	manager := newTestManager(t, root)
 
 	created, err := manager.Create(context.Background(), CreateInput{
 		Type: TypeChat,
@@ -373,7 +558,7 @@ func TestManagerStoresPlanAndCompactAux(t *testing.T) {
 
 func TestManagerStoresTodoAux(t *testing.T) {
 	root := rootfs.NewRootInfo("mindfs", "mindfs", t.TempDir())
-	manager := NewManager(root)
+	manager := newTestManager(t, root)
 
 	created, err := manager.Create(context.Background(), CreateInput{
 		Type: TypeChat,
@@ -407,7 +592,7 @@ func TestManagerStoresTodoAux(t *testing.T) {
 
 func TestManagerGetFullToolCallReadsPendingAuxBeforeDisk(t *testing.T) {
 	root := rootfs.NewRootInfo("mindfs", "mindfs", t.TempDir())
-	manager := NewManager(root)
+	manager := newTestManager(t, root)
 
 	created, err := manager.Create(context.Background(), CreateInput{
 		Type: TypeChat,
@@ -466,7 +651,7 @@ func TestManagerGetFullToolCallReadsPendingAuxBeforeDisk(t *testing.T) {
 
 func TestManagerMarkPendingAskUserAnsweredMergesAnswers(t *testing.T) {
 	root := rootfs.NewRootInfo("mindfs", "mindfs", t.TempDir())
-	manager := NewManager(root)
+	manager := newTestManager(t, root)
 
 	created, err := manager.Create(context.Background(), CreateInput{
 		Type: TypeChat,

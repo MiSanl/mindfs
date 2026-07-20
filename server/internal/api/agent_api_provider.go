@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -33,6 +34,8 @@ func init() {
 	// Allow send/resume to accept models from the active API provider catalog
 	// even when the agent probe ListModels catalog is still native/stale.
 	usecase.AgentAPIProviderModelAllowed = agentModelAllowedByActiveProvider
+	usecase.SessionProviderResolver = resolveSessionProviderConfig
+	usecase.ProviderSelectionValidator = validateProviderSelection
 }
 
 const (
@@ -98,6 +101,112 @@ type agentAPIProviderProbeResult struct {
 	ModelFamilies []string
 }
 
+func resolveSessionProviderConfig(agentName, providerID string) (*usecase.SessionProviderConfig, error) {
+	providerID = strings.TrimSpace(providerID)
+	if providerID == "" {
+		return nil, errors.New("session_provider_unavailable: provider id required")
+	}
+	providers, err := readAgentAPIProviders()
+	if err != nil {
+		return nil, fmt.Errorf("session_provider_unavailable: read providers: %w", err)
+	}
+	var provider agentAPIProvider
+	for _, item := range providers {
+		if item.ID == providerID {
+			provider = item
+			break
+		}
+	}
+	if provider.ID == "" {
+		return nil, fmt.Errorf("session_provider_unavailable: provider %q was deleted", providerID)
+	}
+	protocol, ok := selectAPIProviderProtocolForAgent(provider, agentName)
+	if !ok {
+		return nil, fmt.Errorf("session_provider_unavailable: provider %q is incompatible with agent %q", providerID, strings.TrimSpace(agentName))
+	}
+	return &usecase.SessionProviderConfig{
+		ID:               provider.ID,
+		Revision:         sessionProviderRevision(provider),
+		EndpointRevision: sessionProviderEndpointRevision(provider, protocol),
+		Protocol:         protocol,
+		Models:           append([]string{}, provider.Models...),
+		Env:              sessionProviderRuntimeEnv(agentName, provider),
+		Args:             sessionProviderRuntimeArgs(agentName, provider),
+	}, nil
+}
+
+func validateProviderSelection(agentName, model, providerID string) error {
+	providerID = strings.TrimSpace(providerID)
+	if providerID == "" {
+		return nil
+	}
+	config, err := resolveSessionProviderConfig(agentName, providerID)
+	if err != nil {
+		return err
+	}
+	model = strings.TrimSpace(model)
+	if model == "" || len(config.Models) == 0 {
+		return nil
+	}
+	for _, candidate := range config.Models {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == model || strings.HasSuffix(candidate, "/"+model) || strings.HasSuffix(model, "/"+candidate) {
+			return nil
+		}
+	}
+	return fmt.Errorf("model %q is not supported by provider %q", model, providerID)
+}
+
+func sessionProviderRevision(provider agentAPIProvider) string {
+	payload := strings.Join([]string{
+		strings.TrimSpace(provider.BaseURL),
+		strings.Join(agentAPIProviderProtocols(provider), ","),
+		strings.Join(provider.Models, "\x00"),
+		strings.TrimSpace(provider.UpdatedAt),
+	}, "\x00")
+	sum := sha256.Sum256([]byte(payload))
+	return fmt.Sprintf("%x", sum[:])
+}
+
+func sessionProviderEndpointRevision(provider agentAPIProvider, protocol string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(provider.BaseURL) + "\x00" + strings.TrimSpace(protocol)))
+	return fmt.Sprintf("%x", sum[:])
+}
+
+func sessionProviderRuntimeEnv(agentName string, provider agentAPIProvider) map[string]string {
+	switch normalizedAPIProviderAgent(agentName) {
+	case "claude":
+		return map[string]string{
+			"ANTHROPIC_BASE_URL":   provider.BaseURL,
+			"ANTHROPIC_API_KEY":    provider.APIKey,
+			"ANTHROPIC_AUTH_TOKEN": provider.APIKey,
+		}
+	case "codex":
+		return map[string]string{
+			"OPENAI_BASE_URL": provider.BaseURL,
+			"OPENAI_API_KEY":  provider.APIKey,
+		}
+	default:
+		return nil
+	}
+}
+
+func sessionProviderRuntimeArgs(agentName string, provider agentAPIProvider) []string {
+	if normalizedAPIProviderAgent(agentName) != "codex" {
+		return nil
+	}
+	providerName := agentAPIProviderConfigName(provider)
+	return []string{
+		"-c", "model_provider=" + tomlQuote(providerName),
+		"-c", "model_providers." + providerName + ".base_url=" + tomlQuote(provider.BaseURL),
+		"-c", "model_providers." + providerName + ".wire_api=\"responses\"",
+	}
+}
+
+func tomlQuote(value string) string {
+	return strconv.Quote(strings.TrimSpace(value))
+}
+
 func (h *HTTPHandler) handleAgentAPIProvidersList(w http.ResponseWriter, r *http.Request) {
 	agentName := strings.TrimSpace(r.URL.Query().Get("agent"))
 	providers, err := readAgentAPIProviders()
@@ -157,6 +266,14 @@ func (h *HTTPHandler) handleAgentAPIProviderDelete(w http.ResponseWriter, r *htt
 		respondError(w, http.StatusBadRequest, errInvalidRequest("provider id required"))
 		return
 	}
+	affectedSessions := 0
+	if h.AppContext != nil {
+		for _, manager := range h.AppContext.LoadedSessionManagers() {
+			if count, err := manager.CountProviderBindings(r.Context(), id); err == nil {
+				affectedSessions += count
+			}
+		}
+	}
 	providers, err := deleteAgentAPIProvider(id)
 	if err != nil {
 		respondError(w, http.StatusBadRequest, err)
@@ -166,7 +283,7 @@ func (h *HTTPHandler) handleAgentAPIProviderDelete(w http.ResponseWriter, r *htt
 	for _, provider := range providers {
 		out = append(out, publicAgentAPIProvider(provider))
 	}
-	respondJSON(w, http.StatusOK, map[string]any{"deleted": true, "id": id, "providers": out})
+	respondJSON(w, http.StatusOK, map[string]any{"deleted": true, "id": id, "providers": out, "loaded_affected_sessions": affectedSessions})
 }
 
 func (h *HTTPHandler) handleAgentAPIProviderUpdate(w http.ResponseWriter, r *http.Request) {
@@ -260,7 +377,7 @@ func createAgentAPIProvider(ctx context.Context, req agentAPIProviderCreateReque
 			return agentAPIProvider{}, errAgentConfigConflict
 		}
 	}
-	now := time.Now().Format(time.RFC3339)
+	now := time.Now().UTC().Format(time.RFC3339Nano)
 	provider := agentAPIProvider{
 		ID:            id,
 		Name:          name,
@@ -291,7 +408,7 @@ func syncAgentAPIProviders(ctx context.Context, requests []agentAPIProviderCreat
 	for i, provider := range providers {
 		byName[strings.TrimSpace(provider.Name)] = i
 	}
-	now := time.Now().Format(time.RFC3339)
+	now := time.Now().UTC().Format(time.RFC3339Nano)
 	changed := make([]agentAPIProvider, 0, len(requests))
 	seenNames := map[string]struct{}{}
 	for _, req := range requests {
@@ -424,7 +541,7 @@ func updateAgentAPIProvider(ctx context.Context, id string, req agentAPIProvider
 
 	urlChanged := baseURL != strings.TrimSpace(current.BaseURL)
 	keyChanged := apiKey != strings.TrimSpace(current.APIKey)
-	now := time.Now().Format(time.RFC3339)
+	now := time.Now().UTC().Format(time.RFC3339Nano)
 	previousModels := append([]string(nil), current.Models...)
 	current.Name = name
 	current.BaseURL = baseURL
@@ -532,8 +649,11 @@ func switchAgentAPIProvider(req agentAPIProviderSwitchRequest, app *AppContext) 
 		return agentAPIProvider{}, fmt.Errorf("provider protocols %s are not compatible with agent %s", strings.Join(agentAPIProviderProtocols(provider), ", "), agentName)
 	}
 	provider.activeProtocol = selectedProtocol
-	if err := applyAgentAPIProvider(agentName, provider, app); err != nil {
-		return agentAPIProvider{}, err
+	isSessionBoundAgent := normalizedAPIProviderAgent(agentName) == "claude" || normalizedAPIProviderAgent(agentName) == "codex"
+	if !isSessionBoundAgent {
+		if err := applyAgentAPIProvider(agentName, provider, app); err != nil {
+			return agentAPIProvider{}, err
+		}
 	}
 	if app != nil && app.GetPreferences() != nil {
 		if err := app.GetPreferences().UpdateAgentLastConfigSelection(agentName, preferences.LastConfigSelection{
@@ -544,7 +664,7 @@ func switchAgentAPIProvider(req agentAPIProviderSwitchRequest, app *AppContext) 
 			return agentAPIProvider{}, err
 		}
 	}
-	if app != nil && app.GetAgentPool() != nil {
+	if app != nil && app.GetAgentPool() != nil && !isSessionBoundAgent {
 		app.GetAgentPool().KillAgentProcess(agentName, 0)
 	}
 	triggerAgentConfigSwitchProbe(app, agentName)
@@ -1388,6 +1508,9 @@ func normalizeAPIProviderBaseURL(input string) (string, error) {
 	}
 	if parsed.Scheme != "http" && parsed.Scheme != "https" {
 		return "", errors.New("baseUrl scheme must be http or https")
+	}
+	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", errors.New("baseUrl must not contain credentials, query, or fragment")
 	}
 	return baseURL, nil
 }

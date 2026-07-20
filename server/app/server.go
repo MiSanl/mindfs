@@ -187,6 +187,7 @@ func Start(ctx context.Context, addr string, opts StartOptions) error {
 		<-ctx.Done()
 		agentProber.Stop()
 		agentPool.CloseAll()
+		_ = services.Kanban.Close()
 		server.Shutdown(context.Background())
 	}()
 

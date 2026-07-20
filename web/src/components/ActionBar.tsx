@@ -21,6 +21,7 @@ import TokenEditor, {
 import { renderToolIcon } from "./stream/ToolCallCard";
 import { useI18n, type MessageKey } from "../i18n";
 import { CompactUploadProgress } from "./CompactUploadProgress";
+import { copyText } from "../services/clipboard";
 
 type SessionInfo = {
   key: string;
@@ -36,6 +37,7 @@ type SessionInfo = {
   fast_service?: string;
   plan_mode?: boolean;
   pending?: boolean;
+	agent_bindings?: Array<{ agent?: string; agent_session_id?: string }>;
 };
 
 type PendingAttachment = {
@@ -660,6 +662,13 @@ export function ActionBar({
   const planSessionKey = currentSession?.key || currentSession?.session_key || "";
   const planRootId = currentSession?.root_id || currentRootId || "";
   const sessionHistoryKey = currentSession?.key || currentSession?.session_key || "";
+  const nativeSessionID = currentSession?.agent_bindings?.find(
+    (binding) => binding.agent === agent && binding.agent_session_id,
+  )?.agent_session_id || "";
+  const copySessionID = useCallback(() => {
+	if (!nativeSessionID) return;
+	void copyText(nativeSessionID).catch((error) => console.error("[session] copy id failed", error));
+	}, [nativeSessionID]);
 
   useEffect(() => {
     if (!supportsEffort) {
@@ -1771,6 +1780,17 @@ export function ActionBar({
                     compact
                     onFastServiceChange={(nextFastService) => setFastService(nextFastService || "")}
                   />
+				  {nativeSessionID ? (
+                    <button
+                      type="button"
+                      onClick={copySessionID}
+					  title="Copy native session ID"
+					  aria-label="Copy native session ID"
+                      style={{ width: "28px", height: "28px", borderRadius: "8px", border: "none", background: "transparent", color: "var(--text-secondary)", display: "inline-flex", alignItems: "center", justifyContent: "center", cursor: "pointer" }}
+                    >
+                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="9" y="9" width="11" height="11" rx="2" /><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" /></svg>
+                    </button>
+                  ) : null}
                 </div>
               ) : (
                 <ShellSelector

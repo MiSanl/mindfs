@@ -547,6 +547,7 @@ func (h *WSHandler) handleSessionMessage(ctx context.Context, conn *websocket.Co
 	rootID := getString(req.Payload, "root_id")
 	key := getString(req.Payload, "session_key")
 	requestID := strings.TrimSpace(req.ID)
+	createdSession := false
 	content := getString(req.Payload, "content")
 	planRequested, strippedContent := parsePlanMessage(content)
 	if planRequested {
@@ -556,6 +557,7 @@ func (h *WSHandler) handleSessionMessage(ctx context.Context, conn *websocket.Co
 	sessionType := getString(req.Payload, "type")
 	agentName := getString(req.Payload, "agent")
 	model := getString(req.Payload, "model")
+	providerID := getString(req.Payload, "provider_id")
 	agentMode := getString(req.Payload, "agent_mode")
 	effort := getString(req.Payload, "effort")
 	fastService := normalizeFastServiceValue(getString(req.Payload, "fast_service"))
@@ -593,6 +595,7 @@ func (h *WSHandler) handleSessionMessage(ctx context.Context, conn *websocket.Co
 			return
 		}
 		key = created.Key
+		createdSession = true
 		h.broadcastSessionMetaUpdated(rootID, created)
 		if sessionType != session.TypeCommand {
 			go func(rootID, sessionKey, agentName, firstMessage string) {
@@ -646,14 +649,16 @@ func (h *WSHandler) handleSessionMessage(ctx context.Context, conn *websocket.Co
 	}
 	clientCtx := parseClientContext(req.Payload, rootID)
 	userMessage := PendingUserMessage{
-		Agent:       agentName,
-		Model:       model,
-		Mode:        agentMode,
-		Effort:      effort,
-		FastService: fastService,
-		PlanMode:    planMode,
-		Content:     content,
-		Timestamp:   time.Now().UTC(),
+		Agent:             agentName,
+		Model:             model,
+		ProviderID:        providerID,
+		AllowProviderBind: createdSession,
+		Mode:              agentMode,
+		Effort:            effort,
+		FastService:       fastService,
+		PlanMode:          planMode,
+		Content:           content,
+		Timestamp:         time.Now().UTC(),
 	}
 	job := sessionMessageJob{
 		RootID:          rootID,
@@ -689,6 +694,7 @@ func (h *WSHandler) handleSessionSlashCommandRun(ctx context.Context, conn *webs
 	requestID := strings.TrimSpace(req.ID)
 	agentName := getString(req.Payload, "agent")
 	model := getString(req.Payload, "model")
+	providerID := getString(req.Payload, "provider_id")
 	agentMode := getString(req.Payload, "agent_mode")
 	effort := getString(req.Payload, "effort")
 	fastService := normalizeFastServiceValue(getString(req.Payload, "fast_service"))
@@ -729,6 +735,7 @@ func (h *WSHandler) handleSessionSlashCommandRun(ctx context.Context, conn *webs
 		Key:         key,
 		Agent:       agentName,
 		Model:       model,
+		ProviderID:  providerID,
 		Mode:        agentMode,
 		Effort:      effort,
 		FastService: fastService,
@@ -845,18 +852,20 @@ func (h *WSHandler) runSessionMessage(job sessionMessageJob) {
 	}
 
 	err := uc.SendMessage(msgCtx, usecase.SendMessageInput{
-		RootID:       rootID,
-		Key:          key,
-		Agent:        job.User.Agent,
-		Model:        job.User.Model,
-		Mode:         job.User.Mode,
-		Effort:       job.User.Effort,
-		FastService:  job.User.FastService,
-		PlanMode:     &job.User.PlanMode,
-		Shell:        job.Shell,
-		TerminalCols: job.TerminalCols,
-		Content:      job.User.Content,
-		ClientCtx:    job.ClientCtx,
+		RootID:            rootID,
+		Key:               key,
+		Agent:             job.User.Agent,
+		Model:             job.User.Model,
+		ProviderID:        job.User.ProviderID,
+		AllowProviderBind: job.User.AllowProviderBind,
+		Mode:              job.User.Mode,
+		Effort:            job.User.Effort,
+		FastService:       job.User.FastService,
+		PlanMode:          &job.User.PlanMode,
+		Shell:             job.Shell,
+		TerminalCols:      job.TerminalCols,
+		Content:           job.User.Content,
+		ClientCtx:         job.ClientCtx,
 		OnStart: func() {
 			h.AppContext.ClearTaskAuxFlagsForSession(rootID, key)
 			streamHub.BroadcastSessionUserMessage(rootID, key, job.SessionType, job.SessionName, job.User.Agent, job.User.Model, job.User.Mode, job.User.Effort, job.User.FastService, job.User.PlanMode, job.User.Content, job.ExcludeClientID, job.Queued)

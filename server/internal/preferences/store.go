@@ -140,6 +140,20 @@ func (s *Store) UpdateAgentLastConfigSelection(agentName string, selection LastC
 	return s.saveLocked()
 }
 
+func (s *Store) AgentLastConfigSelection(agentName string) *LastConfigSelection {
+	if s == nil {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	selection := s.data.Agents[strings.TrimSpace(agentName)].LastConfigSelection
+	if selection == nil {
+		return nil
+	}
+	copy := *selection
+	return &copy
+}
+
 func (s *Store) ApplyAgentDefaults(statuses []agent.Status) []agent.Status {
 	if s == nil || len(statuses) == 0 {
 		return statuses

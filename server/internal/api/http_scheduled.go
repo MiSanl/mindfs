@@ -39,6 +39,10 @@ func (h *HTTPHandler) handleScheduledAgentTaskCreate(w http.ResponseWriter, r *h
 		respondError(w, http.StatusBadRequest, err)
 		return
 	}
+	if err := validateProviderSelection(input.Agent, input.Model, input.ProviderID); err != nil {
+		respondError(w, http.StatusBadRequest, err)
+		return
+	}
 	svc, err := h.scheduledService()
 	if err != nil {
 		respondError(w, http.StatusServiceUnavailable, err)
@@ -59,6 +63,10 @@ func (h *HTTPHandler) handleScheduledAgentTaskUpdate(w http.ResponseWriter, r *h
 		return
 	}
 	input.ID = strings.TrimSpace(chi.URLParam(r, "id"))
+	if err := validateProviderSelection(input.Agent, input.Model, input.ProviderID); err != nil {
+		respondError(w, http.StatusBadRequest, err)
+		return
+	}
 	svc, err := h.scheduledService()
 	if err != nil {
 		respondError(w, http.StatusServiceUnavailable, err)
@@ -113,6 +121,7 @@ func decodeScheduledAgentTaskInput(r *http.Request) (scheduled.SaveInput, error)
 	input.TaskCron = strings.TrimSpace(input.TaskCron)
 	input.Agent = strings.TrimSpace(input.Agent)
 	input.Model = strings.TrimSpace(input.Model)
+	input.ProviderID = strings.TrimSpace(input.ProviderID)
 	input.Mode = strings.TrimSpace(input.Mode)
 	input.Effort = strings.TrimSpace(input.Effort)
 	input.FastService = strings.TrimSpace(input.FastService)

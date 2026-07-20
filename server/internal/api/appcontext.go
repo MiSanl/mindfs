@@ -122,6 +122,21 @@ func (s *AppContext) GetSessionManager(rootID string) (*session.Manager, error) 
 	return mgr, nil
 }
 
+func (s *AppContext) LoadedSessionManagers() []*session.Manager {
+	if s == nil {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	managers := make([]*session.Manager, 0, len(s.roots))
+	for _, root := range s.roots {
+		if root != nil && root.Session != nil {
+			managers = append(managers, root.Session)
+		}
+	}
+	return managers
+}
+
 func (s *AppContext) GetKanbanService() (*kanban.Service, error) {
 	if s == nil {
 		return nil, errors.New("app context required")
@@ -267,16 +282,17 @@ func (s *AppContext) RunAgentStage(ctx context.Context, exec kanban.AgentStageEx
 	updateTracker := newTurnUpdateTracker()
 	planMode := exec.Stage.PlanMode
 	err := uc.SendMessage(ctx, usecase.SendMessageInput{
-		RootID:          exec.RootID,
-		RuntimeRootPath: exec.RuntimeRootPath,
-		Key:             sessionKey,
-		Agent:           exec.Stage.Agent,
-		Model:           exec.Stage.Model,
-		Mode:            exec.Stage.Mode,
-		Effort:          exec.Stage.Effort,
-		FastService:     normalizeFastServiceValue(exec.Stage.FastService),
-		PlanMode:        &planMode,
-		Content:         exec.Prompt,
+		RootID:               exec.RootID,
+		RuntimeRootPath:      exec.RuntimeRootPath,
+		Key:                  sessionKey,
+		Agent:                exec.Stage.Agent,
+		Model:                exec.Stage.Model,
+		UseGlobalAgentConfig: true,
+		Mode:                 exec.Stage.Mode,
+		Effort:               exec.Stage.Effort,
+		FastService:          normalizeFastServiceValue(exec.Stage.FastService),
+		PlanMode:             &planMode,
+		Content:              exec.Prompt,
 		OnStart: func() {
 			s.BroadcastSessionUserMessage(exec.RootID, sessionKey, session.TypeChat, sessionName, exec.Stage.Agent, exec.Stage.Model, exec.Stage.Mode, exec.Stage.Effort, exec.Stage.FastService, planMode, exec.Prompt)
 		},

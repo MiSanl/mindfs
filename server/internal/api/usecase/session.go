@@ -480,6 +480,19 @@ func (s *Service) ForkSession(ctx context.Context, in ForkSessionInput) (ForkSes
 		_ = manager.Delete(ctx, created.Key)
 		return ForkSessionOutput{}, err
 	}
+	var forkBinding *session.AgentBinding
+	var forkProvider *SessionProviderConfig
+	if strings.TrimSpace(binding.ProviderID) != "" {
+		forkBinding, forkProvider, err = s.resolveSessionProvider(ctx, manager, created, agentName, binding.ProviderID, true)
+		if err != nil {
+			_ = manager.Delete(ctx, created.Key)
+			return ForkSessionOutput{}, err
+		}
+		if err := s.validateAgentModelForProvider(agentName, resolveForkModel(current, target), forkProvider); err != nil {
+			_ = manager.Delete(ctx, created.Key)
+			return ForkSessionOutput{}, err
+		}
+	}
 	openCtx := pool.Context()
 	if openCtx == nil {
 		openCtx = ctx
@@ -488,7 +501,7 @@ func (s *Service) ForkSession(ctx context.Context, in ForkSessionInput) (ForkSes
 	if isACP {
 		agentCtxSeq = 0
 	}
-	sess, err := pool.GetOrCreate(openCtx, agenttypes.OpenSessionInput{
+	openInput := agenttypes.OpenSessionInput{
 		SessionKey:     agentPoolSessionKey(created.Key, agentName),
 		AgentName:      agentName,
 		Model:          resolveForkModel(current, target),
@@ -500,7 +513,14 @@ func (s *Service) ForkSession(ctx context.Context, in ForkSessionInput) (ForkSes
 		AgentSessionID: "",
 		AgentCtxSeq:    agentCtxSeq,
 		ForkPoint:      forkPoint,
-	})
+	}
+	if forkProvider != nil {
+		openInput.RuntimeEnv = cloneProviderRuntimeEnv(forkProvider.Env)
+		openInput.RuntimeArgs = append([]string{}, forkProvider.Args...)
+		openInput.RuntimeKey = agentName + ":" + forkProvider.ID + ":" + forkProvider.Revision
+	}
+	_ = forkBinding
+	sess, err := pool.GetOrCreate(openCtx, openInput)
 	if err != nil {
 		_ = manager.Delete(ctx, created.Key)
 		return ForkSessionOutput{}, err
@@ -1038,6 +1058,9 @@ type SendMessageInput struct {
 	Key                    string
 	Agent                  string
 	Model                  string
+	ProviderID             string
+	AllowProviderBind      bool
+	UseGlobalAgentConfig   bool
 	Mode                   string
 	Effort                 string
 	FastService            string
@@ -1053,11 +1076,28 @@ type SendMessageInput struct {
 	OnAgentDefaultsChanged func(agentName string)
 }
 
+type SessionProviderConfig struct {
+	ID               string
+	Revision         string
+	EndpointRevision string
+	Protocol         string
+	Models           []string
+	Env              map[string]string
+	Args             []string
+}
+
+// SessionProviderResolver resolves a provider only at the server boundary. The
+// returned environment is used in memory to open Claude/Codex and is never
+// persisted to session metadata or exposed through WebSocket responses.
+var SessionProviderResolver func(agentName, providerID string) (*SessionProviderConfig, error)
+var ProviderSelectionValidator func(agentName, model, providerID string) error
+
 type RunTransientSlashCommandInput struct {
 	RootID      string
 	Key         string
 	Agent       string
 	Model       string
+	ProviderID  string
 	Mode        string
 	Effort      string
 	FastService string
@@ -1663,8 +1703,14 @@ func (s *Service) ensureAgentSession(
 	effort string,
 	fastService string,
 	rootAbs string,
+	binding *session.AgentBinding,
+	providerConfig *SessionProviderConfig,
 ) (agenttypes.Session, *int, error) {
 	poolSessionKey := agentPoolSessionKey(current.Key, agentName)
+	providerRuntimeKey := ""
+	if providerConfig != nil {
+		providerRuntimeKey = agentName + ":" + providerConfig.ID + ":" + providerConfig.Revision
+	}
 	nextModel := resolveRuntimeModel(current, nil, model)
 	nextMode := resolveRuntimeMode(current, mode)
 	nextEffort := resolveRuntimeEffort(agentName, current, effort)
@@ -1685,7 +1731,7 @@ func (s *Service) ensureAgentSession(
 		currentFastService = inferFastServiceFromSession(current)
 		currentPlanMode = current.PlanMode
 	}
-	if existing, ok := pool.Get(poolSessionKey); ok {
+	if existing, ok := pool.Get(poolSessionKey); ok && (providerRuntimeKey == "" || pool.RuntimeKey(poolSessionKey) == providerRuntimeKey) {
 		if !shouldReopenSessionForSetting(pool, agentName, currentEffort, nextEffort) &&
 			currentFastService == nextFastService {
 			if current != nil && currentModel != nextModel {
@@ -1696,6 +1742,16 @@ func (s *Service) ensureAgentSession(
 					}
 					log.Printf("[session/model] switch.error session=%s agent=%s model=%q pool_session=%s err=%v", current.Key, agentName, nextModel, poolSessionKey, err)
 					return nil, nil, err
+				}
+				// Persist immediately after the runtime accepts the model. A later
+				// message failure must not leave the session metadata on the old model.
+				if manager != nil {
+					if err := manager.UpdateModel(ctx, current, nextModel); err != nil {
+						if rollbackErr := existing.SetModel(ctx, currentModel); rollbackErr != nil {
+							log.Printf("[session/model] switch.rollback.error session=%s agent=%s model=%q err=%v", current.Key, agentName, currentModel, rollbackErr)
+						}
+						return nil, nil, err
+					}
 				}
 				log.Printf("[session/model] switch.done session=%s agent=%s model=%q pool_session=%s", current.Key, agentName, nextModel, poolSessionKey)
 			}
@@ -1737,8 +1793,7 @@ func (s *Service) ensureAgentSession(
 		openCtx = ctx
 	}
 
-	var binding *session.AgentBinding
-	if manager != nil {
+	if binding == nil && manager != nil {
 		var err error
 		binding, err = manager.FindAgentBinding(ctx, current.Key, agentName)
 		if err != nil {
@@ -1768,6 +1823,11 @@ func (s *Service) ensureAgentSession(
 			return binding.AgentCtxSeq
 		}(),
 	}
+	if providerConfig != nil {
+		openInput.RuntimeEnv = cloneProviderRuntimeEnv(providerConfig.Env)
+		openInput.RuntimeArgs = append([]string{}, providerConfig.Args...)
+		openInput.RuntimeKey = providerRuntimeKey
+	}
 	if openInput.AgentSessionID != "" {
 		log.Printf("[session/model] open session=%s agent=%s model=%q mode=%q effort=%q fast_service=%q pool_session=%s action=resume_runtime_session agent_session_id=%s agent_ctx_seq=%d", current.Key, agentName, nextModel, nextMode, nextEffort, nextFastService, poolSessionKey, openInput.AgentSessionID, openInput.AgentCtxSeq)
 	} else {
@@ -1776,7 +1836,9 @@ func (s *Service) ensureAgentSession(
 	sess, err := pool.GetOrCreate(openCtx, openInput)
 	var ctxSeqOverride *int
 	if err != nil {
-		if openInput.AgentSessionID != "" {
+		if openInput.AgentSessionID != "" && binding != nil && strings.TrimSpace(binding.ProviderID) != "" {
+			log.Printf("[session/provider] resume.error session=%s agent=%s provider_id=%s model=%q action=fail_without_fallback err=%v", current.Key, agentName, binding.ProviderID, nextModel, err)
+		} else if openInput.AgentSessionID != "" {
 			log.Printf("[session/model] resume.error session=%s agent=%s model=%q mode=%q effort=%q fast_service=%q pool_session=%s agent_session_id=%s err=%v fallback=open_new_runtime_session", current.Key, agentName, nextModel, nextMode, nextEffort, nextFastService, poolSessionKey, openInput.AgentSessionID, err)
 			openInput.AgentSessionID = ""
 			openInput.AgentCtxSeq = 0
@@ -1798,8 +1860,113 @@ func (s *Service) ensureAgentSession(
 		last := binding.AgentCtxSeq
 		ctxSeqOverride = &last
 	}
+	if current != nil && currentModel != nextModel && manager != nil {
+		if err := manager.UpdateModel(ctx, current, nextModel); err != nil {
+			pool.Close(poolSessionKey)
+			return nil, nil, err
+		}
+	}
 	log.Printf("[session/model] open.done session=%s agent=%s model=%q mode=%q effort=%q fast_service=%q pool_session=%s", current.Key, agentName, nextModel, nextMode, nextEffort, nextFastService, poolSessionKey)
 	return sess, ctxSeqOverride, nil
+}
+
+func (s *Service) resolveSessionProvider(ctx context.Context, manager *session.Manager, current *session.Session, agentName, requestedProviderID string, allowBind bool) (*session.AgentBinding, *SessionProviderConfig, error) {
+	if manager == nil || current == nil || !sessionProviderIsolationAgent(agentName) {
+		return nil, nil, nil
+	}
+	binding, err := manager.FindAgentBinding(ctx, current.Key, agentName)
+	if err != nil {
+		return nil, nil, err
+	}
+	requestedProviderID = strings.TrimSpace(requestedProviderID)
+	if binding != nil && strings.TrimSpace(binding.ProviderID) != "" {
+		if requestedProviderID != "" && requestedProviderID != binding.ProviderID {
+			return nil, nil, fmt.Errorf("session_provider_mismatch: session is bound to provider %q", binding.ProviderID)
+		}
+		if SessionProviderResolver == nil {
+			return nil, nil, errors.New("session_provider_unavailable: provider resolver is unavailable")
+		}
+		config, err := SessionProviderResolver(agentName, binding.ProviderID)
+		if err != nil {
+			return nil, nil, err
+		}
+		if config == nil || config.ID != binding.ProviderID {
+			return nil, nil, errors.New("session_provider_unavailable: bound provider is unavailable")
+		}
+		if binding.AgentSessionID != "" && binding.ProviderEndpointRevision != "" && binding.ProviderEndpointRevision != config.EndpointRevision {
+			return nil, nil, errors.New("session_provider_changed: bound provider endpoint or protocol changed; migrate the session to continue")
+		}
+		if binding.ProviderRevision != config.Revision || binding.ProviderProtocol != config.Protocol || binding.ProviderState != "available" {
+			if err := manager.UpdateBoundProvider(ctx, session.AgentBinding{
+				SessionKey:               current.Key,
+				Agent:                    agentName,
+				ProviderID:               binding.ProviderID,
+				ProviderRevision:         config.Revision,
+				ProviderEndpointRevision: config.EndpointRevision,
+				ProviderProtocol:         config.Protocol,
+				ProviderState:            "available",
+			}); err != nil {
+				return nil, nil, err
+			}
+			binding.ProviderRevision = config.Revision
+			binding.ProviderEndpointRevision = config.EndpointRevision
+			binding.ProviderProtocol = config.Protocol
+			binding.ProviderState = "available"
+		}
+		return binding, config, nil
+	}
+	if requestedProviderID == "" {
+		return binding, nil, nil
+	}
+	if !allowBind {
+		return nil, nil, errors.New("session_provider_mismatch: existing sessions cannot acquire a provider binding")
+	}
+	if SessionProviderResolver == nil {
+		return nil, nil, errors.New("session_provider_unavailable: provider resolver is unavailable")
+	}
+	config, err := SessionProviderResolver(agentName, requestedProviderID)
+	if err != nil {
+		return nil, nil, err
+	}
+	if config == nil || strings.TrimSpace(config.ID) == "" {
+		return nil, nil, errors.New("session_provider_unavailable: provider is unavailable")
+	}
+	binding, err = manager.BindProviderIfUnbound(ctx, session.AgentBinding{
+		SessionKey:               current.Key,
+		Agent:                    agentName,
+		ProviderID:               config.ID,
+		ProviderRevision:         config.Revision,
+		ProviderEndpointRevision: config.EndpointRevision,
+		ProviderProtocol:         config.Protocol,
+		ProviderState:            "available",
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	if binding.ProviderID != config.ID {
+		return nil, nil, fmt.Errorf("session_provider_mismatch: session is bound to provider %q", binding.ProviderID)
+	}
+	return binding, config, nil
+}
+
+func sessionProviderIsolationAgent(agentName string) bool {
+	switch strings.ToLower(strings.TrimSpace(agentName)) {
+	case "claude", "codex":
+		return true
+	default:
+		return false
+	}
+}
+
+func cloneProviderRuntimeEnv(env map[string]string) map[string]string {
+	if len(env) == 0 {
+		return nil
+	}
+	cloned := make(map[string]string, len(env))
+	for key, value := range env {
+		cloned[key] = value
+	}
+	return cloned
 }
 
 func shouldReopenSessionForSetting(pool *agent.Pool, agentName, currentValue, nextValue string) bool {
@@ -1951,7 +2118,29 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 	if current.Type == session.TypeCommand {
 		return s.sendCommandMessage(turnCtx, in, manager, current)
 	}
-	if err := s.validateAgentModel(in.Agent, in.Model); err != nil {
+	if strings.TrimSpace(in.ProviderID) != "" && ProviderSelectionValidator != nil {
+		if err := ProviderSelectionValidator(in.Agent, in.Model, in.ProviderID); err != nil {
+			return err
+		}
+	}
+	var binding *session.AgentBinding
+	var providerConfig *SessionProviderConfig
+	if in.UseGlobalAgentConfig {
+		binding, err = manager.FindAgentBinding(ctx, current.Key, in.Agent)
+		if err != nil {
+			return err
+		}
+		if binding != nil && strings.TrimSpace(binding.ProviderID) != "" {
+			return errors.New("session is provider-bound and cannot run with the global agent configuration")
+		}
+	} else {
+		binding, providerConfig, err = s.resolveSessionProvider(ctx, manager, current, in.Agent, in.ProviderID, in.AllowProviderBind)
+	}
+	if err != nil {
+		return err
+	}
+	resolvedRequestedModel := resolveRuntimeModel(current, nil, in.Model)
+	if err := s.validateAgentModelForProvider(in.Agent, resolvedRequestedModel, providerConfig); err != nil {
 		log.Printf("[session/model] validate.error root=%s session=%s agent=%s model=%q err=%v", in.RootID, in.Key, strings.TrimSpace(in.Agent), strings.TrimSpace(in.Model), err)
 		return err
 	}
@@ -1972,7 +2161,7 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 		rootAbs = filepath.Clean(runtimeRootPath)
 	}
 	planMode := current != nil && current.PlanMode
-	sess, agentCtxSeq, err := s.ensureAgentSession(turnCtx, agentPool, manager, current, in.Agent, in.Model, in.Mode, in.Effort, in.FastService, rootAbs)
+	sess, agentCtxSeq, err := s.ensureAgentSession(turnCtx, agentPool, manager, current, in.Agent, in.Model, in.Mode, in.Effort, in.FastService, rootAbs, binding, providerConfig)
 	if err != nil {
 		return err
 	}
@@ -2281,16 +2470,35 @@ func (s *Service) RunTransientSlashCommand(ctx context.Context, in RunTransientS
 			return errors.New("slash command agent does not match session agent")
 		}
 	}
-	if err := s.validateAgentModel(agentName, in.Model); err != nil {
-		return err
-	}
 	agentPool := s.Registry.GetAgentPool()
 	if agentPool == nil {
 		return errors.New("agent pool not configured")
 	}
 	root := manager.Root()
 	rootAbs, _ := root.RootDir()
-	sess, _, err := s.ensureAgentSession(turnCtx, agentPool, manager, current, agentName, in.Model, in.Mode, in.Effort, in.FastService, rootAbs)
+	var binding *session.AgentBinding
+	var providerConfig *SessionProviderConfig
+	if command == "login" {
+		if strings.TrimSpace(in.ProviderID) != "" {
+			return errors.New("codex login is only available with the global agent configuration")
+		}
+		binding, err = manager.FindAgentBinding(ctx, current.Key, agentName)
+		if err != nil {
+			return err
+		}
+		if binding != nil && strings.TrimSpace(binding.ProviderID) != "" {
+			return errors.New("codex login is unavailable for an API-provider-bound session")
+		}
+	} else {
+		binding, providerConfig, err = s.resolveSessionProvider(ctx, manager, current, agentName, in.ProviderID, false)
+		if err != nil {
+			return err
+		}
+	}
+	if err := s.validateAgentModelForProvider(agentName, in.Model, providerConfig); err != nil {
+		return err
+	}
+	sess, _, err := s.ensureAgentSession(turnCtx, agentPool, manager, current, agentName, in.Model, in.Mode, in.Effort, in.FastService, rootAbs, binding, providerConfig)
 	if err != nil {
 		return err
 	}
@@ -3686,6 +3894,23 @@ func (s *Service) validateAgentModel(agentName, model string) error {
 		return nil
 	}
 	return fmt.Errorf("model %q is not supported by agent %q", model, agentName)
+}
+
+func (s *Service) validateAgentModelForProvider(agentName, model string, provider *SessionProviderConfig) error {
+	if provider == nil {
+		return s.validateAgentModel(agentName, model)
+	}
+	model = strings.TrimSpace(model)
+	if model == "" || len(provider.Models) == 0 {
+		return nil
+	}
+	for _, candidate := range provider.Models {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == model || strings.HasSuffix(candidate, "/"+model) || strings.HasSuffix(model, "/"+candidate) {
+			return nil
+		}
+	}
+	return fmt.Errorf("model %q is not supported by bound provider %q", model, provider.ID)
 }
 
 func modelIDInCatalog(models []agenttypes.ModelInfo, model string) bool {

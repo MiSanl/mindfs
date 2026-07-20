@@ -2382,6 +2382,9 @@ export function FileTree({
         setSelectedAgentAPIProviderID("");
         setAgentConfigSwitchSelection(null);
       }
+	      if ((result.loaded_affected_sessions || 0) > 0) {
+	        setAgentConfigError(`Provider deleted. ${result.loaded_affected_sessions} loaded session(s) remain readable but cannot resume with this provider.`);
+	      }
     } catch (error) {
       setAgentConfigError(error instanceof Error ? error.message : t("agentConfig.deleteProviderFailed"));
     } finally {

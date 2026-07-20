@@ -106,7 +106,11 @@ func TestAutoAddExternalProjectRootsSkipsGitWorktrees(t *testing.T) {
 	}
 	t.Setenv("CODEX_HOME", codexHome)
 	t.Setenv("HOME", filepath.Join(workspace, "home"))
-	t.Setenv("TMPDIR", filepath.Join(workspace, "tmp"))
+	tempRoot := filepath.Join(workspace, "tmp")
+	t.Setenv("TMPDIR", tempRoot)
+	t.Setenv("TEMP", tempRoot)
+	t.Setenv("TMP", tempRoot)
+	t.Setenv("USERPROFILE", filepath.Join(workspace, "home"))
 
 	registry := fs.NewRegistry(filepath.Join(workspace, "registry.json"))
 	autoAddExternalProjectRoots(registry)
