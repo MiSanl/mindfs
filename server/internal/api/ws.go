@@ -1014,12 +1014,14 @@ func (h *WSHandler) handleSessionCancel(ctx context.Context, conn *websocket.Con
 	log.Printf("[ws] session.cancel root=%s session=%s request=%s", rootID, key, req.ID)
 
 	streamHub := h.AppContext.GetSessionStreamHub()
-	if usecase.HasActiveSessionTurn(rootID, key) {
-		if queue, freezeID, ok := streamHub.FreezeQueuedSessionMessages(key); ok {
+	if generation, active := usecase.ActiveSessionTurnGeneration(rootID, key); active {
+		freezeID := uint64(0)
+		if queue, frozenID, ok := streamHub.FreezeQueuedSessionMessages(key); ok {
 			log.Printf("[ws] session.queue.freeze root=%s session=%s request=%s", rootID, key, req.ID)
 			streamHub.BroadcastSessionQueueUpdated(rootID, key, queue)
-			h.scheduleFrozenQueueRecovery(rootID, key, req.ID, freezeID)
+			freezeID = frozenID
 		}
+		h.scheduleSessionCancelRecovery(rootID, key, req.ID, generation, freezeID)
 	}
 
 	uc := &usecase.Service{Registry: h.AppContext}
@@ -1036,7 +1038,7 @@ func (h *WSHandler) handleSessionCancel(ctx context.Context, conn *websocket.Con
 	}
 }
 
-func (h *WSHandler) scheduleFrozenQueueRecovery(rootID, key, requestID string, freezeID uint64) {
+func (h *WSHandler) scheduleSessionCancelRecovery(rootID, key, requestID string, generation, freezeID uint64) {
 	if h == nil || h.AppContext == nil {
 		return
 	}
@@ -1044,18 +1046,24 @@ func (h *WSHandler) scheduleFrozenQueueRecovery(rootID, key, requestID string, f
 		if h == nil || h.AppContext == nil {
 			return
 		}
-		streamHub := h.AppContext.GetSessionStreamHub()
-		if !streamHub.IsQueueFreezeCurrent(key, freezeID) {
+		if !usecase.IsActiveSessionTurnGeneration(rootID, key, generation) {
 			return
 		}
-		log.Printf("[ws] session.queue.freeze_timeout root=%s session=%s request=%s", rootID, key, requestID)
+		streamHub := h.AppContext.GetSessionStreamHub()
+		if freezeID != 0 && !streamHub.IsQueueFreezeCurrent(key, freezeID) {
+			return
+		}
+		log.Printf("[ws] session.cancel.timeout root=%s session=%s request=%s", rootID, key, requestID)
 		uc := &usecase.Service{Registry: h.AppContext}
-		if err := uc.ForceCancelSessionTurn(context.Background(), usecase.CancelSessionTurnInput{RootID: rootID, Key: key}); err != nil {
-			log.Printf("[ws] session.queue.force_cancel.error root=%s session=%s request=%s err=%v", rootID, key, requestID, err)
+		if !uc.ForceCancelSessionTurnIfCurrent(context.Background(), usecase.CancelSessionTurnInput{RootID: rootID, Key: key}, generation) {
+			return
 		}
 		if queue, changed := streamHub.UnfreezeQueuedSessionMessagesIfCurrent(key, freezeID); changed {
 			log.Printf("[ws] session.queue.unfreeze root=%s session=%s reason=cancel_timeout", rootID, key)
 			streamHub.BroadcastSessionQueueUpdated(rootID, key, queue)
+		}
+		if usecase.IsActiveSessionTurnGeneration(rootID, key, generation) {
+			return
 		}
 		if streamHub.IsSessionReplying(key) {
 			h.AppContext.BroadcastSessionDone(rootID, key, requestID)

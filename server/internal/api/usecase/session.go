@@ -1145,9 +1145,11 @@ var (
 	sessionSendLocks   = make(map[string]*sync.Mutex)
 	activeTurnsMu      sync.Mutex
 	activeTurns        = make(map[string]*activeTurnState)
+	activeTurnSequence uint64
 )
 
 type activeTurnState struct {
+	generation  uint64
 	cancel      context.CancelFunc
 	retryCancel context.CancelFunc
 	session     agenttypes.Session
@@ -1173,7 +1175,11 @@ func registerActiveTurn(rootID, sessionKey string, cancel context.CancelFunc) {
 		return
 	}
 	activeTurnsMu.Lock()
-	activeTurns[activeTurnKey(rootID, sessionKey)] = &activeTurnState{cancel: cancel}
+	activeTurnSequence++
+	activeTurns[activeTurnKey(rootID, sessionKey)] = &activeTurnState{
+		generation: activeTurnSequence,
+		cancel:     cancel,
+	}
 	activeTurnsMu.Unlock()
 }
 
@@ -1217,6 +1223,24 @@ func getActiveTurn(rootID, sessionKey string) *activeTurnState {
 // session. Queue cancellation uses it to avoid freezing an already-idle queue.
 func HasActiveSessionTurn(rootID, sessionKey string) bool {
 	return getActiveTurn(rootID, sessionKey) != nil
+}
+
+// ActiveSessionTurnGeneration identifies the current turn so delayed cancel
+// cleanup cannot terminate a turn started after the original cancel request.
+func ActiveSessionTurnGeneration(rootID, sessionKey string) (uint64, bool) {
+	active := getActiveTurn(rootID, sessionKey)
+	if active == nil {
+		return 0, false
+	}
+	return active.generation, true
+}
+
+func IsActiveSessionTurnGeneration(rootID, sessionKey string, generation uint64) bool {
+	if generation == 0 {
+		return false
+	}
+	active := getActiveTurn(rootID, sessionKey)
+	return active != nil && active.generation == generation
 }
 
 func agentPoolSessionKey(sessionKey, agentName string) string {
@@ -4126,4 +4150,23 @@ func (s *Service) ForceCancelSessionTurn(ctx context.Context, in CancelSessionTu
 		active.cancel()
 	}
 	return nil
+}
+
+// ForceCancelSessionTurnIfCurrent ends only the turn generation that requested
+// watchdog recovery. A delayed watchdog must never cancel a later user turn.
+func (s *Service) ForceCancelSessionTurnIfCurrent(_ context.Context, in CancelSessionTurnInput, generation uint64) bool {
+	active := getActiveTurn(in.RootID, strings.TrimSpace(in.Key))
+	if active == nil || active.generation != generation {
+		return false
+	}
+	if active.retryCancel != nil {
+		active.retryCancel()
+	}
+	if active.session != nil {
+		if err := active.session.CancelCurrentTurn(); err != nil {
+			log.Printf("[session] turn.force_cancel.error root=%s session=%s err=%v", in.RootID, in.Key, err)
+		}
+	}
+	active.cancel()
+	return true
 }

@@ -2110,6 +2110,54 @@ func TestCancelSessionTurnCancelsTransientActiveTurn(t *testing.T) {
 	}
 }
 
+func TestActiveSessionTurnGenerationChangesForReplacementTurn(t *testing.T) {
+	rootID := "root"
+	sessionKey := "session"
+	registerActiveTurn(rootID, sessionKey, func() {})
+	defer unregisterActiveTurn(rootID, sessionKey)
+
+	first, ok := ActiveSessionTurnGeneration(rootID, sessionKey)
+	if !ok || first == 0 {
+		t.Fatalf("first active turn generation = %d, %v", first, ok)
+	}
+	registerActiveTurn(rootID, sessionKey, func() {})
+	second, ok := ActiveSessionTurnGeneration(rootID, sessionKey)
+	if !ok || second == first {
+		t.Fatalf("replacement active turn generation = %d, want distinct from %d", second, first)
+	}
+	if IsActiveSessionTurnGeneration(rootID, sessionKey, first) {
+		t.Fatal("stale generation must not match replacement turn")
+	}
+	if !IsActiveSessionTurnGeneration(rootID, sessionKey, second) {
+		t.Fatal("current generation must match replacement turn")
+	}
+}
+
+func TestForceCancelSessionTurnIfCurrentSkipsReplacementTurn(t *testing.T) {
+	rootID := "root"
+	sessionKey := "session"
+	firstCanceled := false
+	registerActiveTurn(rootID, sessionKey, func() { firstCanceled = true })
+	first, _ := ActiveSessionTurnGeneration(rootID, sessionKey)
+	secondCanceled := false
+	registerActiveTurn(rootID, sessionKey, func() { secondCanceled = true })
+	second, _ := ActiveSessionTurnGeneration(rootID, sessionKey)
+	defer unregisterActiveTurn(rootID, sessionKey)
+
+	if (&Service{}).ForceCancelSessionTurnIfCurrent(context.Background(), CancelSessionTurnInput{RootID: rootID, Key: sessionKey}, first) {
+		t.Fatal("stale watchdog generation must not cancel replacement turn")
+	}
+	if firstCanceled || secondCanceled {
+		t.Fatal("stale watchdog cancellation invoked a turn cancel function")
+	}
+	if !(&Service{}).ForceCancelSessionTurnIfCurrent(context.Background(), CancelSessionTurnInput{RootID: rootID, Key: sessionKey}, second) {
+		t.Fatal("current watchdog generation should cancel active turn")
+	}
+	if !secondCanceled {
+		t.Fatal("current watchdog did not invoke active turn cancel function")
+	}
+}
+
 type commandTestRegistry struct {
 	root    rootfs.RootInfo
 	manager *session.Manager

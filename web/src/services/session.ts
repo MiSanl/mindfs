@@ -289,6 +289,7 @@ class SessionService {
   private pendingStreams = new Map<string, StreamEvent[]>();
   private activeStreams = new Set<string>();
   private pendingMessages = new Map<string, PendingMessage>();
+  private canceledStreams = new Set<string>();
   private listeners = new Set<(event: SessionServiceEvent) => void>();
   private reconnectTimer: number | null = null;
   private connectTimeoutTimer: number | null = null;
@@ -664,6 +665,9 @@ class SessionService {
     msg: any,
   ) {
     const nextPayload = { ...payload };
+    if (type === "session.stream" && this.canceledStreams.has(sessionKey)) {
+      return;
+    }
     this.emit({ type, sessionKey, payload: nextPayload });
 
     if (!sessionKey) return;
@@ -746,11 +750,19 @@ class SessionService {
   ) {
     if (type === "session.done" || type === "session.error") {
       this.activeStreams.delete(sessionKey);
+      this.canceledStreams.delete(sessionKey);
+      return;
+    }
+    if (type === "session.user_message") {
+      this.canceledStreams.delete(sessionKey);
       return;
     }
     if (type !== "session.stream") return;
     const event = payload.event as StreamEvent | undefined;
     if (!event) return;
+    if (this.canceledStreams.has(sessionKey)) {
+      return;
+    }
     if (event.type === "error") {
       this.activeStreams.delete(sessionKey);
       return;
@@ -926,7 +938,12 @@ class SessionService {
       },
     };
 
-    return this.sendWSMessage(msg);
+    const sent = await this.sendWSMessage(msg);
+    if (sent) {
+      this.canceledStreams.add(sessionKey);
+      this.activeStreams.delete(sessionKey);
+    }
+    return sent;
   }
 
   async removeQueuedMessage(rootId: string, sessionKey: string, queueId: string): Promise<boolean> {
