@@ -184,6 +184,8 @@ function sessionErrorCode(message: string): ErrorCode {
   const normalized = message.trim().toLowerCase();
   if (
     normalized.includes("peer disconnected") ||
+    normalized.includes("stream disconnected") ||
+    normalized.includes("upstream connection error") ||
     normalized.includes("connection closed") ||
     normalized.includes("connection reset") ||
     normalized.includes("broken pipe") ||

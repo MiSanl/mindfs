@@ -1706,8 +1706,9 @@ func TestIsNonRecoverableAgentError(t *testing.T) {
 		{errors.New("remote compaction failed while compact_remote retried"), true},
 		{errors.New("usageLimitExceeded"), true},
 		{errors.New("responseTooManyFailedAttempts"), true},
-		{errors.New("agent peer disconnected"), true},
-		{errors.New("connection reset by peer"), true},
+		{errors.New("agent peer disconnected"), false},
+		{errors.New("connection reset by peer"), false},
+		{errors.New("stream disconnected before completion: Upstream request failed"), false},
 		{errors.New("temporary websocket EOF"), false},
 		{context.Canceled, false},
 	}
@@ -1715,6 +1716,26 @@ func TestIsNonRecoverableAgentError(t *testing.T) {
 	for _, tc := range testCases {
 		if got := isNonRecoverableAgentError(tc.err); got != tc.want {
 			t.Fatalf("isNonRecoverableAgentError(%v) = %v, want %v", tc.err, got, tc.want)
+		}
+	}
+}
+
+func TestIsRecoverableTransportError(t *testing.T) {
+	testCases := []struct {
+		err  error
+		want bool
+	}{
+		{nil, false},
+		{errors.New("agent peer disconnected"), true},
+		{errors.New("connection reset by peer"), true},
+		{errors.New("stream disconnected before completion: Upstream request failed"), true},
+		{errors.New("websocket: close 1006"), true},
+		{errors.New("429 Too Many Requests"), false},
+	}
+
+	for _, tc := range testCases {
+		if got := isRecoverableTransportError(tc.err); got != tc.want {
+			t.Fatalf("isRecoverableTransportError(%v) = %v, want %v", tc.err, got, tc.want)
 		}
 	}
 }
@@ -1744,7 +1765,7 @@ func TestRecoverAgentTurnStopsOnNonRecoverableError(t *testing.T) {
 		CurrentSession:    runtime,
 		Prompt:            "original prompt",
 		SawAssistantChunk: true,
-		SendWithAttachment: func(_ agenttypes.Session, content string) error {
+		SendWithAttachment: func(_ context.Context, _ agenttypes.Session, content string) error {
 			sent = append(sent, content)
 			return errors.New("codex turn failed: exceeded retry limit, last status: 429 Too Many Requests")
 		},
@@ -1757,6 +1778,102 @@ func TestRecoverAgentTurnStopsOnNonRecoverableError(t *testing.T) {
 	}
 	if len(sent) != 1 || sent[0] != "continue" {
 		t.Fatalf("sent = %#v, want one continue recovery attempt", sent)
+	}
+}
+
+func TestRecoverAgentTurnRetriesTransportFailureWithStatus(t *testing.T) {
+	rootDir := t.TempDir()
+	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
+	manager := newTestSessionManager(t, root)
+	current, err := manager.Create(context.Background(), session.CreateInput{Type: session.TypeChat, Agent: "claude", Name: "chat"})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	originalDelay := sessionRecoveryDelay
+	sessionRecoveryDelay = time.Millisecond
+	t.Cleanup(func() { sessionRecoveryDelay = originalDelay })
+	runtime := &fakeUsecaseAgentSession{id: "claude-thread"}
+	var sent, statuses []string
+	gotSess, err := (&Service{}).recoverAgentTurn(context.Background(), SendRecoveryInput{
+		RootID:         root.ID,
+		SessionKey:     current.Key,
+		Manager:        manager,
+		Current:        current,
+		AgentName:      "claude",
+		CurrentSession: runtime,
+		Prompt:         "original prompt",
+		SendWithAttachment: func(_ context.Context, _ agenttypes.Session, content string) error {
+			sent = append(sent, content)
+			if len(sent) == 1 {
+				return errors.New("peer disconnected")
+			}
+			return nil
+		},
+		OnUpdate: func(event agenttypes.Event) {
+			if status, ok := event.Data.(agenttypes.RecoveryStatus); ok {
+				statuses = append(statuses, status.Message)
+			}
+		},
+	})
+	if err != nil {
+		t.Fatalf("recoverAgentTurn returned error: %v", err)
+	}
+	if gotSess != runtime {
+		t.Fatalf("recoverAgentTurn session = %#v, want runtime", gotSess)
+	}
+	if got, want := len(sent), 2; got != want {
+		t.Fatalf("send attempts = %d, want %d", got, want)
+	}
+	if len(statuses) < 3 || !strings.Contains(statuses[0], "1/3") || !strings.Contains(statuses[1], "2/3") {
+		t.Fatalf("recovery statuses = %#v, want visible first and second attempt", statuses)
+	}
+}
+
+func TestRecoverAgentTurnStopsDuringRetryDelayWhenCanceled(t *testing.T) {
+	rootDir := t.TempDir()
+	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
+	manager := newTestSessionManager(t, root)
+	current, err := manager.Create(context.Background(), session.CreateInput{Type: session.TypeChat, Agent: "claude", Name: "chat"})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	originalDelay := sessionRecoveryDelay
+	sessionRecoveryDelay = time.Second
+	t.Cleanup(func() { sessionRecoveryDelay = originalDelay })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	attempted := make(chan struct{}, 1)
+	result := make(chan error, 1)
+	go func() {
+		_, err := (&Service{}).recoverAgentTurn(ctx, SendRecoveryInput{
+			RootID:         root.ID,
+			SessionKey:     current.Key,
+			Manager:        manager,
+			Current:        current,
+			AgentName:      "claude",
+			CurrentSession: &fakeUsecaseAgentSession{id: "claude-thread"},
+			Prompt:         "original prompt",
+			SendWithAttachment: func(context.Context, agenttypes.Session, string) error {
+				select {
+				case attempted <- struct{}{}:
+				default:
+				}
+				return errors.New("peer disconnected")
+			},
+		})
+		result <- err
+	}()
+	<-attempted
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("recoverAgentTurn error = %v, want context canceled", err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("recovery did not stop after cancellation")
 	}
 }
 

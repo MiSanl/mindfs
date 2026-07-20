@@ -1129,8 +1129,9 @@ const (
 	sessionNameTimeout       = 30 * time.Second
 	sessionNameMinMessageLen = 12
 	sessionRecoveryAttempts  = 3
-	sessionRecoveryDelay     = 30 * time.Second
 )
+
+var sessionRecoveryDelay = 30 * time.Second
 
 type SuggestSessionNameInput struct {
 	RootID       string
@@ -1147,8 +1148,9 @@ var (
 )
 
 type activeTurnState struct {
-	cancel  context.CancelFunc
-	session agenttypes.Session
+	cancel      context.CancelFunc
+	retryCancel context.CancelFunc
+	session     agenttypes.Session
 }
 
 func getSessionSendLock(sessionKey string) *sync.Mutex {
@@ -1183,6 +1185,15 @@ func setActiveTurnSession(rootID, sessionKey string, sess agenttypes.Session) {
 	state := activeTurns[activeTurnKey(rootID, sessionKey)]
 	if state != nil {
 		state.session = sess
+	}
+	activeTurnsMu.Unlock()
+}
+
+func setActiveTurnRetryCancel(rootID, sessionKey string, cancel context.CancelFunc) {
+	activeTurnsMu.Lock()
+	state := activeTurns[activeTurnKey(rootID, sessionKey)]
+	if state != nil {
+		state.retryCancel = cancel
 	}
 	activeTurnsMu.Unlock()
 }
@@ -1473,7 +1484,24 @@ func isNonRecoverableAgentError(err error) bool {
 		"remote compaction failed",
 		"compact_remote",
 		"responsetoomanyfailedattempts",
+	}
+	for _, needle := range needles {
+		if strings.Contains(value, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func isRecoverableTransportError(err error) bool {
+	if err == nil {
+		return false
+	}
+	value := strings.ToLower(strings.TrimSpace(err.Error()))
+	needles := []string{
 		"peer disconnected",
+		"stream disconnected",
+		"upstream connection error",
 		"connection closed",
 		"connection reset",
 		"broken pipe",
@@ -2412,25 +2440,21 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 			}
 		})
 	}
-	sendWithAttachedUpdates := func(runtime agenttypes.Session, content string) error {
+	sendWithAttachedUpdates := func(sendCtx context.Context, runtime agenttypes.Session, content string) error {
 		attachSessionUpdates(runtime)
-		return runtime.SendMessage(turnCtx, content)
+		return runtime.SendMessage(sendCtx, content)
 	}
-	sendErr := sendWithAttachedUpdates(sess, prompt)
+	sendErr := sendWithAttachedUpdates(turnCtx, sess, prompt)
 	if sendErr != nil && !isCanceledTurnError(sendErr) {
 		if isNonRecoverableAgentError(sendErr) {
 			log.Printf("[session] turn.send.non_recoverable root=%s session=%s agent=%s action=fail_without_recovery err=%v", in.RootID, current.Key, in.Agent, sendErr)
 			cancelRuntimeAfterNonRecoverableError(sess, agentPool, in.Agent, sendErr)
-		} else if !sawAssistantChunk {
+		} else if !sawAssistantChunk && !isRecoverableTransportError(sendErr) {
 			log.Printf("[session] turn.send.no_response root=%s session=%s agent=%s action=fail_without_recovery", in.RootID, current.Key, in.Agent)
 		} else {
-			if in.OnUpdate != nil {
-				in.OnUpdate(agenttypes.Event{
-					Type: agenttypes.EventTypeRecovery,
-					Data: agenttypes.RecoveryStatus{Message: "遇到错误，重试中..."},
-				})
-			}
-			recoveredSess, recoveredErr := s.recoverAgentTurn(turnCtx, SendRecoveryInput{
+			recoveryCtx, cancelRecovery := context.WithCancel(turnCtx)
+			setActiveTurnRetryCancel(in.RootID, current.Key, cancelRecovery)
+			recoveredSess, recoveredErr := s.recoverAgentTurn(recoveryCtx, SendRecoveryInput{
 				RootID:             in.RootID,
 				SessionKey:         current.Key,
 				Manager:            manager,
@@ -2446,7 +2470,10 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 				Prompt:             prompt,
 				SawAssistantChunk:  sawAssistantChunk,
 				SendWithAttachment: sendWithAttachedUpdates,
+				OnUpdate:           in.OnUpdate,
 			})
+			setActiveTurnRetryCancel(in.RootID, current.Key, nil)
+			cancelRecovery()
 			if recoveredErr != nil {
 				sendErr = recoveredErr
 			} else {
@@ -3458,7 +3485,8 @@ type SendRecoveryInput struct {
 	CurrentSession     agenttypes.Session
 	Prompt             string
 	SawAssistantChunk  bool
-	SendWithAttachment func(agenttypes.Session, string) error
+	SendWithAttachment func(context.Context, agenttypes.Session, string) error
+	OnUpdate           func(agenttypes.Event)
 }
 
 func (s *Service) recoverAgentTurn(ctx context.Context, in SendRecoveryInput) (agenttypes.Session, error) {
@@ -3481,6 +3509,7 @@ func (s *Service) recoverAgentTurn(ctx context.Context, in SendRecoveryInput) (a
 	var lastErr error
 	for attempt := 1; attempt <= sessionRecoveryAttempts; attempt++ {
 		if attempt > 1 {
+			emitRecoveryStatus(in.OnUpdate, fmt.Sprintf("Connection interrupted. Retrying %d/%d in %s: %s", attempt, sessionRecoveryAttempts, sessionRecoveryDelay, recoveryErrorSummary(lastErr)))
 			log.Printf("[session/recovery] wait root=%s session=%s agent=%s attempt=%d/%d delay=%s", in.RootID, in.SessionKey, in.AgentName, attempt, sessionRecoveryAttempts, sessionRecoveryDelay)
 			if err := waitForRecoveryDelay(ctx, sessionRecoveryDelay); err != nil {
 				return nil, err
@@ -3494,8 +3523,9 @@ func (s *Service) recoverAgentTurn(ctx context.Context, in SendRecoveryInput) (a
 			recoveryMessage = "continue"
 			recoveryAction = "continue"
 		}
+		emitRecoveryStatus(in.OnUpdate, fmt.Sprintf("Retrying connection %d/%d: %s", attempt, sessionRecoveryAttempts, recoveryErrorSummary(lastErr)))
 		log.Printf("[session/recovery] send.start root=%s session=%s agent=%s attempt=%d/%d action=%s", in.RootID, in.SessionKey, in.AgentName, attempt, sessionRecoveryAttempts, recoveryAction)
-		if err := in.SendWithAttachment(sess, recoveryMessage); err != nil {
+		if err := in.SendWithAttachment(ctx, sess, recoveryMessage); err != nil {
 			if isCanceledTurnError(err) || ctx.Err() != nil {
 				return nil, err
 			}
@@ -3514,6 +3544,23 @@ func (s *Service) recoverAgentTurn(ctx context.Context, in SendRecoveryInput) (a
 		lastErr = errors.New("agent recovery failed")
 	}
 	return nil, lastErr
+}
+
+func emitRecoveryStatus(onUpdate func(agenttypes.Event), message string) {
+	if onUpdate != nil {
+		onUpdate(agenttypes.Event{Type: agenttypes.EventTypeRecovery, Data: agenttypes.RecoveryStatus{Message: message}})
+	}
+}
+
+func recoveryErrorSummary(err error) string {
+	if err == nil {
+		return "resuming the interrupted turn"
+	}
+	message := strings.TrimSpace(err.Error())
+	if len(message) > 160 {
+		return message[:157] + "..."
+	}
+	return message
 }
 
 func waitForRecoveryDelay(ctx context.Context, delay time.Duration) error {
@@ -4049,6 +4096,9 @@ func (s *Service) CancelSessionTurn(ctx context.Context, in CancelSessionTurnInp
 	active := getActiveTurn(in.RootID, current.Key)
 	if active == nil {
 		return nil
+	}
+	if active.retryCancel != nil {
+		active.retryCancel()
 	}
 	if active.session != nil {
 		// Let the runtime emit its own turn boundary after interrupt. Canceling
