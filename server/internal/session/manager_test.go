@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -39,6 +40,15 @@ func TestManagerUsesSessionDBLink(t *testing.T) {
 	}
 	if _, err := os.Stat(linkedDB); err != nil {
 		t.Fatalf("stat linked db: %v", err)
+	}
+}
+
+func TestIsSQLiteDatabaseMovedError(t *testing.T) {
+	if !isSQLiteDatabaseMovedError(errors.New("attempt to write a readonly database (1032)")) {
+		t.Fatal("expected SQLITE_READONLY_DBMOVED error to be recognized")
+	}
+	if isSQLiteDatabaseMovedError(errors.New("attempt to write a readonly database (8)")) {
+		t.Fatal("unexpected recognition of ordinary readonly database error")
 	}
 }
 

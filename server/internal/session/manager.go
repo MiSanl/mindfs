@@ -1051,22 +1051,20 @@ func (m *Manager) getAgentBindingUnsafe(sessionKey, agent string) (*AgentBinding
 }
 
 func (m *Manager) updateAgentRuntimeStateUnsafe(binding AgentBinding) error {
-	db, err := m.ensureSessionMetaDBUnsafe()
-	if err != nil {
-		return err
-	}
 	agentCtxSeq := 0
 	if binding.AgentCtxSeq > 0 {
 		agentCtxSeq = binding.AgentCtxSeq
 	}
-	_, err = db.Exec(
-		upsertAgentBindingSQL,
-		strings.TrimSpace(binding.SessionKey),
-		strings.TrimSpace(binding.Agent),
-		strings.TrimSpace(binding.AgentSessionID),
-		agentCtxSeq,
-	)
-	return err
+	return m.retrySessionMetaWriteUnsafe(func(db *sql.DB) error {
+		_, err := db.Exec(
+			upsertAgentBindingSQL,
+			strings.TrimSpace(binding.SessionKey),
+			strings.TrimSpace(binding.Agent),
+			strings.TrimSpace(binding.AgentSessionID),
+			agentCtxSeq,
+		)
+		return err
+	})
 }
 
 func (m *Manager) Close(ctx context.Context, key string) (*Session, error) {
@@ -1513,10 +1511,6 @@ func (m *Manager) loadSessionUnsafe(key string, afterSeq int) (*Session, error) 
 }
 
 func (m *Manager) upsertSessionMetaUnsafe(session *Session) error {
-	db, err := m.ensureSessionMetaDBUnsafe()
-	if err != nil {
-		return err
-	}
 	if session == nil {
 		return errors.New("session required")
 	}
@@ -1525,11 +1519,10 @@ func (m *Manager) upsertSessionMetaUnsafe(session *Session) error {
 	if err != nil {
 		return err
 	}
-	_, err = db.Exec(upsertSessionMetaSQL, args...)
-	if err != nil {
+	return m.retrySessionMetaWriteUnsafe(func(db *sql.DB) error {
+		_, err := db.Exec(upsertSessionMetaSQL, args...)
 		return err
-	}
-	return nil
+	})
 }
 
 func (m *Manager) loadExchanges(key string, afterSeq int) ([]Exchange, int, error) {
@@ -1954,6 +1947,33 @@ func (m *Manager) ensureSessionMetaDBUnsafe() (*sql.DB, error) {
 	log.Printf("[session/store] sqlite fallback root=%s legacy=%s fallback=%s err=%v", m.root.ID, legacyDBFile, fallbackDBFile, legacyErr)
 	m.db = db
 	return m.db, nil
+}
+
+func (m *Manager) retrySessionMetaWriteUnsafe(write func(*sql.DB) error) error {
+	db, err := m.ensureSessionMetaDBUnsafe()
+	if err != nil {
+		return err
+	}
+	if err := write(db); !isSQLiteDatabaseMovedError(err) {
+		return err
+	}
+	if closeErr := db.Close(); closeErr != nil {
+		return fmt.Errorf("close moved session db: %w", closeErr)
+	}
+	m.db = nil
+	db, err = m.ensureSessionMetaDBUnsafe()
+	if err != nil {
+		return fmt.Errorf("reopen moved session db: %w", err)
+	}
+	return write(db)
+}
+
+func isSQLiteDatabaseMovedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "readonly database") && strings.Contains(message, "1032")
 }
 
 func openSessionMetaDB(dbFile string) (db *sql.DB, err error) {
