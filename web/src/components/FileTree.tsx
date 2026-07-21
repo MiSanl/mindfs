@@ -179,7 +179,7 @@ type AgentConfigFlow = "backup" | "switch";
 type AgentConfigStep = "agent" | "details" | "confirm" | "edit_provider";
 type AgentConfigAddTab = "backup" | "api";
 type AgentConfigSwitchTab = "backup" | "api_provider";
-type AgentConfigSwitchSelection = { type: "backup" | "api_provider"; id: string };
+type AgentConfigSwitchSelection = { type: "backup" | "api_provider" | "system_global"; id: string };
 
 function isAgentConfigBackupConflict(error: unknown): boolean {
   const maybeError = error as { status?: unknown; message?: unknown; payload?: { error?: unknown; message?: unknown } } | null;
@@ -951,7 +951,7 @@ function AgentConfigPopover({
           <div style={{ display: "flex", flexDirection: "column", gap: "8px", maxHeight: "260px", overflow: "auto" }}>
             {busy ? (
               <div style={agentConfigHintStyle}>{t("agentConfig.loading")}</div>
-            ) : backups.length === 0 && (supportsAPIProvider ? apiProviders.length === 0 : true) ? (
+            ) : backups.length === 0 && !supportsAPIProvider ? (
               <div style={agentConfigHintStyle}>{t("agentConfig.noSwitchableConfig")}</div>
             ) : effectiveSwitchTab === "backup" ? (
               backups.length === 0 ? (
@@ -992,9 +992,25 @@ function AgentConfigPopover({
                 );
               })
             ) : (
-	              apiProviders.length === 0 ? (
+              <>
+                <div
+                  onClick={() => onSelectedAPIProviderChange("")}
+                  style={{
+                    border: "1px solid var(--border-color)",
+                    background: !selectedAPIProviderID ? "var(--selection-bg)" : "transparent",
+                    color: !selectedAPIProviderID ? "var(--accent-color)" : "var(--text-primary)",
+                    borderRadius: "8px",
+                    padding: "8px 10px",
+                    textAlign: "left",
+                    cursor: "pointer",
+                  }}
+                >
+                  <div style={{ fontSize: "12px", fontWeight: 600 }}>{t("agentConfig.systemGlobal")}</div>
+                  <div style={{ marginTop: "4px", fontSize: "11px", color: "var(--text-secondary)" }}>{t("agentConfig.systemGlobalHint")}</div>
+                </div>
+	              {apiProviders.length === 0 ? (
 	                <div style={agentConfigHintStyle}>{t("agentConfig.noAPIProviders")}</div>
-              ) : apiProviders.map((item) => {
+                  ) : apiProviders.map((item) => {
                 const selected = item.id === selectedAPIProviderID;
                 const summary = (item.modelFamilies || []).join(", ");
                 return (
@@ -1045,7 +1061,8 @@ function AgentConfigPopover({
                     </div>
                   </div>
                 );
-              })
+                  })}
+              </>
             )}
           </div>
           <div style={agentConfigActionRowStyle}>
@@ -1054,9 +1071,9 @@ function AgentConfigPopover({
             </button>
             <button
               type="button"
-              disabled={busy || (effectiveSwitchTab === "backup" ? !selectedBackupID : !selectedAPIProviderID)}
+              disabled={busy || (effectiveSwitchTab === "backup" && !selectedBackupID)}
               onClick={onSwitch}
-              style={agentConfigPrimaryButtonStyle(busy || (effectiveSwitchTab === "backup" ? !selectedBackupID : !selectedAPIProviderID))}
+              style={agentConfigPrimaryButtonStyle(busy || (effectiveSwitchTab === "backup" && !selectedBackupID))}
             >
               {t("agentConfig.switch")}
             </button>
@@ -2098,10 +2115,19 @@ export function FileTree({
         setAgentConfigBackups(backups);
         setAgentAPIProviders(providers);
         setSelectedAgentConfigID("");
-        const preferredProvider = providers.find((provider) => agentConfigPreferredProviderIDs.includes(provider.id));
+        const selectedProviderID = selectedAgent?.last_config_selection?.type === "api_provider"
+          ? String(selectedAgent.last_config_selection.id || "").trim()
+          : "";
+        const preferredProvider = providers.find((provider) => provider.id === selectedProviderID);
         setSelectedAgentAPIProviderID(preferredProvider?.id || "");
-        setAgentConfigSwitchSelection(preferredProvider ? { type: "api_provider", id: preferredProvider.id } : null);
-        setAgentConfigSwitchTab(supportsAPIProvider && selectedAgent?.last_config_selection?.type === "api_provider" ? "api_provider" : "backup");
+        setAgentConfigSwitchSelection(
+          preferredProvider
+            ? { type: "api_provider", id: preferredProvider.id }
+            : supportsAPIProvider
+              ? { type: "system_global", id: "" }
+              : null,
+        );
+        setAgentConfigSwitchTab(supportsAPIProvider && (selectedAgent?.last_config_selection?.type === "api_provider" || agentConfigPreferredProviderIDs.length === 0) ? "api_provider" : "backup");
         if (supportsAPIProvider && agentConfigPreferredProviderIDs.length > 0) {
           setAgentConfigSwitchTab("api_provider");
         }
@@ -2332,6 +2358,17 @@ export function FileTree({
         closeAgentConfigFlow();
         return;
       }
+      if (agentConfigSwitchSelection.type === "system_global") {
+        await switchAgentAPIProvider({ agent: agentConfigAgent, providerID: "" });
+        setAgentConfigAgents((prev) => prev.map((item) => (
+          item.name === agentConfigAgent
+            ? { ...item, last_config_selection: undefined }
+            : item
+        )));
+        bumpAgentsAfterProviderChange();
+        closeAgentConfigFlow();
+        return;
+      }
       const result = await switchAgentConfig({ id: agentConfigSwitchSelection.id, confirmOverwrite });
       if (result.needs_confirm) {
         setAgentConfigConfirmMessage(result.message || t("agentConfig.targetExists"));
@@ -2404,7 +2441,7 @@ export function FileTree({
   const selectAgentAPIProvider = React.useCallback((id: string) => {
     setSelectedAgentAPIProviderID(id);
     setSelectedAgentConfigID("");
-    setAgentConfigSwitchSelection(id ? { type: "api_provider", id } : null);
+    setAgentConfigSwitchSelection(id ? { type: "api_provider", id } : { type: "system_global", id: "" });
   }, []);
 
   React.useEffect(() => {

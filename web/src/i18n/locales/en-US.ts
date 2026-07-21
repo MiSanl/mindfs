@@ -89,6 +89,8 @@ export const enUS = {
   "agentConfig.targetExists": "The target config file already exists. Make sure it is backed up.",
   "agentConfig.backup": "Config backup",
   "agentConfig.apiProvider": "API provider",
+  "agentConfig.systemGlobal": "System global configuration",
+  "agentConfig.systemGlobalHint": "Use the provider configured by the installed agent",
   "agentConfig.backupName": "Backup name",
   "agentConfig.fileSources": "Config sources",
   "agentConfig.fileSourcePlaceholder": "One file path per line",

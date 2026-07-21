@@ -628,7 +628,13 @@ func switchAgentAPIProvider(req agentAPIProviderSwitchRequest, app *AppContext) 
 	}
 	providerID := strings.TrimSpace(req.ProviderID)
 	if providerID == "" {
-		return agentAPIProvider{}, errors.New("provider id required")
+		if app != nil && app.GetPreferences() != nil {
+			if err := app.GetPreferences().ClearAgentLastConfigSelection(agentName); err != nil {
+				return agentAPIProvider{}, err
+			}
+		}
+		triggerAgentConfigSwitchProbe(app, agentName)
+		return agentAPIProvider{}, nil
 	}
 	providers, err := readAgentAPIProviders()
 	if err != nil {

@@ -87,6 +87,8 @@ export const zhCN = {
   "agentConfig.targetExists": "目标配置文件已存在，请确保已备份",
   "agentConfig.backup": "配置备份",
   "agentConfig.apiProvider": "API 供应商",
+  "agentConfig.systemGlobal": "系统全局配置",
+  "agentConfig.systemGlobalHint": "使用已安装 Agent 配置的全局供应商",
   "agentConfig.backupName": "备份名称",
   "agentConfig.fileSources": "配置来源",
   "agentConfig.fileSourcePlaceholder": "每行一个文件路径",
