@@ -72,6 +72,7 @@ export const zhCN = {
   "fileTree.create": "创建",
   "fileTree.boundSession": "已绑定会话",
   "fileTree.boundSessionReplying": "已绑定会话，正在回复",
+  "fileTree.copyPath": "复制路径",
   "fileTree.projectTabs": "项目展开内容",
   "fileTree.files": "文件",
   "fileTree.worktrees": "工作树",

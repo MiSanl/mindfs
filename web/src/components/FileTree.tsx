@@ -22,6 +22,7 @@ import { AgentMenuList } from "./AgentMenuList";
 import { AgentIcon } from "./AgentIcon";
 import { SymlinkBadge } from "./SymlinkBadge";
 import { RelayLocalServicesDialog } from "./RelayLocalServicesDialog";
+import { copyText } from "../services/clipboard";
 import { fetchAgentCatalog, fetchAgents, scheduleAgentsRefresh, type AgentStatus } from "../services/agents";
 import {
   createAgentAPIProvider,
@@ -121,6 +122,7 @@ type FileTreeProps = {
   selectedDirKey?: string | null;
   selectedPath?: string | null;
   rootId?: string | null;
+  rootPaths?: Record<string, string>;
   rootSessionIndicators?: Record<string, RootSessionIndicator>;
   fileMetas?: Record<string, FileMeta>;
   activeSessionKey?: string | null;
@@ -1344,6 +1346,7 @@ export function FileTree({
   selectedDirKey,
   selectedPath,
   rootId,
+  rootPaths = {},
   rootSessionIndicators = {},
   fileMetas = {},
   activeSessionKey,
@@ -2557,6 +2560,9 @@ export function FileTree({
           : null;
         const showRootIndicator = !!rootIndicator?.bound;
         const isRootPending = !!rootIndicator?.pending;
+        const fullPath = isManagedRootNode
+          ? String(rootPaths[entry.path] || entry.path)
+          : `${String(rootPaths[entryRoot] || entryRoot).replace(/[\\/]+$/, "")}/${entry.path}`;
         const handleEntryClick = () => {
           if (entry.is_dir) {
             if (isManagedRootNode) {
@@ -2589,88 +2595,123 @@ export function FileTree({
 
         return (
           <li key={expandedKey}>
-            <button
-              type="button"
-              onClick={handleEntryClick}
+            <div
               style={{
-                border: "none",
-                background: isSelected ? "var(--selection-bg)" : "transparent",
-                cursor: "pointer",
-                padding: "6px 8px",
-                paddingLeft: PROJECT_TREE_ROOT_PADDING_LEFT + depth * PROJECT_TREE_INDENT,
                 display: "flex",
                 alignItems: "center",
                 gap: "4px",
                 width: "100%",
-                textAlign: "left",
-                color: isSelected ? "var(--accent-color)" : "var(--text-primary)",
-                fontSize: "13px",
-                borderRadius: "6px",
-                transition: "all 0.1s",
-                fontWeight: isSelected ? 600 : 400,
-                outline: "none",
               }}
-              onMouseEnter={(e) => { if (!isSelected) e.currentTarget.style.background = "rgba(0,0,0,0.04)"; }}
-              onMouseLeave={(e) => { if (!isSelected) e.currentTarget.style.background = "transparent"; }}
             >
-              <span
-                onClick={handleDirectoryIconClick}
-                title={entry.is_dir ? (isOpen ? t("common.collapse") : t("common.expand")) : undefined}
+              <button
+                type="button"
+                onClick={handleEntryClick}
+                title={fullPath}
                 style={{
+                  flex: 1,
+                  minWidth: 0,
+                  border: "none",
+                  background: isSelected ? "var(--selection-bg)" : "transparent",
+                  cursor: "pointer",
+                  padding: `6px 4px 6px ${PROJECT_TREE_ROOT_PADDING_LEFT + depth * PROJECT_TREE_INDENT}px`,
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "4px",
+                  textAlign: "left",
+                  color: isSelected ? "var(--accent-color)" : "var(--text-primary)",
+                  fontSize: "13px",
+                  borderRadius: "6px",
+                  transition: "all 0.1s",
+                  fontWeight: isSelected ? 600 : 400,
+                  outline: "none",
+                }}
+                onMouseEnter={(e) => { if (!isSelected) e.currentTarget.style.background = "rgba(0,0,0,0.04)"; }}
+                onMouseLeave={(e) => { if (!isSelected) e.currentTarget.style.background = "transparent"; }}
+              >
+                <span
+                  onClick={handleDirectoryIconClick}
+                  title={entry.is_dir ? (isOpen ? t("common.collapse") : t("common.expand")) : undefined}
+                  style={{
+                    display: "inline-flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    borderRadius: "4px",
+                    cursor: entry.is_dir ? "pointer" : "default",
+                  }}
+                >
+                  <DirectoryIconSlot entry={entry} isOpen={isOpen} />
+                </span>
+                <span
+                  style={{
+                    whiteSpace: "nowrap",
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    flex: 1,
+                    marginLeft: "4px",
+                  }}
+                >
+                  <span
+                    style={{
+                      ...(isManagedRootNode ? rootBadgeStyle : {}),
+                      maxWidth: "100%",
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                    }}
+                  >
+                    {entry.name}
+                  </span>
+                </span>
+                {showRootIndicator ? (
+                  <span
+                    aria-label={isRootPending ? t("fileTree.boundSessionReplying") : t("fileTree.boundSession")}
+                    title={isRootPending ? t("fileTree.boundSessionReplying") : t("fileTree.boundSession")}
+                    style={{
+                      width: "8px",
+                      height: "8px",
+                      borderRadius: "999px",
+                      flexShrink: 0,
+                      boxSizing: "border-box",
+                      border: "1.5px solid #2563eb",
+                      background: isRootPending ? "#2563eb" : "transparent",
+                      animation: isRootPending ? "mindfs-bound-pulse 2.2s ease-in-out infinite" : "none",
+                      boxShadow: isRootPending
+                        ? "0 0 0 1.5px rgba(37,99,235,0.14)"
+                        : "0 0 0 1px rgba(37,99,235,0.10)",
+                    }}
+                  />
+                ) : null}
+                {hasSessionLink && (
+                  <span style={{ fontSize: "10px", color: isFromActiveSession ? "#3b82f6" : "#9ca3af" }}>
+                    {isFromActiveSession ? "◆" : "◇"}
+                  </span>
+                )}
+              </button>
+              <button
+                type="button"
+                aria-label={t("fileTree.copyPath")}
+                title={`${t("fileTree.copyPath")}: ${fullPath}`}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  void copyText(fullPath).catch((error) => console.error("[file-tree] copy path failed", error));
+                }}
+                onKeyDown={(event) => event.stopPropagation()}
+                style={{
+                  width: "22px",
+                  height: "22px",
+                  flexShrink: 0,
+                  border: "none",
+                  borderRadius: "4px",
+                  background: "transparent",
+                  color: "var(--text-secondary)",
                   display: "inline-flex",
                   alignItems: "center",
                   justifyContent: "center",
-                  borderRadius: "4px",
-                  cursor: entry.is_dir ? "pointer" : "default",
+                  cursor: "pointer",
                 }}
               >
-                <DirectoryIconSlot entry={entry} isOpen={isOpen} />
-              </span>
-              <span
-                style={{
-                  whiteSpace: "nowrap",
-                  overflow: "hidden",
-                  textOverflow: "ellipsis",
-                  flex: 1,
-                  marginLeft: "4px",
-                }}
-              >
-                <span
-                  style={{
-                    ...(isManagedRootNode ? rootBadgeStyle : {}),
-                    maxWidth: "100%",
-                    overflow: "hidden",
-                    textOverflow: "ellipsis",
-                  }}
-                >
-                  {entry.name}
-                </span>
-              </span>
-              {showRootIndicator ? (
-                <span
-                  aria-label={isRootPending ? t("fileTree.boundSessionReplying") : t("fileTree.boundSession")}
-                  title={isRootPending ? t("fileTree.boundSessionReplying") : t("fileTree.boundSession")}
-                  style={{
-                    width: "8px",
-                    height: "8px",
-                    borderRadius: "999px",
-                    flexShrink: 0,
-                    boxSizing: "border-box",
-                    border: "1.5px solid #2563eb",
-                    background: isRootPending ? "#2563eb" : "transparent",
-                    animation: isRootPending ? "mindfs-bound-pulse 2.2s ease-in-out infinite" : "none",
-                    boxShadow: isRootPending
-                      ? "0 0 0 1.5px rgba(37,99,235,0.14)"
-                      : "0 0 0 1px rgba(37,99,235,0.10)",
-                  }}
-                />
-              ) : null}
-              {hasSessionLink && (
-                <span style={{ fontSize: "10px", color: isFromActiveSession ? "#3b82f6" : "#9ca3af" }}>
-                  {isFromActiveSession ? "◆" : "◇"}
-                </span>
-              )}
-            </button>
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2" /><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" /></svg>
+              </button>
+            </div>
             {entry.is_dir && isOpen && shouldRenderChildren && children.length > 0 ? renderEntries(children, depth + 1, entryRoot) : null}
             {entry.is_dir && isOpen && rootExtraContent ? (
               <div style={{ padding: `2px 4px 8px ${PROJECT_TREE_INDENT}px` }}>

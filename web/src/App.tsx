@@ -13769,6 +13769,11 @@ export function App({ onGoHome }: AppProps) {
             selectedDirKey={selectedDirKey}
             selectedPath={file?.path}
             rootId={currentRootId}
+            rootPaths={Object.fromEntries(
+              Object.entries(managedRootByIdRef.current)
+                .filter(([, root]) => !!root.root_path)
+                .map(([id, root]) => [id, root.root_path as string]),
+            )}
             rootSessionIndicators={rootSessionIndicators}
             creatingRootName={
               creatingRootKind === "worktree" ? null : creatingRootName

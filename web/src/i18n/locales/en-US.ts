@@ -74,6 +74,7 @@ export const enUS = {
   "fileTree.create": "Create",
   "fileTree.boundSession": "Bound session",
   "fileTree.boundSessionReplying": "Bound session, replying",
+  "fileTree.copyPath": "Copy path",
   "fileTree.projectTabs": "Project expanded content",
   "fileTree.files": "Files",
   "fileTree.worktrees": "Worktrees",
