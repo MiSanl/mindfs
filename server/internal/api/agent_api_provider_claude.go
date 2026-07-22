@@ -30,7 +30,7 @@ func applyClaudeAPIProvider(provider agentAPIProvider) error {
 	}
 
 	env["ANTHROPIC_AUTH_TOKEN"] = provider.APIKey
-	env["ANTHROPIC_BASE_URL"] = provider.BaseURL
+	env["ANTHROPIC_BASE_URL"] = anthropicBaseURL(provider.BaseURL)
 
 	// Set default model if available
 	if len(provider.Models) > 0 {

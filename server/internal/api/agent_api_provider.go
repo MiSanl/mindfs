@@ -690,7 +690,7 @@ func applyAgentAPIProvider(agentName string, provider agentAPIProvider, app *App
 			return err
 		}
 		env, err := mergeAgentEnvConfig(agentName, map[string]string{
-			"ANTHROPIC_BASE_URL": provider.BaseURL,
+			"ANTHROPIC_BASE_URL": anthropicBaseURL(provider.BaseURL),
 			"ANTHROPIC_API_KEY":  provider.APIKey,
 		})
 		if err != nil {
