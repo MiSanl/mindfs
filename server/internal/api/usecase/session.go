@@ -2792,7 +2792,18 @@ func (s *Service) RunTransientSlashCommand(ctx context.Context, in RunTransientS
 			return errors.New("codex login is unavailable for an API-provider-bound session")
 		}
 	} else {
-		binding, providerConfig, err = s.resolveSessionProvider(ctx, manager, current, agentName, in.ProviderID, false)
+		// Transient /status may run against a pre-created empty session or a pure
+		// transient key. Allow the first bind from the UI-selected provider so the
+		// diagnostic hits the same endpoint as normal session turns.
+		allowBind := false
+		if strings.TrimSpace(in.ProviderID) != "" {
+			if strings.HasPrefix(current.Key, "transient-") || len(current.Exchanges) == 0 {
+				allowBind = true
+			} else if binding, bindErr := manager.FindAgentBinding(ctx, current.Key, agentName); bindErr == nil {
+				allowBind = binding == nil || strings.TrimSpace(binding.ProviderID) == ""
+			}
+		}
+		binding, providerConfig, err = s.resolveSessionProvider(ctx, manager, current, agentName, in.ProviderID, allowBind)
 		if err != nil {
 			return err
 		}

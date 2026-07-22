@@ -697,28 +697,18 @@ export function ActionBar({
     if (catalog.length === 0) {
       return;
     }
-    // Remap after provider overlay/catalog churn instead of wiping to ""
-    // (which would silently drop model on the next send).
-    const remapped =
-      matchAgentModelID(catalog, model)
-      || selectedAgent.current_model_id
-      || selectedAgent.default_model_id
-      || catalog[0]?.id
-      || "";
-    // Prefer suffix remap; only fall back to current/default/first when the
-    // catalog is non-empty and clearly no longer contains the selection.
+    // Prefer suffix remap within the current catalog. Do not fall back to the
+    // agent-global current/default model while a session may still be bound to
+    // a different provider — that silently rewrote the user's model.
+    const remapped = matchAgentModelID(catalog, model) || "";
     if (remapped && remapped !== model) {
-      const remappedInCatalog = catalog.some((item) => item.id === remapped);
-      if (remappedInCatalog || matchAgentModelID(catalog, model)) {
-        setModel(matchAgentModelID(catalog, model) || remapped);
-        return;
-      }
-      // Catalog changed for real (e.g. new provider); accept fallback.
       setModel(remapped);
       return;
     }
-    if (!remapped) {
-      setModel("");
+    // Catalog changed for real and no suffix match remains: pick first catalog
+    // entry only when the previous model is completely gone.
+    if (!remapped && catalog[0]?.id) {
+      setModel(catalog[0].id);
     }
   }, [agent, model, agents]);
 

@@ -6214,12 +6214,20 @@ export function App({ onGoHome }: AppProps) {
           };
           return next;
         });
+        const slashProvider =
+          availableAgents.find((item) => item.name === effectiveAgent)
+            ?.last_config_selection;
+        const slashProviderID =
+          effectiveAgent === "codex" && slashProvider?.type === "api_provider"
+            ? String(slashProvider.id || "").trim() || undefined
+            : undefined;
         const sent = await sessionService.runSlashCommand(
           activeRoot,
           targetSessionKey,
           transientSlashCommand,
           effectiveAgent,
           effectiveModel || undefined,
+          slashProviderID,
           effectiveAgentMode || undefined,
           effectiveEffort || undefined,
           effectiveFastService,
