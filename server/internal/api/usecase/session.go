@@ -3862,7 +3862,7 @@ func (s *Service) AnswerQuestion(ctx context.Context, in AnswerQuestionInput) er
 	if pool == nil {
 		return errors.New("agent pool unavailable")
 	}
-	sess, ok := pool.Get(agentPoolSessionKey(sessionKey, agentName))
+	sess, ok := pool.Get(agentPoolSessionKey(sessionKey, agentName, in.RootID))
 	if !ok {
 		return errors.New("agent session not found")
 	}
