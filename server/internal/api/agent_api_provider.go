@@ -145,7 +145,10 @@ func validateProviderSelection(agentName, model, providerID string) error {
 		return err
 	}
 	model = strings.TrimSpace(model)
-	if model == "" || len(config.Models) == 0 {
+	if model == "" {
+		return fmt.Errorf("model is required for provider %q", config.ID)
+	}
+	if len(config.Models) == 0 {
 		return nil
 	}
 	for _, candidate := range config.Models {

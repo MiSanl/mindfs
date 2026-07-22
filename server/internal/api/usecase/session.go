@@ -4262,7 +4262,13 @@ func (s *Service) validateAgentModelForProvider(agentName, model string, provide
 		return s.validateAgentModel(agentName, model)
 	}
 	model = strings.TrimSpace(model)
-	if model == "" || len(provider.Models) == 0 {
+	if model == "" {
+		// Bound sessions must choose an explicit model so empty ActionBar state
+		// cannot silently fall through to a provider-incompatible default.
+		return fmt.Errorf("model is required for bound provider %q", provider.ID)
+	}
+	if len(provider.Models) == 0 {
+		// Provider catalog not curated yet; keep compatibility with open catalogs.
 		return nil
 	}
 	for _, candidate := range provider.Models {
