@@ -943,7 +943,6 @@ func (h *WSHandler) runSessionMessage(job sessionMessageJob) {
 	// so a failed/empty turn does not leave the session permanently "generating"
 	// and force subsequent messages into the queue.
 	h.finishSessionMessage(rootID, key, requestID)
-	h.startNextQueuedSessionMessage(rootID, key)
 }
 
 func isCanceledSessionTurnError(err error) bool {
@@ -975,6 +974,9 @@ func (h *WSHandler) startNextQueuedSessionMessage(rootID, key string) {
 		return
 	}
 	streamHub := h.AppContext.GetSessionStreamHub()
+	if streamHub.IsSessionReplying(key) {
+		return
+	}
 	item, queue, ok := streamHub.PopQueuedSessionMessage(key, "")
 	if !ok {
 		return

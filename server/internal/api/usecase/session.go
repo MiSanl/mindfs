@@ -3041,11 +3041,25 @@ func (r *claudeSubagentRouter) ensure(ctx context.Context, ref claudeSubagentRef
 	if err != nil {
 		return nil, err
 	}
-	if err := r.in.Manager.UpsertAgentBinding(ctx, session.AgentBinding{
+	childBinding := session.AgentBinding{
 		SessionKey:     child.Key,
 		Agent:          r.in.Agent,
 		AgentSessionID: "claude-subagent:" + primary,
-	}); err != nil {
+	}
+	if r.in.Binding != nil && strings.TrimSpace(r.in.Binding.ProviderID) != "" {
+		childBinding.ProviderID = r.in.Binding.ProviderID
+		childBinding.ProviderRevision = r.in.Binding.ProviderRevision
+		childBinding.ProviderEndpointRevision = r.in.Binding.ProviderEndpointRevision
+		childBinding.ProviderProtocol = r.in.Binding.ProviderProtocol
+		childBinding.ProviderState = r.in.Binding.ProviderState
+	} else if r.in.ProviderConfig != nil {
+		childBinding.ProviderID = r.in.ProviderConfig.ID
+		childBinding.ProviderRevision = r.in.ProviderConfig.Revision
+		childBinding.ProviderEndpointRevision = r.in.ProviderConfig.EndpointRevision
+		childBinding.ProviderProtocol = r.in.ProviderConfig.Protocol
+		childBinding.ProviderState = "available"
+	}
+	if err := r.in.Manager.UpsertAgentBinding(ctx, childBinding); err != nil {
 		return nil, err
 	}
 	attached := r.attach(child, ref)

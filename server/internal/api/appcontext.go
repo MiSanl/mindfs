@@ -320,7 +320,6 @@ func (s *AppContext) RunAgentStage(ctx context.Context, exec kanban.AgentStageEx
 			s.BroadcastSessionUpdate(exec.RootID, sessionKey, update)
 			if update.Type == agenttypes.EventTypeMessageDone {
 				s.BroadcastSessionDone(exec.RootID, sessionKey, "")
-	s.StartNextQueuedSessionMessage(exec.RootID, sessionKey)
 			}
 		},
 	})
@@ -331,7 +330,6 @@ func (s *AppContext) RunAgentStage(ctx context.Context, exec kanban.AgentStageEx
 		log.Printf("[kanban] session.done.wait_timeout root=%s session=%s task=%s", exec.RootID, sessionKey, exec.Task.ID)
 	}
 	s.BroadcastSessionDone(exec.RootID, sessionKey, "")
-	s.StartNextQueuedSessionMessage(exec.RootID, sessionKey)
 	return err
 }
 
