@@ -51,6 +51,9 @@ type AppContext struct {
 	Prefs     *preferences.Store
 	Scheduled *scheduled.Service
 	Kanban    *kanban.Service
+	// QueueDrainer optionally starts the next queued WS/user message for a session.
+	// Wired by the WS layer so kanban/scheduled completion can drain leftovers.
+	QueueDrainer func(rootID, sessionKey string)
 
 	mu                       sync.RWMutex
 	roots                    map[string]*RootContext // root id -> root context
@@ -985,6 +988,8 @@ func (s *AppContext) BroadcastSessionDone(rootID, sessionKey, requestID string) 
 	s.notifySessionDone(rootID, sessionKey, requestID, pending)
 	hub.ClearSessionPending(sessionKey)
 	hub.BroadcastSessionDone(rootID, sessionKey, requestID)
+	// Drain leftovers after any completion path (WS, kanban, scheduled).
+	s.StartNextQueuedSessionMessage(rootID, sessionKey)
 }
 
 // StartNextQueuedSessionMessage drains one queued user message if the session
@@ -994,12 +999,14 @@ func (s *AppContext) StartNextQueuedSessionMessage(rootID, sessionKey string) {
 	if s == nil {
 		return
 	}
+	if s.QueueDrainer != nil {
+		s.QueueDrainer(rootID, sessionKey)
+		return
+	}
 	hub := s.GetSessionStreamHub()
 	if hub == nil || hub.IsSessionReplying(sessionKey) || !hub.HasQueuedSessionMessages(sessionKey) {
 		return
 	}
-	// Best-effort: only unfreeze/broadcast; actual run requires WS handler.
-	// Mark queue for the next WS message path by ensuring HasQueued remains true.
 	if queue, changed := hub.UnfreezeQueuedSessionMessages(sessionKey); changed {
 		hub.BroadcastSessionQueueUpdated(rootID, sessionKey, queue)
 	}

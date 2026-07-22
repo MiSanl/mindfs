@@ -1440,3 +1440,19 @@ func parseClientContext(payload map[string]any, rootID string) usecase.ClientCon
 	}
 	return ctx
 }
+
+
+// WireSessionQueueDrainer lets non-WS completion paths (kanban/scheduled) drain
+// leftover user message queues through the same runner as WebSocket turns.
+func WireSessionQueueDrainer(app *AppContext) {
+	if app == nil {
+		return
+	}
+	app.QueueDrainer = func(rootID, sessionKey string) {
+		if app == nil || strings.TrimSpace(rootID) == "" || strings.TrimSpace(sessionKey) == "" {
+			return
+		}
+		h := &WSHandler{AppContext: app}
+		h.startNextQueuedSessionMessage(rootID, sessionKey)
+	}
+}
