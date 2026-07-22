@@ -922,12 +922,19 @@ func (h *HTTPHandler) sessionResponseWithBindings(ctx context.Context, rootID, k
 		if len(runtimes) > 0 {
 			items := make([]map[string]any, 0, len(runtimes))
 			for _, rt := range runtimes {
+				// Live pool entries are connected; opening/error are WS-only states.
+				// Do not invent "connected" for missing agent session ids that still
+				// have a process handle — surface agent name and optional session id.
 				item := map[string]any{
 					"agent": rt.AgentName,
 					"state": "connected",
+					"live":  true,
 				}
 				if strings.TrimSpace(rt.AgentSession) != "" {
 					item["agent_session_id"] = rt.AgentSession
+				} else {
+					// Handle exists but native session id not ready yet.
+					item["state"] = "opening"
 				}
 				items = append(items, item)
 			}
