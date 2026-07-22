@@ -2057,6 +2057,11 @@ func (s *Service) resolveSessionProvider(ctx context.Context, manager *session.M
 	return binding, config, nil
 }
 
+// SessionProviderIsolationAgent reports whether agent uses session-scoped providers.
+func SessionProviderIsolationAgent(agentName string) bool {
+	return sessionProviderIsolationAgent(agentName)
+}
+
 func sessionProviderIsolationAgent(agentName string) bool {
 	switch strings.ToLower(strings.TrimSpace(agentName)) {
 	case "claude", "codex":

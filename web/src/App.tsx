@@ -10353,21 +10353,16 @@ export function App({ onGoHome }: AppProps) {
             currentSessionRef.current?.session_key ||
             "";
           if (activeKey && activeKey === rtKey) {
-            // Connect success / disconnect: surface as toast.
+            // Keep runtime status in the ActionBar indicator. Only toast real
+            // disconnects that carry a message (skip settings reopen churn).
             // Open failures already emit session.error (avoid double toast).
-            if (rtState === "connected") {
-              reportError("agent.connected", t("session.runtime.connected", { agent: rtAgent }), {
-                severity: "info",
-                recoverable: false,
-                details: { agent: rtAgent, rootId: rtRoot, sessionKey: rtKey },
-              });
-            } else if (rtState === "disconnected") {
+            if (rtState === "disconnected" && rtMessage) {
               reportError(
-                "agent.connected",
-                t("session.runtime.disconnected", { agent: rtAgent }),
+                "network.disconnected",
+                rtMessage || t("session.runtime.disconnected", { agent: rtAgent }),
                 {
                   severity: "warning",
-                  recoverable: false,
+                  recoverable: true,
                   details: { agent: rtAgent, rootId: rtRoot, sessionKey: rtKey, state: "disconnected" },
                 },
               );

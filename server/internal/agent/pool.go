@@ -383,7 +383,19 @@ func (p *Pool) ListRuntimeInfoForMindFSSession(mindfsSessionKey string) []Runtim
 		if entry == nil || entry.session == nil {
 			continue
 		}
-		if poolKey != mindfsSessionKey && !strings.HasSuffix(poolKey, "-"+mindfsSessionKey) {
+		// Pool keys are "agent-mindfsSessionKey" (see agentPoolSessionKey). Match by
+		// exact entry.sessionKey first, then structured prefix form only.
+		matched := strings.TrimSpace(entry.sessionKey) == mindfsSessionKey
+		if !matched {
+			agent := strings.ToLower(strings.TrimSpace(entry.agentName))
+			if agent != "" && poolKey == agent+"-"+mindfsSessionKey {
+				matched = true
+			}
+		}
+		if !matched && poolKey == mindfsSessionKey {
+			matched = true
+		}
+		if !matched {
 			continue
 		}
 		info := RuntimeSessionInfo{
