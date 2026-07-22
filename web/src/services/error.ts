@@ -12,6 +12,9 @@ export type ErrorCode =
   | "session.rename_failed"
   | "session.sync_failed"
   | "session.slash_command_failed"
+  | "session.provider_unavailable"
+  | "session.provider_mismatch"
+  | "session.provider_changed"
   | "app.init_failed"
   // Root/project errors
   | "root.create_failed"
@@ -26,6 +29,10 @@ export type ErrorCode =
   | "agent.timeout"
   | "agent.crashed"
   | "agent.permission_denied"
+  | "agent.connect_failed"
+  | "agent.switch_failed"
+  | "agent.connected"
+  | "agent.switched"
   // View errors
   | "view.invalid"
   | "view.render_failed"
@@ -164,6 +171,21 @@ class ErrorService {
         severity: "error",
         recoverable: true,
       },
+      "session.provider_unavailable": {
+        messageKey: "error.session.providerUnavailable",
+        severity: "error",
+        recoverable: false,
+      },
+      "session.provider_mismatch": {
+        messageKey: "error.session.providerMismatch",
+        severity: "error",
+        recoverable: false,
+      },
+      "session.provider_changed": {
+        messageKey: "error.session.providerChanged",
+        severity: "warning",
+        recoverable: false,
+      },
       "app.init_failed": {
         messageKey: "error.app.initFailed",
         severity: "error",
@@ -223,6 +245,26 @@ class ErrorService {
         messageKey: "error.agent.permissionDenied",
         severity: "warning",
         recoverable: false,
+      },
+      "agent.connect_failed": {
+        messageKey: "error.agent.connectFailed",
+        severity: "error",
+        recoverable: true,
+      },
+      "agent.switch_failed": {
+        messageKey: "error.agent.switchFailed",
+        severity: "error",
+        recoverable: true,
+      },
+      "agent.connected": {
+        messageKey: "session.runtime.connected",
+        severity: "info",
+        recoverable: true,
+      },
+      "agent.switched": {
+        messageKey: "session.runtime.switched",
+        severity: "info",
+        recoverable: true,
       },
       "view.invalid": {
         messageKey: "error.view.invalid",

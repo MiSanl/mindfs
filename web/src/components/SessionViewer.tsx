@@ -1061,6 +1061,15 @@ function SessionViewerInner({
   const sessionKey = session?.key || session?.session_key || null;
   const exchanges = Array.isArray(session?.exchanges) ? session.exchanges : [];
   const isAwaiting = !!(session as any)?.pending;
+  const sessionErrors = Array.isArray((session as any)?.errors)
+    ? ((session as any).errors as Array<Record<string, any>>)
+    : [];
+  const [errorsExpanded, setErrorsExpanded] = useState(sessionErrors.length > 0);
+  useEffect(() => {
+    if (sessionErrors.length > 0) {
+      setErrorsExpanded(true);
+    }
+  }, [sessionErrors.length, (session as any)?.key || (session as any)?.session_key]);
   const { timeline, isStreaming, streamVersion, streamStatusText } = useSessionStream(
     sessionKey,
     exchanges,
@@ -2474,6 +2483,81 @@ if (useInnerScrollContainer && !container) {
               ),
             )}
             {renderSlashCommandResult()}
+            {sessionErrors.length > 0 && (
+              <div
+                style={{
+                  marginTop: "16px",
+                  border: "1px solid color-mix(in srgb, var(--danger-color, #d14343) 45%, var(--border-color))",
+                  background: "color-mix(in srgb, var(--danger-color, #d14343) 8%, var(--panel-bg, var(--bg-color)))",
+                  borderRadius: "10px",
+                  padding: "10px 12px",
+                  width: "100%",
+                  boxSizing: "border-box",
+                }}
+              >
+                <button
+                  type="button"
+                  onClick={() => setErrorsExpanded((v) => !v)}
+                  style={{
+                    all: "unset",
+                    cursor: "pointer",
+                    display: "flex",
+                    width: "100%",
+                    justifyContent: "space-between",
+                    alignItems: "center",
+                    color: "var(--danger-color, #d14343)",
+                    fontSize: "12px",
+                    fontWeight: 600,
+                  }}
+                >
+                  <span>
+                    {errorsExpanded
+                      ? t("session.errorHide")
+                      : t("session.errorShow", { count: sessionErrors.length })}
+                  </span>
+                  <span>{errorsExpanded ? "▾" : "▸"}</span>
+                </button>
+                {errorsExpanded ? (
+                  <div style={{ marginTop: "10px", display: "grid", gap: "8px" }}>
+                    <div style={{ fontSize: "12px", color: "var(--text-secondary)" }}>
+                      {t("session.errorsTitle")}
+                    </div>
+                    {sessionErrors.map((item, index) => {
+                      const key = String(item.id || item.request_id || index);
+                      const afterSeq = Number(item.after_seq || 0);
+                      const ts = item.timestamp ? String(item.timestamp) : "";
+                      return (
+                        <div
+                          key={key}
+                          style={{
+                            borderTop: index === 0 ? "none" : "1px solid var(--border-color)",
+                            paddingTop: index === 0 ? 0 : 8,
+                            fontSize: "12px",
+                            color: "var(--text-primary)",
+                            whiteSpace: "pre-wrap",
+                            wordBreak: "break-word",
+                          }}
+                        >
+                          <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", marginBottom: 4, color: "var(--text-secondary)" }}>
+                            {afterSeq > 0 ? <span>{t("session.errorAfterSeq", { seq: afterSeq })}</span> : null}
+                            {item.agent ? <span>{String(item.agent)}</span> : null}
+                            {item.model ? <span>{String(item.model)}</span> : null}
+                            {item.recoverable ? <span>{t("session.errorRecoverable")}</span> : null}
+                            {ts ? <span>{ts}</span> : null}
+                          </div>
+                          <div>{String(item.message || "")}</div>
+                          {item.request_id ? (
+                            <div style={{ marginTop: 4, color: "var(--text-secondary)" }}>
+                              request: {String(item.request_id)}
+                            </div>
+                          ) : null}
+                        </div>
+                      );
+                    })}
+                  </div>
+                ) : null}
+              </div>
+            )}
             {(isAwaiting || isStreaming) && (
               <div
                 style={{

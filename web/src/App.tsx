@@ -182,6 +182,15 @@ function isCanceledSessionError(message: string): boolean {
 
 function sessionErrorCode(message: string): ErrorCode {
   const normalized = message.trim().toLowerCase();
+  if (normalized.includes("session_provider_unavailable")) {
+    return "session.provider_unavailable";
+  }
+  if (normalized.includes("session_provider_mismatch")) {
+    return "session.provider_mismatch";
+  }
+  if (normalized.includes("session_provider_changed")) {
+    return "session.provider_changed";
+  }
   if (
     normalized.includes("peer disconnected") ||
     normalized.includes("stream disconnected") ||
@@ -334,7 +343,33 @@ export type SessionItem = {
   closed_at?: string;
   title?: string;
 	agent_session_id?: string;
-	agent_bindings?: Array<{ agent?: string; agent_session_id?: string }>;
+	agent_bindings?: Array<{ agent?: string; agent_session_id?: string; provider_id?: string; provider_revision?: string; provider_protocol?: string; provider_state?: string }>;
+  runtime?: {
+    agent?: string;
+    state?: string;
+    agent_session_id?: string;
+    message?: string;
+  } | null;
+  runtimes?: Array<{
+    agent?: string;
+    state?: string;
+    agent_session_id?: string;
+    message?: string;
+  }>;
+  errors?: Array<{
+    id?: string;
+    session_key?: string;
+    request_id?: string;
+    after_message_id?: string;
+    after_seq?: number;
+    agent?: string;
+    model?: string;
+    code?: string;
+    kind?: string;
+    message?: string;
+    recoverable?: boolean;
+    timestamp?: string;
+  }>;
   context_window?: {
     totalTokens: number;
     modelContextWindow: number;
@@ -479,6 +514,9 @@ function toSessionItem(
         : latestExchangeText(session?.exchanges, "agent"),
 		model: typeof session?.model === "string" ? session.model : "",
 		agent_bindings: Array.isArray(session?.agent_bindings) ? session.agent_bindings : undefined,
+    runtime: session?.runtime && typeof session.runtime === "object" ? session.runtime : undefined,
+    runtimes: Array.isArray(session?.runtimes) ? session.runtimes : undefined,
+    errors: Array.isArray(session?.errors) ? session.errors : undefined,
     shell: typeof session?.shell === "string" ? session.shell : "",
     mode:
       typeof session?.mode === "string" && session.mode.trim()
@@ -3188,6 +3226,13 @@ export function App({ onGoHome }: AppProps) {
             : typeof (cached as any)?.pending === "boolean"
               ? !!(cached as any).pending
               : undefined;
+      const errors = Array.isArray((cached as any)?.errors)
+        ? ((cached as any).errors as any[])
+        : Array.isArray((session as any)?.errors)
+          ? ((session as any).errors as any[])
+          : Array.isArray((drawerSession as any)?.errors) && drawerSession?.key === key
+            ? ((drawerSession as any).errors as any[])
+            : [];
       return {
         ...(session as any),
         ...(cached as any),
@@ -3198,6 +3243,7 @@ export function App({ onGoHome }: AppProps) {
         search_snippet: (session as any).search_snippet,
         search_match_type: (session as any).search_match_type,
         exchanges,
+        errors,
         pending,
       } as any;
     },
@@ -9596,13 +9642,114 @@ export function App({ onGoHome }: AppProps) {
           // Always clear state, even after session.accepted removed the local
           // pending request. Cancellation is a normal terminal outcome.
           if (!isCanceledSessionError(errorMessage)) {
+            const recoverable =
+              typeof (payload as any)?.recoverable === "boolean"
+                ? Boolean((payload as any).recoverable)
+                : /peer disconnected|stream disconnected|504|timeout|connection/i.test(
+                    errorMessage,
+                  );
             reportError(sessionErrorCode(errorMessage), errorMessage, {
+              recoverable,
               details: {
                 rootId: payloadRootId || pending?.rootId || currentRootIdRef.current,
                 sessionKey: payloadSessionKey || pending?.sessionKey || null,
                 requestId: requestId || null,
               },
             });
+          }
+          {
+            const errRoot = payloadRootId || pending?.rootId || currentRootIdRef.current || "";
+            const errKey = payloadSessionKey || pending?.sessionKey || "";
+            if (errRoot && errKey && !isCanceledSessionError(errorMessage)) {
+              const cacheKey = rootSessionKey(errRoot, errKey);
+              const recoverable =
+                typeof (payload as any)?.recoverable === "boolean"
+                  ? Boolean((payload as any).recoverable)
+                  : /peer disconnected|stream disconnected|504|timeout|connection/i.test(
+                      errorMessage,
+                    );
+              const optimistic = {
+                id: requestId || `err-${Date.now()}`,
+                session_key: errKey,
+                request_id: requestId || "",
+                after_message_id: requestId || "",
+                after_seq: 0,
+                message: errorMessage,
+                code: "session.message_failed",
+                kind: "turn",
+                recoverable,
+                timestamp: new Date().toISOString(),
+              };
+              const prevErrors = Array.isArray((sessionCacheRef.current[cacheKey] as any)?.errors)
+                ? ([...(sessionCacheRef.current[cacheKey] as any).errors] as any[])
+                : Array.isArray((selectedSessionRef.current as any)?.errors) &&
+                    (selectedSessionRef.current?.key === errKey ||
+                      (selectedSessionRef.current as any)?.session_key === errKey)
+                  ? ([...(selectedSessionRef.current as any).errors] as any[])
+                  : [];
+              const nextErrors = [
+                ...prevErrors.filter(
+                  (e) => e?.id !== optimistic.id && e?.request_id !== optimistic.request_id,
+                ),
+                optimistic,
+              ].slice(-100);
+              const cached = sessionCacheRef.current[cacheKey];
+              sessionCacheRef.current[cacheKey] = {
+                ...(cached && typeof cached === "object" ? cached : { key: errKey, session_key: errKey, root_id: errRoot }),
+                errors: nextErrors,
+              } as any;
+              const latestDrawer = drawerSessionByRootRef.current[errRoot];
+              if (latestDrawer && (latestDrawer.key === errKey || (latestDrawer as any).session_key === errKey)) {
+                setDrawerSessionForRoot(errRoot, { ...(latestDrawer as any), errors: nextErrors } as Session);
+              }
+              setSelectedSession((prev) => {
+                const prevKey = prev?.key || prev?.session_key;
+                if (!prev || prevKey !== errKey) return prev;
+                return { ...(prev as any), errors: nextErrors } as SessionItem;
+              });
+              bumpCacheVersion();
+              void sessionService.getSessionErrors(errRoot, errKey).then((serverErrors) => {
+                // Prefer server list, but keep optimistic rows the server has not
+                // persisted yet (race: GET can return older history only).
+                let merged = Array.isArray(serverErrors) ? [...serverErrors] : [];
+                if (merged.length === 0) {
+                  merged = nextErrors;
+                } else {
+                  for (const opt of nextErrors) {
+                    const optId = String(opt?.id || "");
+                    const optReq = String(opt?.request_id || "");
+                    const exists = merged.some((e) => {
+                      const id = String(e?.id || "");
+                      const req = String(e?.request_id || "");
+                      return (
+                        (optId && id && optId === id) ||
+                        (optReq && req && optReq === req) ||
+                        (String(e?.message || "") === String(opt?.message || "") &&
+                          String(e?.timestamp || "") === String(opt?.timestamp || ""))
+                      );
+                    });
+                    if (!exists) merged.push(opt);
+                  }
+                  merged = merged.slice(-100);
+                }
+                if (sessionCacheRef.current[cacheKey]) {
+                  sessionCacheRef.current[cacheKey] = {
+                    ...(sessionCacheRef.current[cacheKey] as any),
+                    errors: merged,
+                  } as any;
+                }
+                const drawer = drawerSessionByRootRef.current[errRoot];
+                if (drawer && (drawer.key === errKey || (drawer as any).session_key === errKey)) {
+                  setDrawerSessionForRoot(errRoot, { ...(drawer as any), errors: merged } as Session);
+                }
+                setSelectedSession((prev) => {
+                  const prevKey = prev?.key || prev?.session_key;
+                  if (!prev || prevKey !== errKey) return prev;
+                  return { ...(prev as any), errors: merged } as SessionItem;
+                });
+                bumpCacheVersion();
+              });
+            }
           }
           if (requestId && pending) {
             console.warn("[session/ws] error", {
@@ -10103,6 +10250,99 @@ export function App({ onGoHome }: AppProps) {
         case "file.changed":
           handleFileChanged(payload);
           break;
+        case "session.runtime.changed": {
+          const rtRoot =
+            typeof payload?.root_id === "string" ? payload.root_id : currentRootIdRef.current || "";
+          const rtKey = typeof payload?.session_key === "string" ? payload.session_key : "";
+          const rtAgent = typeof payload?.agent === "string" ? payload.agent.trim() : "";
+          const rtState = typeof payload?.state === "string" ? payload.state.trim() : "";
+          const rtSid =
+            typeof payload?.agent_session_id === "string" ? payload.agent_session_id : "";
+          const rtMessage = typeof payload?.message === "string" ? payload.message.trim() : "";
+          if (!rtRoot || !rtKey || !rtAgent || !rtState) {
+            break;
+          }
+          const runtimeInfo = {
+            agent: rtAgent,
+            state: rtState,
+            agent_session_id: rtSid || undefined,
+            message: rtMessage || undefined,
+          };
+          const cacheKey = rootSessionKey(rtRoot, rtKey);
+          const applyRuntime = (sess: any) => {
+            if (!sess) return sess;
+            const prevRuntimes = Array.isArray(sess.runtimes) ? [...sess.runtimes] : [];
+            const without = prevRuntimes.filter(
+              (item) => String(item?.agent || "").toLowerCase() !== rtAgent.toLowerCase(),
+            );
+            const nextRuntimes =
+              rtState === "disconnected"
+                ? without
+                : [...without, runtimeInfo];
+            return {
+              ...sess,
+              agent: rtState === "connected" || rtState === "opening" ? rtAgent : sess.agent,
+              runtime:
+                rtState === "disconnected"
+                  ? nextRuntimes[nextRuntimes.length - 1] || {
+                      agent: rtAgent,
+                      state: "disconnected",
+                    }
+                  : runtimeInfo,
+              runtimes: nextRuntimes,
+            };
+          };
+          if (sessionCacheRef.current[cacheKey]) {
+            sessionCacheRef.current[cacheKey] = applyRuntime(sessionCacheRef.current[cacheKey]);
+          }
+          const latestDrawer = drawerSessionByRootRef.current[rtRoot];
+          if (
+            latestDrawer &&
+            (latestDrawer.key === rtKey || (latestDrawer as any).session_key === rtKey)
+          ) {
+            setDrawerSessionForRoot(rtRoot, applyRuntime(latestDrawer));
+          }
+          setSelectedSession((prev) => {
+            const prevKey = prev?.key || prev?.session_key;
+            if (!prev || prevKey !== rtKey) return prev;
+            return applyRuntime(prev) as SessionItem;
+          });
+          setCurrentSession((prev) => {
+            const prevKey = prev?.key || prev?.session_key;
+            if (!prev || prevKey !== rtKey) return prev;
+            return applyRuntime(prev) as SessionItem;
+          });
+          bumpCacheVersion();
+
+          const activeKey =
+            selectedSessionRef.current?.key ||
+            selectedSessionRef.current?.session_key ||
+            currentSessionRef.current?.key ||
+            currentSessionRef.current?.session_key ||
+            "";
+          if (activeKey && activeKey === rtKey) {
+            // Connect success / disconnect: surface as toast.
+            // Open failures already emit session.error (avoid double toast).
+            if (rtState === "connected") {
+              reportError("agent.connected", t("session.runtime.connected", { agent: rtAgent }), {
+                severity: "info",
+                recoverable: false,
+                details: { agent: rtAgent, rootId: rtRoot, sessionKey: rtKey },
+              });
+            } else if (rtState === "disconnected") {
+              reportError(
+                "agent.connected",
+                t("session.runtime.disconnected", { agent: rtAgent }),
+                {
+                  severity: "warning",
+                  recoverable: false,
+                  details: { agent: rtAgent, rootId: rtRoot, sessionKey: rtKey, state: "disconnected" },
+                },
+              );
+            }
+          }
+          break;
+        }
         case "agent.status.changed":
           setAgentsVersion((v) => v + 1);
           break;

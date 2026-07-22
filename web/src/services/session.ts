@@ -90,6 +90,30 @@ export type ExchangeAux = {
   compact?: CompactNotice | null;
 };
 
+export type SessionErrorRecord = {
+  id: string;
+  session_key?: string;
+  request_id?: string;
+  after_message_id?: string;
+  after_seq?: number;
+  agent?: string;
+  model?: string;
+  code?: string;
+  kind?: string;
+  message: string;
+  recoverable?: boolean;
+  timestamp: string;
+};
+
+export type SessionRuntimeState = "idle" | "opening" | "connected" | "disconnected" | "error";
+
+export type SessionRuntimeInfo = {
+  agent?: string;
+  state?: SessionRuntimeState | string;
+  agent_session_id?: string;
+  message?: string;
+};
+
 export type Session = {
   key: string;
   session_key?: string;
@@ -117,6 +141,10 @@ export type Session = {
   related_files?: RelatedFile[];
   related_worktree?: RelatedWorktree | null;
   exchange_aux?: Record<string, ExchangeAux[]>;
+  errors?: SessionErrorRecord[];
+  runtime?: SessionRuntimeInfo | null;
+  runtimes?: SessionRuntimeInfo[];
+  agent_bindings?: Array<{ agent?: string; agent_session_id?: string; provider_id?: string; provider_revision?: string; provider_protocol?: string; provider_state?: string }>;
   exchanges?: Array<{
     seq?: number;
     role?: string;
@@ -1151,6 +1179,23 @@ class SessionService {
         : [];
     } catch (err) {
       console.error("[Session] Failed to search sessions:", err);
+      return [];
+    }
+  }
+
+
+  async getSessionErrors(
+    rootId: string,
+    sessionKey: string,
+  ): Promise<SessionErrorRecord[]> {
+    try {
+      const params = new URLSearchParams({ root: rootId });
+      const data = await protectedJSON<{ errors?: SessionErrorRecord[] }>(
+        appURL(`/api/sessions/${encodeURIComponent(sessionKey)}/errors`, params),
+      );
+      return Array.isArray(data?.errors) ? data.errors : [];
+    } catch (err) {
+      console.error("[Session] Failed to get session errors:", err);
       return [];
     }
   }

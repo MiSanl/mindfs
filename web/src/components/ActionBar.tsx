@@ -38,6 +38,18 @@ type SessionInfo = {
   plan_mode?: boolean;
   pending?: boolean;
 	agent_bindings?: Array<{ agent?: string; agent_session_id?: string }>;
+  runtime?: {
+    agent?: string;
+    state?: string;
+    agent_session_id?: string;
+    message?: string;
+  } | null;
+  runtimes?: Array<{
+    agent?: string;
+    state?: string;
+    agent_session_id?: string;
+    message?: string;
+  }>;
 };
 
 type PendingAttachment = {
@@ -148,6 +160,72 @@ function wsStatusMeta(status: WSStatus, t: (key: MessageKey) => string): {
         label: t("action.ws.disconnected"),
       };
   }
+}
+
+
+function runtimeStatusMeta(
+  runtime: SessionInfo["runtime"] | null | undefined,
+  selectedAgent: string,
+  agents: AgentStatus[],
+  t: (key: MessageKey, params?: Record<string, string | number>) => string,
+): {
+  color: string;
+  label: string;
+  agent: string;
+  state: string;
+} {
+  const agentStatus = agents.find((item) => item.name === selectedAgent);
+  const runtimeAgent = String(runtime?.agent || "").trim();
+  const state = String(runtime?.state || "").trim().toLowerCase();
+  const connectedHere =
+    state === "connected" &&
+    (!selectedAgent || !runtimeAgent || runtimeAgent.toLowerCase() === selectedAgent.toLowerCase());
+  if (connectedHere) {
+    return {
+      color: "#22c55e",
+      label: t("session.runtime.connected", { agent: runtimeAgent || selectedAgent || "?" }),
+      agent: runtimeAgent || selectedAgent,
+      state: "connected",
+    };
+  }
+  if (state === "opening" && (!selectedAgent || !runtimeAgent || runtimeAgent.toLowerCase() === selectedAgent.toLowerCase())) {
+    return {
+      color: "#f59e0b",
+      label: t("session.runtime.opening", { agent: runtimeAgent || selectedAgent || "?" }),
+      agent: runtimeAgent || selectedAgent,
+      state: "opening",
+    };
+  }
+  if (state === "error" && (!selectedAgent || !runtimeAgent || runtimeAgent.toLowerCase() === selectedAgent.toLowerCase())) {
+    return {
+      color: "#ef4444",
+      label: t("session.runtime.error", { agent: runtimeAgent || selectedAgent || "?" }),
+      agent: runtimeAgent || selectedAgent,
+      state: "error",
+    };
+  }
+  if (agentStatus && agentStatus.available === false) {
+    return {
+      color: "#ef4444",
+      label: t("error.agent.unavailable"),
+      agent: selectedAgent,
+      state: "unavailable",
+    };
+  }
+  if (selectedAgent) {
+    return {
+      color: "#94a3b8",
+      label: t("session.runtime.willUse", { agent: selectedAgent }),
+      agent: selectedAgent,
+      state: "idle",
+    };
+  }
+  return {
+    color: "#94a3b8",
+    label: t("session.runtime.idle"),
+    agent: "",
+    state: "idle",
+  };
 }
 
 const modePlaceholderKeys: Record<SessionMode, MessageKey> = {
@@ -503,6 +581,7 @@ export function ActionBar({
   const { isMobile } = useResponsive();
   const isConnected = status === "connected";
   const connectionMeta = wsStatusMeta(status, t);
+  const runtimeMeta = runtimeStatusMeta(currentSession?.runtime, agent, agents, t);
   const DRAG_THRESHOLD = -40;
   const boundRingColor = detachedBoundSession ? "#f59e0b" : "#2563eb";
   const boundRingShadow = detachedBoundSession
@@ -1728,6 +1807,7 @@ export function ActionBar({
                     agent={agent}
                     agents={agents}
                     onAgentChange={(nextAgent) => {
+                      const prevAgent = agent;
                       const nextStatus = agents.find((item) => item.name === nextAgent);
                       const defaults = getAgentDefaults(nextStatus);
                       setAgent(nextAgent);
@@ -1735,6 +1815,22 @@ export function ActionBar({
                       setAgentMode("");
                       setEffort(getModelDefaultEffort(nextStatus, defaults.model));
                       setFastService(defaults.fastService);
+                      if (nextAgent && nextAgent !== prevAgent) {
+                        reportError(
+                          "agent.switched",
+                          t("session.runtime.willUse", { agent: nextAgent }),
+                          {
+                            severity: "info",
+                            recoverable: false,
+                            details: { from: prevAgent, to: nextAgent },
+                          },
+                        );
+                        if (nextStatus && nextStatus.available === false) {
+                          reportError("agent.unavailable", undefined, {
+                            details: { agent: nextAgent },
+                          });
+                        }
+                      }
                     }}
                     onAgentRestart={async (targetAgent) => {
                       await restartAgent(targetAgent);
@@ -1744,6 +1840,41 @@ export function ActionBar({
                     compact={true}
                     warnUnavailable={isSelectedAgentUnavailable}
                   />
+                  <span
+                    title={runtimeMeta.label}
+                    aria-label={`${t("session.runtime.label")}: ${runtimeMeta.label}`}
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: "6px",
+                      maxWidth: isMobile ? "min(28vw, 110px)" : "160px",
+                      height: "28px",
+                      padding: "0 8px",
+                      borderRadius: "8px",
+                      border: "1px solid var(--border-color)",
+                      background: "var(--bg-secondary, transparent)",
+                      color: "var(--text-secondary)",
+                      fontSize: "11px",
+                      fontWeight: 600,
+                      whiteSpace: "nowrap",
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                      flexShrink: 1,
+                    }}
+                  >
+                    <span
+                      style={{
+                        width: "8px",
+                        height: "8px",
+                        borderRadius: "50%",
+                        background: runtimeMeta.color,
+                        flexShrink: 0,
+                      }}
+                    />
+                    <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>
+                      {runtimeMeta.agent || runtimeMeta.label}
+                    </span>
+                  </span>
                   <ModelSelector
                     agent={selectedAgent}
                     model={model}
