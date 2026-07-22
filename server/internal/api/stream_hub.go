@@ -391,15 +391,6 @@ func (h *StreamHub) BindSessionClient(rootID, sessionKey, clientID string) {
 	}
 	h.sessionClients[key] = clientSet
 	clientSet[clientID] = struct{}{}
-	// Also keep bare key for transition callers that still look up without root.
-	if key != sessionKey {
-		bare := h.sessionClients[sessionKey]
-		if bare == nil {
-			bare = make(map[string]struct{})
-			h.sessionClients[sessionKey] = bare
-		}
-		bare[clientID] = struct{}{}
-	}
 }
 
 func (h *StreamHub) GetSessionClientIDs(rootID, sessionKey string, liveOnly bool) []string {
@@ -410,21 +401,26 @@ func (h *StreamHub) GetSessionClientIDs(rootID, sessionKey string, liveOnly bool
 	defer h.mu.RUnlock()
 	key := pendingKey(rootID, sessionKey)
 	clientSet := h.sessionClients[key]
-	if len(clientSet) == 0 && key != sessionKey {
-		clientSet = h.sessionClients[sessionKey]
-	}
 	if len(clientSet) == 0 && strings.TrimSpace(rootID) == "" {
-		// Union unique root-scoped client sets for this session key.
-		merged := map[string]struct{}{}
-		suffix := "::" + strings.TrimSpace(sessionKey)
-		for mapKey, set := range h.sessionClients {
-			if mapKey == sessionKey || strings.HasSuffix(mapKey, suffix) {
-				for id := range set {
-					merged[id] = struct{}{}
+		// No root: prefer bare key, else unique root-scoped match only.
+		if bare := h.sessionClients[sessionKey]; len(bare) > 0 {
+			clientSet = bare
+		} else {
+			merged := map[string]struct{}{}
+			suffix := "::" + strings.TrimSpace(sessionKey)
+			matches := 0
+			for mapKey, set := range h.sessionClients {
+				if strings.HasSuffix(mapKey, suffix) {
+					matches++
+					for id := range set {
+						merged[id] = struct{}{}
+					}
 				}
 			}
+			if matches == 1 {
+				clientSet = merged
+			}
 		}
-		clientSet = merged
 	}
 	if len(clientSet) == 0 {
 		return nil
@@ -1098,7 +1094,11 @@ func (h *StreamHub) replayCompletionToClient(rootID, clientID, sessionKey string
 		return
 	}
 	h.mu.Lock()
-	completed := h.completed[sessionKey]
+	completed := h.completed[pendingKey(rootID, sessionKey)]
+	if completed == nil {
+		// Legacy bare-key fallback for in-flight transitions.
+		completed = h.completed[sessionKey]
+	}
 	if completed == nil {
 		h.mu.Unlock()
 		return
