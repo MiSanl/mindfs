@@ -2,7 +2,7 @@
 
 ## Status
 
-Design proposal. No implementation has been applied.
+Partially implemented on feat/session-provider-isolation: session bindings, runtime env isolation, durable errors, provider migrate endpoint, and related recovery UI. Full design items may still be incomplete.
 
 ## Goal
 

@@ -774,3 +774,16 @@ func TestSessionProviderRuntimeEnvNormalizesBaseURLs(t *testing.T) {
 		t.Fatalf("claude root URL mutated: %q", got)
 	}
 }
+
+func TestSessionProviderRuntimeArgsNormalizesCodexBaseURL(t *testing.T) {
+	provider := agentAPIProvider{
+		Name:    "sub2",
+		BaseURL: "https://relay.example",
+		APIKey:  "k",
+	}
+	args := sessionProviderRuntimeArgs("codex", provider)
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "https://relay.example/v1") {
+		t.Fatalf("codex runtime args missing /v1 base: %v", args)
+	}
+}

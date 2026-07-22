@@ -484,13 +484,23 @@ func (s *Service) runTask(ctx context.Context, task Task, force bool) error {
 		}
 	}
 	sessionName := current.Name
+	allowProviderBind := createdSession
+	if !allowProviderBind && strings.TrimSpace(current.ProviderID) != "" {
+		if existing, getErr := manager.Get(ctx, sessionKey, 0); getErr == nil && existing != nil && len(existing.Exchanges) == 0 {
+			if binding, bindErr := manager.FindAgentBinding(ctx, sessionKey, current.Agent); bindErr == nil {
+				if binding == nil || strings.TrimSpace(binding.ProviderID) == "" {
+					allowProviderBind = true
+				}
+			}
+		}
+	}
 	err = s.usecase.SendMessage(ctx, usecase.SendMessageInput{
 		RootID:            current.RootID,
 		Key:               sessionKey,
 		Agent:             current.Agent,
 		Model:             current.Model,
 		ProviderID:        current.ProviderID,
-		AllowProviderBind: createdSession,
+		AllowProviderBind: allowProviderBind,
 		Mode:              current.Mode,
 		Effort:            current.Effort,
 		FastService:       current.FastService,

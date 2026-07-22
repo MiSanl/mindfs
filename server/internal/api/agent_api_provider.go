@@ -200,7 +200,7 @@ func sessionProviderRuntimeArgs(agentName string, provider agentAPIProvider) []s
 	providerName := agentAPIProviderConfigName(provider)
 	return []string{
 		"-c", "model_provider=" + tomlQuote(providerName),
-		"-c", "model_providers." + providerName + ".base_url=" + tomlQuote(provider.BaseURL),
+		"-c", "model_providers." + providerName + ".base_url=" + tomlQuote(openAIModelsBaseURL(provider.BaseURL)),
 		"-c", "model_providers." + providerName + ".wire_api=\"responses\"",
 	}
 }
@@ -744,7 +744,7 @@ func applyAgentAPIProvider(agentName string, provider agentAPIProvider, app *App
 		}
 	default:
 		if err := applyAgentProviderEnv(agentName, map[string]string{
-			"OPENAI_BASE_URL": provider.BaseURL,
+			"OPENAI_BASE_URL": openAIModelsBaseURL(provider.BaseURL),
 			"OPENAI_API_KEY":  provider.APIKey,
 		}, app); err != nil {
 			return err
