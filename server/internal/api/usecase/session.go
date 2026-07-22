@@ -2528,17 +2528,19 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 	}
 	lastResponseUpdateType := ""
 	claudeSubagents := newClaudeSubagentRouter(subagentSessionInput{
-		RootID:      in.RootID,
-		Parent:      current,
-		Agent:       in.Agent,
-		Model:       in.Model,
-		Mode:        in.Mode,
-		Effort:      in.Effort,
-		FastService: in.FastService,
-		RootAbs:     rootAbs,
-		Manager:     manager,
-		OnCreated:   in.OnSubSessionCreated,
-		OnUpdate:    in.OnSubSessionUpdate,
+		RootID:         in.RootID,
+		Parent:         current,
+		Agent:          in.Agent,
+		Model:          in.Model,
+		Mode:           in.Mode,
+		Effort:         in.Effort,
+		FastService:    in.FastService,
+		RootAbs:        rootAbs,
+		Manager:        manager,
+		Binding:        binding,
+		ProviderConfig: providerConfig,
+		OnCreated:      in.OnSubSessionCreated,
+		OnUpdate:       in.OnSubSessionUpdate,
 	})
 	attachSessionUpdates := func(runtime agenttypes.Session) {
 		runtime.OnUpdate(func(update agenttypes.Event) {
@@ -2585,8 +2587,10 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 						Effort:      in.Effort,
 						FastService: in.FastService,
 						RootAbs:     rootAbs,
-						Pool:        agentPool,
-						Manager:     manager,
+						Pool:           agentPool,
+						Binding:        binding,
+						ProviderConfig: providerConfig,
+						Manager:        manager,
 						ToolCall:    toolCall,
 						OnCreated:   in.OnSubSessionCreated,
 						OnUpdate:    in.OnSubSessionUpdate,
@@ -2865,19 +2869,21 @@ func (s *Service) RunTransientSlashCommand(ctx context.Context, in RunTransientS
 }
 
 type subagentSessionInput struct {
-	RootID      string
-	Parent      *session.Session
-	Agent       string
-	Model       string
-	Mode        string
-	Effort      string
-	FastService string
-	RootAbs     string
-	Pool        *agent.Pool
-	Manager     *session.Manager
-	ToolCall    agenttypes.ToolCall
-	OnCreated   func(*session.Session)
-	OnUpdate    func(sessionKey string, update agenttypes.Event)
+	RootID         string
+	Parent         *session.Session
+	Agent          string
+	Model          string
+	Mode           string
+	Effort         string
+	FastService    string
+	RootAbs        string
+	Pool           *agent.Pool
+	Manager        *session.Manager
+	Binding        *session.AgentBinding
+	ProviderConfig *SessionProviderConfig
+	ToolCall       agenttypes.ToolCall
+	OnCreated      func(*session.Session)
+	OnUpdate       func(sessionKey string, update agenttypes.Event)
 }
 
 type claudeSubagentRouter struct {
@@ -3265,11 +3271,25 @@ func (s *Service) ensureSubagentSession(ctx context.Context, in subagentSessionI
 	if err != nil {
 		return nil, err
 	}
-	if err := in.Manager.UpsertAgentBinding(ctx, session.AgentBinding{
+	childBinding := session.AgentBinding{
 		SessionKey:     child.Key,
 		Agent:          in.Agent,
 		AgentSessionID: receiverThreadID,
-	}); err != nil {
+	}
+	if in.Binding != nil && strings.TrimSpace(in.Binding.ProviderID) != "" {
+		childBinding.ProviderID = in.Binding.ProviderID
+		childBinding.ProviderRevision = in.Binding.ProviderRevision
+		childBinding.ProviderEndpointRevision = in.Binding.ProviderEndpointRevision
+		childBinding.ProviderProtocol = in.Binding.ProviderProtocol
+		childBinding.ProviderState = in.Binding.ProviderState
+	} else if in.ProviderConfig != nil {
+		childBinding.ProviderID = in.ProviderConfig.ID
+		childBinding.ProviderRevision = in.ProviderConfig.Revision
+		childBinding.ProviderEndpointRevision = in.ProviderConfig.EndpointRevision
+		childBinding.ProviderProtocol = in.ProviderConfig.Protocol
+		childBinding.ProviderState = "available"
+	}
+	if err := in.Manager.UpsertAgentBinding(ctx, childBinding); err != nil {
 		return nil, err
 	}
 	if in.OnCreated != nil {
@@ -3288,7 +3308,7 @@ func (s *Service) startSubagentSubscription(in subagentSessionInput, child *sess
 		ctx, cancel := context.WithCancel(in.Pool.Context())
 		registerActiveTurn(in.RootID, child.Key, cancel)
 		defer unregisterActiveTurn(in.RootID, child.Key)
-		runtime, err := in.Pool.GetOrCreate(ctx, agenttypes.OpenSessionInput{
+		openInput := agenttypes.OpenSessionInput{
 			SessionKey:     agentPoolSessionKey(child.Key, in.Agent, in.RootID),
 			AgentName:      in.Agent,
 			Model:          firstNonEmptyString(stringMeta(in.ToolCall.Meta, "model"), in.Model),
@@ -3299,7 +3319,13 @@ func (s *Service) startSubagentSubscription(in subagentSessionInput, child *sess
 			RootPath:       in.RootAbs,
 			AgentSessionID: receiverThreadID,
 			AgentCtxSeq:    child.AgentCtxSeq[in.Agent],
-		})
+		}
+		if in.ProviderConfig != nil {
+			openInput.RuntimeEnv = cloneProviderRuntimeEnv(in.ProviderConfig.Env)
+			openInput.RuntimeArgs = append([]string{}, in.ProviderConfig.Args...)
+			openInput.RuntimeKey = in.Agent + ":" + in.ProviderConfig.ID + ":" + in.ProviderConfig.Revision
+		}
+		runtime, err := in.Pool.GetOrCreate(ctx, openInput)
 		if err != nil {
 			log.Printf("[subagent] subscription.open.error root=%s session=%s receiver=%s err=%v", in.RootID, child.Key, receiverThreadID, err)
 			return

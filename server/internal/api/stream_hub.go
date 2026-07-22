@@ -707,10 +707,10 @@ func (h *StreamHub) PendingSessionSnapshot(sessionKey string) PendingSessionSnap
 	}
 }
 
-func (h *StreamHub) AppendReplyEvent(sessionKey string, event StreamEvent) {
+func (h *StreamHub) AppendReplyEvent(rootID, sessionKey string, event StreamEvent) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	state := h.ensurePendingSessionLocked("", sessionKey)
+	state := h.ensurePendingSessionLocked(rootID, sessionKey)
 	if coalesceUserShellStreamEvent(state, event) {
 		state.UpdatedAt = time.Now().UTC()
 		return
@@ -796,9 +796,14 @@ func (h *StreamHub) ListReplyingSessions() []ReplyingSessionState {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	items := make([]ReplyingSessionState, 0, len(h.pendingSessions))
-	for sessionKey, state := range h.pendingSessions {
-		if state == nil || !state.Active || blank(sessionKey) || blank(state.RootID) {
+	for mapKey, state := range h.pendingSessions {
+		if state == nil || !state.Active || blank(mapKey) || blank(state.RootID) {
 			continue
+		}
+		sessionKey := mapKey
+		prefix := state.RootID + "::"
+		if strings.HasPrefix(mapKey, prefix) {
+			sessionKey = strings.TrimPrefix(mapKey, prefix)
 		}
 		items = append(items, ReplyingSessionState{
 			RootID:       state.RootID,
@@ -852,15 +857,22 @@ func (h *StreamHub) ClearSessionPending(sessionKey string) {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	state := h.getPendingStateLocked("", sessionKey)
-	if state != nil && len(state.Queue) > 0 {
+	key := h.pendingLookupKey("", sessionKey)
+	state := h.pendingSessions[key]
+	if state == nil {
+		return
+	}
+	if len(state.Queue) > 0 {
 		state.Active = false
 		state.User = nil
 		state.ReplyingList = nil
 		state.Summary = ""
 		state.UpdatedAt = time.Now().UTC()
 	} else {
-		delete(h.pendingSessions, sessionKey)
+		delete(h.pendingSessions, key)
+		if key != sessionKey {
+			delete(h.pendingSessions, sessionKey)
+		}
 	}
 	h.clearReplayStatesForSessionLocked(sessionKey)
 }
@@ -888,7 +900,7 @@ func (h *StreamHub) BroadcastSessionStream(rootID, sessionKey string, event *Str
 	if event == nil {
 		return
 	}
-	h.AppendReplyEvent(sessionKey, *event)
+	h.AppendReplyEvent(rootID, sessionKey, *event)
 	for _, clientID := range h.GetSessionClientIDs(sessionKey, true) {
 		resp := buildSessionStreamResponse(rootID, sessionKey, event)
 		h.SendToClient(clientID, resp)

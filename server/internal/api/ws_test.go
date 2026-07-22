@@ -45,7 +45,7 @@ func TestParseClientContext(t *testing.T) {
 func TestAppendReplyEventPrefixesTruncatedSummary(t *testing.T) {
 	hub := NewStreamHub(nil)
 
-	hub.AppendReplyEvent("sess-1", StreamEvent{
+	hub.AppendReplyEvent("root", "sess-1", StreamEvent{
 		Type: "message_chunk",
 		Data: agenttypes.MessageChunk{Content: strings.Repeat("前", 601) + "后"},
 	})
@@ -62,15 +62,15 @@ func TestAppendReplyEventPrefixesTruncatedSummary(t *testing.T) {
 func TestAppendReplyEventResetsSummaryAfterAuxiliaryEvent(t *testing.T) {
 	hub := NewStreamHub(nil)
 
-	hub.AppendReplyEvent("sess-1", StreamEvent{
+	hub.AppendReplyEvent("root", "sess-1", StreamEvent{
 		Type: string(agenttypes.EventTypeMessageChunk),
 		Data: agenttypes.MessageChunk{Content: "before aux"},
 	})
-	hub.AppendReplyEvent("sess-1", StreamEvent{
+	hub.AppendReplyEvent("root", "sess-1", StreamEvent{
 		Type: string(agenttypes.EventTypePlanUpdate),
 		Data: agenttypes.PlanUpdate{Content: "- inspect"},
 	})
-	hub.AppendReplyEvent("sess-1", StreamEvent{
+	hub.AppendReplyEvent("root", "sess-1", StreamEvent{
 		Type: string(agenttypes.EventTypeMessageChunk),
 		Data: agenttypes.MessageChunk{Content: "after aux"},
 	})

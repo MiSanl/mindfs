@@ -839,7 +839,7 @@ func (s *AppContext) BroadcastSessionErrorWithRequest(rootID, sessionKey, reques
 	s.persistSessionError(rootID, sessionKey, requestID, "session.message_failed", "turn", normalized, recoverable)
 	hub := s.GetSessionStreamHub()
 	// Still append to reply event log so reconnect/replay can surface the failure.
-	hub.AppendReplyEvent(sessionKey, StreamEvent{
+	hub.AppendReplyEvent(rootID, sessionKey, StreamEvent{
 		Type: "error",
 		Data: map[string]string{"message": normalized},
 	})
