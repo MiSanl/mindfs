@@ -502,7 +502,7 @@ func (s *Service) ForkSession(ctx context.Context, in ForkSessionInput) (ForkSes
 		agentCtxSeq = 0
 	}
 	openInput := agenttypes.OpenSessionInput{
-		SessionKey:     agentPoolSessionKey(created.Key, agentName),
+		SessionKey:     agentPoolSessionKey(created.Key, agentName, in.RootID),
 		AgentName:      agentName,
 		Model:          resolveForkModel(current, target),
 		Mode:           strings.TrimSpace(target.Mode),
@@ -897,7 +897,7 @@ func (s *Service) GetSessionContextWindow(ctx context.Context, in GetSessionCont
 	if agentName == "" {
 		return agenttypes.ContextWindow{}, nil
 	}
-	sess, ok := pool.Get(agentPoolSessionKey(in.Key, agentName))
+	sess, ok := pool.Get(agentPoolSessionKey(in.Key, agentName, in.RootID))
 	if !ok || sess == nil {
 		return agenttypes.ContextWindow{}, nil
 	}
@@ -1020,7 +1020,7 @@ func (s *Service) CloseSession(ctx context.Context, in CloseSessionInput) (*sess
 	}
 	if pool := s.Registry.GetAgentPool(); pool != nil && closed != nil {
 		for agentName := range closed.AgentCtxSeq {
-			pool.Close(agentPoolSessionKey(closed.Key, agentName))
+			pool.Close(agentPoolSessionKey(closed.Key, agentName, in.RootID))
 			notifyRuntimeState(in.RootID, closed.Key, agentName, "disconnected", "", "")
 		}
 	}
@@ -1300,13 +1300,17 @@ type activeTurnState struct {
 	session     agenttypes.Session
 }
 
-func getSessionSendLock(sessionKey string) *sync.Mutex {
+func getSessionSendLock(rootID, sessionKey string) *sync.Mutex {
+	key := strings.TrimSpace(rootID) + "::" + strings.TrimSpace(sessionKey)
+	if strings.TrimSpace(sessionKey) == "" {
+		key = strings.TrimSpace(rootID)
+	}
 	sessionSendLocksMu.Lock()
 	defer sessionSendLocksMu.Unlock()
-	lock := sessionSendLocks[sessionKey]
+	lock := sessionSendLocks[key]
 	if lock == nil {
 		lock = &sync.Mutex{}
-		sessionSendLocks[sessionKey] = lock
+		sessionSendLocks[key] = lock
 	}
 	return lock
 }
@@ -1388,10 +1392,18 @@ func IsActiveSessionTurnGeneration(rootID, sessionKey string, generation uint64)
 	return active != nil && active.generation == generation
 }
 
-func agentPoolSessionKey(sessionKey, agentName string) string {
+func agentPoolSessionKey(sessionKey, agentName string, rootID ...string) string {
 	trimmedSessionKey := strings.TrimSpace(sessionKey)
 	if trimmedSessionKey == "" {
 		return ""
+	}
+	root := ""
+	if len(rootID) > 0 {
+		root = strings.TrimSpace(rootID[0])
+	}
+	if root != "" {
+		// Isolate concurrent managed roots that may share session key material.
+		trimmedSessionKey = root + "::" + trimmedSessionKey
 	}
 	trimmedAgent := strings.TrimSpace(agentName)
 	if trimmedAgent == "" {
@@ -1453,7 +1465,7 @@ func sessionNameRunner(ctx context.Context, pool *agent.Pool, rootAbs string, in
 		return "", err
 	}
 
-	sessionKey := agentPoolSessionKey("name-"+in.SessionKey, agentName)
+	sessionKey := agentPoolSessionKey("name-"+in.SessionKey, agentName, in.RootID)
 	sess, err := pool.GetOrCreate(ctx, agenttypes.OpenSessionInput{
 		SessionKey: sessionKey,
 		AgentName:  agentName,
@@ -1684,7 +1696,7 @@ func isRecoverableTransportError(err error) bool {
 	return false
 }
 
-func cancelRuntimeAfterNonRecoverableError(sess agenttypes.Session, pool *agent.Pool, mindfsSessionKey, agentName string, cause error) {
+func cancelRuntimeAfterNonRecoverableError(sess agenttypes.Session, pool *agent.Pool, rootID, mindfsSessionKey, agentName string, cause error) {
 	agentName = strings.TrimSpace(agentName)
 	mindfsSessionKey = strings.TrimSpace(mindfsSessionKey)
 	if sess != nil {
@@ -1700,7 +1712,7 @@ func cancelRuntimeAfterNonRecoverableError(sess agenttypes.Session, pool *agent.
 		}
 	}
 	if pool != nil && mindfsSessionKey != "" && agentName != "" {
-		pool.Close(agentPoolSessionKey(mindfsSessionKey, agentName))
+		pool.Close(agentPoolSessionKey(mindfsSessionKey, agentName, rootID))
 		log.Printf("[session] runtime.pool_close_after_non_recoverable.done session=%s agent=%s cause=%v", mindfsSessionKey, agentName, cause)
 	}
 }
@@ -1916,7 +1928,7 @@ func (s *Service) ensureAgentSession(
 	binding *session.AgentBinding,
 	providerConfig *SessionProviderConfig,
 ) (agenttypes.Session, *int, error) {
-	poolSessionKey := agentPoolSessionKey(current.Key, agentName)
+	poolSessionKey := agentPoolSessionKey(current.Key, agentName, rootID)
 	mindfsKey := ""
 	if current != nil {
 		mindfsKey = strings.TrimSpace(current.Key)
@@ -2387,7 +2399,7 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 	if err := s.ensureRegistry(); err != nil {
 		return err
 	}
-	sendLock := getSessionSendLock(in.Key)
+	sendLock := getSessionSendLock(in.RootID, in.Key)
 	sendLock.Lock()
 	defer sendLock.Unlock()
 	turnCtx, turnCancel := context.WithCancel(ctx)
@@ -2654,7 +2666,7 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 	if sendErr != nil && !isCanceledTurnError(sendErr) {
 		if isNonRecoverableAgentError(sendErr) {
 			log.Printf("[session] turn.send.non_recoverable root=%s session=%s agent=%s action=fail_without_recovery err=%v", in.RootID, current.Key, in.Agent, sendErr)
-			cancelRuntimeAfterNonRecoverableError(sess, agentPool, current.Key, in.Agent, sendErr)
+			cancelRuntimeAfterNonRecoverableError(sess, agentPool, in.RootID, current.Key, in.Agent, sendErr)
 		} else if !sawAssistantChunk && !isRecoverableTransportError(sendErr) {
 			log.Printf("[session] turn.send.no_response root=%s session=%s agent=%s action=fail_without_recovery", in.RootID, current.Key, in.Agent)
 		} else {
@@ -2750,7 +2762,7 @@ func (s *Service) RunTransientSlashCommand(ctx context.Context, in RunTransientS
 	if key == "" {
 		key = fmt.Sprintf("transient-%s-%d", command, time.Now().UnixNano())
 	}
-	sendLock := getSessionSendLock(key)
+	sendLock := getSessionSendLock(in.RootID, key)
 	sendLock.Lock()
 	defer sendLock.Unlock()
 
@@ -3277,7 +3289,7 @@ func (s *Service) startSubagentSubscription(in subagentSessionInput, child *sess
 		registerActiveTurn(in.RootID, child.Key, cancel)
 		defer unregisterActiveTurn(in.RootID, child.Key)
 		runtime, err := in.Pool.GetOrCreate(ctx, agenttypes.OpenSessionInput{
-			SessionKey:     agentPoolSessionKey(child.Key, in.Agent),
+			SessionKey:     agentPoolSessionKey(child.Key, in.Agent, in.RootID),
 			AgentName:      in.Agent,
 			Model:          firstNonEmptyString(stringMeta(in.ToolCall.Meta, "model"), in.Model),
 			Mode:           in.Mode,
@@ -3747,7 +3759,7 @@ func (s *Service) recoverAgentTurn(ctx context.Context, in SendRecoveryInput) (a
 				_ = in.CurrentSession.Close()
 			}
 			if in.Pool != nil {
-				in.Pool.Close(agentPoolSessionKey(in.SessionKey, in.AgentName))
+				in.Pool.Close(agentPoolSessionKey(in.SessionKey, in.AgentName, in.RootID))
 			}
 			if in.Pool != nil && in.Manager != nil && in.Current != nil {
 				reopened, _, reopenErr := s.ensureAgentSession(ctx, in.Pool, in.Manager, in.Current, in.RootID, in.AgentName, in.Model, in.Mode, in.Effort, in.FastService, in.RootAbs, in.Binding, in.ProviderConfig)
