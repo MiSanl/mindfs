@@ -1084,13 +1084,15 @@ func (h *WSHandler) scheduleSessionCancelRecovery(rootID, key, requestID string,
 			log.Printf("[ws] session.queue.unfreeze root=%s session=%s reason=cancel_timeout", rootID, key)
 			streamHub.BroadcastSessionQueueUpdated(rootID, key, queue)
 		}
+		// If the turn is already gone, runSessionMessage will finish and drain the
+		// queue. Only clear a stuck replying flag here; do not startNext to avoid
+		// double-pop races with the normal finish path.
 		if usecase.IsActiveSessionTurnGeneration(rootID, key, generation) {
 			return
 		}
 		if streamHub.IsSessionReplying(key) {
 			h.AppContext.BroadcastSessionDone(rootID, key, requestID)
 		}
-		h.startNextQueuedSessionMessage(rootID, key)
 	})
 }
 

@@ -1880,7 +1880,7 @@ func TestRecoverAgentTurnStopsDuringRetryDelayWhenCanceled(t *testing.T) {
 func TestCancelRuntimeAfterNonRecoverableErrorClosesSession(t *testing.T) {
 	runtime := &fakeUsecaseAgentSession{id: "codex-thread"}
 
-	cancelRuntimeAfterNonRecoverableError(runtime, nil, "codex", errors.New("429 Too Many Requests"))
+	cancelRuntimeAfterNonRecoverableError(runtime, nil, "sess-1", "codex", errors.New("429 Too Many Requests"))
 
 	if runtime.cancelCalls != 1 {
 		t.Fatalf("cancel calls = %d, want 1", runtime.cancelCalls)

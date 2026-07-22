@@ -254,8 +254,21 @@ func cloneEnv(env map[string]string) map[string]string {
 
 // Close closes a session (not the underlying runtime pool).
 func (p *Pool) Close(sessionKey string) {
+	sessionKey = strings.TrimSpace(sessionKey)
+	if sessionKey == "" {
+		return
+	}
 	entries := p.takeSessions(func(entry *sessionEntry) bool {
-		return entry.sessionKey == sessionKey
+		if entry == nil {
+			return false
+		}
+		// Callers may pass either the pool key ("agent-mindfsKey") or the raw
+		// MindFS session key depending on protocol path.
+		if entry.sessionKey == sessionKey {
+			return true
+		}
+		agent := strings.ToLower(strings.TrimSpace(entry.agentName))
+		return agent != "" && entry.sessionKey == agent+"-"+sessionKey
 	})
 	if len(entries) == 0 {
 		return
@@ -263,7 +276,8 @@ func (p *Pool) Close(sessionKey string) {
 	p.closeSessions(entries)
 	for _, entry := range entries {
 		if entry.protocol == ProtocolACP {
-			p.acp.CloseSession(sessionKey)
+			// ACP maps use the pool/session key stored on the entry.
+			p.acp.CloseSession(entry.sessionKey)
 		}
 	}
 }

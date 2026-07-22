@@ -891,7 +891,18 @@ func (s *session) ContextWindow(_ context.Context) (types.ContextWindow, error) 
 	return s.contextWindow, nil
 }
 
-func (s *session) Close() error { return nil }
+func (s *session) Close() error {
+	if s == nil {
+		return nil
+	}
+	s.cancelPendingQuestions(errors.New("session closed"))
+	s.turn.Cancel()
+	s.mu.Lock()
+	s.thread = nil
+	s.onUpdate = nil
+	s.mu.Unlock()
+	return nil
+}
 
 func (s *session) updateThreadIDFromThread() {
 	if s == nil || s.thread == nil {

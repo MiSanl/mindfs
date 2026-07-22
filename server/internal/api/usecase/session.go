@@ -1684,21 +1684,25 @@ func isRecoverableTransportError(err error) bool {
 	return false
 }
 
-func cancelRuntimeAfterNonRecoverableError(sess agenttypes.Session, pool *agent.Pool, agentName string, cause error) {
+func cancelRuntimeAfterNonRecoverableError(sess agenttypes.Session, pool *agent.Pool, mindfsSessionKey, agentName string, cause error) {
 	agentName = strings.TrimSpace(agentName)
+	mindfsSessionKey = strings.TrimSpace(mindfsSessionKey)
 	if sess != nil {
 		if err := sess.CancelCurrentTurn(); err != nil {
 			log.Printf("[session] turn.cancel_after_non_recoverable.error agent=%s cause=%v err=%v", agentName, cause, err)
 		}
 	}
-	// Close only this runtime session. Killing the whole agent process would
-	// tear down every concurrent Claude/Codex session (including other providers).
+	// Close only this runtime session and drop its pool entry so the next turn
+	// cannot reuse a dead handle. Do not kill the whole agent process.
 	if sess != nil {
 		if err := sess.Close(); err != nil {
 			log.Printf("[session] runtime.close_after_non_recoverable.error agent=%s cause=%v err=%v", agentName, cause, err)
 		}
 	}
-	_ = pool
+	if pool != nil && mindfsSessionKey != "" && agentName != "" {
+		pool.Close(agentPoolSessionKey(mindfsSessionKey, agentName))
+		log.Printf("[session] runtime.pool_close_after_non_recoverable.done session=%s agent=%s cause=%v", mindfsSessionKey, agentName, cause)
+	}
 }
 
 func contextLineCount(exchanges []session.Exchange) int {
@@ -2650,7 +2654,7 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 	if sendErr != nil && !isCanceledTurnError(sendErr) {
 		if isNonRecoverableAgentError(sendErr) {
 			log.Printf("[session] turn.send.non_recoverable root=%s session=%s agent=%s action=fail_without_recovery err=%v", in.RootID, current.Key, in.Agent, sendErr)
-			cancelRuntimeAfterNonRecoverableError(sess, agentPool, in.Agent, sendErr)
+			cancelRuntimeAfterNonRecoverableError(sess, agentPool, current.Key, in.Agent, sendErr)
 		} else if !sawAssistantChunk && !isRecoverableTransportError(sendErr) {
 			log.Printf("[session] turn.send.no_response root=%s session=%s agent=%s action=fail_without_recovery", in.RootID, current.Key, in.Agent)
 		} else {
