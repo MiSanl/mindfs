@@ -2438,7 +2438,7 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 	isInitial := len(current.Exchanges) == 0
 	agentPool := s.Registry.GetAgentPool()
 	if agentPool == nil {
-		return nil
+		return errors.New("agent pool not configured")
 	}
 	watcher, _ := s.Registry.GetFileWatcher(in.RootID, manager)
 	if watcher != nil {
@@ -2669,6 +2669,9 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 				FastService:        in.FastService,
 				PlanMode:           planMode,
 				RootAbs:            rootAbs,
+				Pool:               agentPool,
+				Binding:            binding,
+				ProviderConfig:     providerConfig,
 				CurrentSession:     sess,
 				Prompt:             prompt,
 				SawAssistantChunk:  sawAssistantChunk,
@@ -3696,6 +3699,9 @@ type SendRecoveryInput struct {
 	FastService        string
 	PlanMode           bool
 	RootAbs            string
+	Pool               *agent.Pool
+	Binding            *session.AgentBinding
+	ProviderConfig     *SessionProviderConfig
 	CurrentSession     agenttypes.Session
 	Prompt             string
 	SawAssistantChunk  bool
@@ -3728,10 +3734,25 @@ func (s *Service) recoverAgentTurn(ctx context.Context, in SendRecoveryInput) (a
 			if err := waitForRecoveryDelay(ctx, sessionRecoveryDelay); err != nil {
 				return nil, err
 			}
-			// Close the dead handle before retrying. Without this, retries keep writing
-			// into a broken stream and never recover from peer disconnects.
+			// Close the dead handle, drop the pool entry, and reopen with the same
+			// provider binding before retrying. Resending on a broken stream never
+			// recovers peer disconnects.
 			if in.CurrentSession != nil {
 				_ = in.CurrentSession.Close()
+			}
+			if in.Pool != nil {
+				in.Pool.Close(agentPoolSessionKey(in.SessionKey, in.AgentName))
+			}
+			if in.Pool != nil && in.Manager != nil && in.Current != nil {
+				reopened, _, reopenErr := s.ensureAgentSession(ctx, in.Pool, in.Manager, in.Current, in.RootID, in.AgentName, in.Model, in.Mode, in.Effort, in.FastService, in.RootAbs, in.Binding, in.ProviderConfig)
+				if reopenErr != nil {
+					lastErr = reopenErr
+					log.Printf("[session/recovery] reopen.failed root=%s session=%s agent=%s attempt=%d/%d err=%v", in.RootID, in.SessionKey, in.AgentName, attempt, sessionRecoveryAttempts, reopenErr)
+					continue
+				}
+				in.CurrentSession = reopened
+				setActiveTurnSession(in.RootID, in.SessionKey, reopened)
+				log.Printf("[session/recovery] reopen.done root=%s session=%s agent=%s attempt=%d/%d", in.RootID, in.SessionKey, in.AgentName, attempt, sessionRecoveryAttempts)
 			}
 		}
 
