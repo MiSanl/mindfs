@@ -547,6 +547,139 @@ func (s *Service) ForkSession(ctx context.Context, in ForkSessionInput) (ForkSes
 	return ForkSessionOutput{Session: out}, nil
 }
 
+
+type MigrateSessionProviderInput struct {
+	RootID     string
+	Key        string
+	Agent      string
+	ProviderID string
+	Model      string
+}
+
+type MigrateSessionProviderOutput struct {
+	Session *session.Session
+}
+
+// MigrateSessionProvider creates a child MindFS session that copies visible history
+// and binds a new API provider. The child starts a fresh native agent session so a
+// changed/deleted provider endpoint does not silently reuse the old runtime.
+func (s *Service) MigrateSessionProvider(ctx context.Context, in MigrateSessionProviderInput) (MigrateSessionProviderOutput, error) {
+	if err := s.ensureRegistry(); err != nil {
+		return MigrateSessionProviderOutput{}, err
+	}
+	key := strings.TrimSpace(in.Key)
+	providerID := strings.TrimSpace(in.ProviderID)
+	if key == "" {
+		return MigrateSessionProviderOutput{}, errors.New("session key required")
+	}
+	if providerID == "" {
+		return MigrateSessionProviderOutput{}, errors.New("provider_id required")
+	}
+	manager, err := s.Registry.GetSessionManager(in.RootID)
+	if err != nil {
+		return MigrateSessionProviderOutput{}, err
+	}
+	current, err := manager.Get(ctx, key, 0)
+	if err != nil {
+		return MigrateSessionProviderOutput{}, err
+	}
+	agentName := strings.TrimSpace(in.Agent)
+	if agentName == "" {
+		agentName = strings.TrimSpace(session.InferAgentFromSession(current))
+	}
+	if agentName == "" {
+		return MigrateSessionProviderOutput{}, errors.New("agent required")
+	}
+	if !sessionProviderIsolationAgent(agentName) {
+		return MigrateSessionProviderOutput{}, errors.New("agent does not support session provider migration")
+	}
+	if SessionProviderResolver == nil {
+		return MigrateSessionProviderOutput{}, errors.New("session_provider_unavailable: provider resolver is unavailable")
+	}
+	providerConfig, err := SessionProviderResolver(agentName, providerID)
+	if err != nil {
+		return MigrateSessionProviderOutput{}, err
+	}
+	if providerConfig == nil || strings.TrimSpace(providerConfig.ID) == "" {
+		return MigrateSessionProviderOutput{}, errors.New("session_provider_unavailable: provider is unavailable")
+	}
+	model := strings.TrimSpace(in.Model)
+	if model == "" {
+		model = strings.TrimSpace(current.Model)
+	}
+	if model == "" {
+		for i := len(current.Exchanges) - 1; i >= 0; i-- {
+			if m := strings.TrimSpace(current.Exchanges[i].Model); m != "" {
+				model = m
+				break
+			}
+		}
+	}
+	if err := s.validateAgentModelForProvider(agentName, model, providerConfig); err != nil {
+		return MigrateSessionProviderOutput{}, err
+	}
+	maxSeq := 0
+	for _, exchange := range current.Exchanges {
+		if exchange.Seq > maxSeq {
+			maxSeq = exchange.Seq
+		}
+	}
+	sourceJSON, err := json.Marshal(map[string]any{
+		"type":        "provider_migrate",
+		"session_key": current.Key,
+		"agent":       agentName,
+		"provider_id": providerConfig.ID,
+		"seq":         maxSeq,
+	})
+	if err != nil {
+		return MigrateSessionProviderOutput{}, err
+	}
+	created, err := manager.Create(ctx, session.CreateInput{
+		Type:             session.TypeChat,
+		ParentSessionKey: current.Key,
+		Source:           string(sourceJSON),
+		Agent:            agentName,
+		Model:            model,
+		Name:             buildMigrateSessionName(current, providerConfig.ID),
+		PlanMode:         current.PlanMode,
+	})
+	if err != nil {
+		return MigrateSessionProviderOutput{}, err
+	}
+	if maxSeq > 0 {
+		if _, err := copyForkHistory(ctx, manager, current, created, maxSeq, agentName); err != nil {
+			_ = manager.Delete(ctx, created.Key)
+			return MigrateSessionProviderOutput{}, err
+		}
+	}
+	// Bind the target provider on the child only. Parent binding stays intact.
+	if _, _, err := s.resolveSessionProvider(ctx, manager, created, agentName, providerConfig.ID, true); err != nil {
+		_ = manager.Delete(ctx, created.Key)
+		return MigrateSessionProviderOutput{}, err
+	}
+	out, err := manager.Get(ctx, created.Key, 0)
+	if err != nil {
+		_ = manager.Delete(ctx, created.Key)
+		return MigrateSessionProviderOutput{}, err
+	}
+	log.Printf("[session/provider] migrate.done root=%s parent=%s child=%s agent=%s provider_id=%s model=%q exchanges=%d",
+		strings.TrimSpace(in.RootID), current.Key, out.Key, agentName, providerConfig.ID, model, len(out.Exchanges))
+	return MigrateSessionProviderOutput{Session: out}, nil
+}
+
+func buildMigrateSessionName(current *session.Session, providerID string) string {
+	base := "Migrated"
+	if current != nil && strings.TrimSpace(current.Name) != "" {
+		base = strings.TrimSpace(current.Name)
+	}
+	name := fmt.Sprintf("%s@%s", base, strings.TrimSpace(providerID))
+	runes := []rune(name)
+	if len(runes) > 80 {
+		name = string(runes[:80])
+	}
+	return name
+}
+
 func isACPAgent(pool *agent.Pool, agentName string) bool {
 	if pool == nil {
 		return false

@@ -309,6 +309,7 @@ func (h *HTTPHandler) Routes() http.Handler {
 	r.Post("/api/sessions/import", h.protectedEndpoint(h.handleExternalSessionImport))
 	r.Post("/api/sessions/import/batch", h.protectedEndpoint(h.handleExternalSessionImportBatch))
 	r.Post("/api/sessions/fork", h.protectedEndpoint(h.handleSessionFork))
+	r.Post("/api/sessions/{key}/migrate-provider", h.protectedEndpoint(h.handleSessionMigrateProvider))
 	r.Get("/api/sessions/{key}/toolcalls/{callID}", h.protectedEndpoint(h.handleSessionToolCallGet))
 	r.Post("/api/sessions/{key}/sync", h.protectedEndpoint(h.handleSessionSync))
 	r.Get("/api/sessions/{key}", h.protectedEndpoint(h.handleSessionGet))
@@ -1076,6 +1077,45 @@ func (h *HTTPHandler) handleSessionFork(w http.ResponseWriter, r *http.Request) 
 		"session":     h.sessionResponse(out.Session, nil, agenttypes.ContextWindow{}, nil),
 	})
 }
+
+func (h *HTTPHandler) handleSessionMigrateProvider(w http.ResponseWriter, r *http.Request) {
+	rootID := r.URL.Query().Get("root")
+	key := chi.URLParam(r, "key")
+	var req struct {
+		Agent      string `json:"agent"`
+		ProviderID string `json:"provider_id"`
+		Model      string `json:"model"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, errInvalidRequest("invalid json body"))
+		return
+	}
+	if strings.TrimSpace(req.ProviderID) == "" {
+		respondError(w, http.StatusBadRequest, errInvalidRequest("provider_id required"))
+		return
+	}
+	out, err := h.service().MigrateSessionProvider(r.Context(), usecase.MigrateSessionProviderInput{
+		RootID:     rootID,
+		Key:        key,
+		Agent:      req.Agent,
+		ProviderID: req.ProviderID,
+		Model:      req.Model,
+	})
+	if err != nil {
+		msg := err.Error()
+		status := http.StatusBadRequest
+		if strings.Contains(msg, "not found") || strings.Contains(msg, "session_provider_unavailable") {
+			status = http.StatusNotFound
+		}
+		respondError(w, status, err)
+		return
+	}
+	if h.AppContext != nil && out.Session != nil {
+		h.AppContext.BroadcastSessionMetaUpdated(rootID, out.Session)
+	}
+	respondJSON(w, http.StatusOK, h.sessionResponseWithBindings(r.Context(), rootID, out.Session.Key, out.Session, nil, agenttypes.ContextWindow{}, nil))
+}
+
 
 func (h *HTTPHandler) handleSessionRename(w http.ResponseWriter, r *http.Request) {
 	rootID := r.URL.Query().Get("root")
