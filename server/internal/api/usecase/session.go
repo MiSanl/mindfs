@@ -1994,8 +1994,15 @@ func (s *Service) resolveSessionProvider(ctx context.Context, manager *session.M
 		if config == nil || config.ID != binding.ProviderID {
 			return nil, nil, errors.New("session_provider_unavailable: bound provider is unavailable")
 		}
-		if binding.AgentSessionID != "" && binding.ProviderEndpointRevision != "" && binding.ProviderEndpointRevision != config.EndpointRevision {
-			return nil, nil, errors.New("session_provider_changed: bound provider endpoint or protocol changed; migrate the session to continue")
+		if strings.TrimSpace(binding.AgentSessionID) != "" {
+			// Endpoint/protocol identity is sticky once a native agent session exists.
+			// Empty historical endpoint revision still blocks when the live config has a
+			// non-empty revision (treat as changed rather than silently rebinding).
+			boundEndpoint := strings.TrimSpace(binding.ProviderEndpointRevision)
+			liveEndpoint := strings.TrimSpace(config.EndpointRevision)
+			if liveEndpoint != "" && boundEndpoint != liveEndpoint {
+				return nil, nil, errors.New("session_provider_changed: bound provider endpoint or protocol changed; migrate the session to continue")
+			}
 		}
 		if binding.ProviderRevision != config.Revision || binding.ProviderProtocol != config.Protocol || binding.ProviderState != "available" {
 			if err := manager.UpdateBoundProvider(ctx, session.AgentBinding{

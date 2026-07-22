@@ -5261,11 +5261,41 @@ export function App({ onGoHome }: AppProps) {
           bumpCacheVersion();
         }
       };
+      const refreshSessionErrors = () => {
+        void sessionService.getSessionErrors(targetRoot, key).then((serverErrors) => {
+          if (!Array.isArray(serverErrors)) return;
+          const existing = sessionCacheRef.current[cacheKey];
+          if (existing && typeof existing === "object") {
+            sessionCacheRef.current[cacheKey] = {
+              ...(existing as any),
+              errors: serverErrors,
+            } as any;
+          }
+          setSelectedSession((prev) => {
+            const prevKey = prev?.key || prev?.session_key;
+            const prevRoot =
+              (prev?.root_id as string | undefined) || currentRootIdRef.current;
+            if (!prev || prevKey !== key || prevRoot !== targetRoot) return prev;
+            return { ...(prev as any), errors: serverErrors } as SessionItem;
+          });
+          if ((boundSessionByRootRef.current[targetRoot] || null) === key) {
+            const drawer = drawerSessionByRootRef.current[targetRoot];
+            if (drawer && (drawer.key === key || (drawer as any).session_key === key)) {
+              setDrawerSessionForRoot(targetRoot, {
+                ...(drawer as any),
+                errors: serverErrors,
+              } as Session);
+            }
+          }
+          bumpCacheVersion();
+        });
+      };
       const cached = sessionCacheRef.current[cacheKey];
       if (cached) {
         applySession(cached);
         if (!shouldSyncHistory && hasSessionExchanges(cached)) {
           loadedSessionRef.current[cacheKey] = true;
+          refreshSessionErrors();
           return;
         }
       } else {
@@ -5274,11 +5304,13 @@ export function App({ onGoHome }: AppProps) {
           applySession(persisted);
           if (!shouldSyncHistory && hasSessionExchanges(persisted)) {
             loadedSessionRef.current[cacheKey] = true;
+            refreshSessionErrors();
             return;
           }
         }
       }
       if (!shouldSyncHistory && loadedSessionRef.current[cacheKey]) {
+        refreshSessionErrors();
         return;
       }
       try {
