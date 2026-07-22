@@ -761,6 +761,12 @@ func (h *HTTPHandler) handleSessionErrorsGet(w http.ResponseWriter, r *http.Requ
 		respondError(w, http.StatusNotFound, err)
 		return
 	}
+	// Require the session to exist so callers do not confuse empty logs with
+	// "no such session" (ListSessionErrors returns [] for missing files).
+	if _, err := manager.Get(r.Context(), key, 0); err != nil {
+		respondError(w, http.StatusNotFound, err)
+		return
+	}
 	errorsList, err := manager.ListSessionErrors(r.Context(), key)
 	if err != nil {
 		respondError(w, http.StatusInternalServerError, err)
