@@ -312,6 +312,7 @@ func (h *HTTPHandler) Routes() http.Handler {
 	r.Get("/api/sessions/{key}/toolcalls/{callID}", h.protectedEndpoint(h.handleSessionToolCallGet))
 	r.Post("/api/sessions/{key}/sync", h.protectedEndpoint(h.handleSessionSync))
 	r.Get("/api/sessions/{key}", h.protectedEndpoint(h.handleSessionGet))
+	r.Get("/api/sessions/{key}/errors", h.protectedEndpoint(h.handleSessionErrorsGet))
 	r.Get("/api/sessions/{key}/related-files", h.protectedEndpoint(h.handleSessionRelatedFilesGet))
 	r.Post("/api/sessions/{key}/rename", h.protectedEndpoint(h.handleSessionRename))
 	r.Delete("/api/sessions/{key}/related-files", h.protectedEndpoint(h.handleSessionRelatedFilesDelete))
@@ -743,6 +744,37 @@ func (h *HTTPHandler) handleExternalSessionImportBatch(w http.ResponseWriter, r 
 	respondJSON(w, http.StatusOK, out)
 }
 
+
+func (h *HTTPHandler) handleSessionErrorsGet(w http.ResponseWriter, r *http.Request) {
+	rootID := r.URL.Query().Get("root")
+	key := chi.URLParam(r, "key")
+	if strings.TrimSpace(key) == "" {
+		respondError(w, http.StatusBadRequest, errInvalidRequest("session key required"))
+		return
+	}
+	if h.AppContext == nil {
+		respondError(w, http.StatusServiceUnavailable, errors.New("app context unavailable"))
+		return
+	}
+	manager, err := h.AppContext.GetSessionManager(rootID)
+	if err != nil {
+		respondError(w, http.StatusNotFound, err)
+		return
+	}
+	errorsList, err := manager.ListSessionErrors(r.Context(), key)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if errorsList == nil {
+		errorsList = []session.SessionError{}
+	}
+	respondJSON(w, http.StatusOK, map[string]any{
+		"session_key": key,
+		"errors":      errorsList,
+	})
+}
+
 func (h *HTTPHandler) handleSessionGet(w http.ResponseWriter, r *http.Request) {
 	rootID := r.URL.Query().Get("root")
 	key := chi.URLParam(r, "key")
@@ -833,6 +865,13 @@ func (h *HTTPHandler) handleSessionSync(w http.ResponseWriter, r *http.Request) 
 
 func (h *HTTPHandler) sessionResponseWithBindings(ctx context.Context, rootID, key string, s *session.Session, pendingUser *session.Exchange, contextWindow agenttypes.ContextWindow, exchangeAux map[int][]session.ExchangeAux) map[string]any {
 	response := h.sessionResponse(s, pendingUser, contextWindow, exchangeAux)
+	if h != nil && h.AppContext != nil {
+		if manager, err := h.AppContext.GetSessionManager(rootID); err == nil && manager != nil {
+			if errors, listErr := manager.ListSessionErrors(ctx, key); listErr == nil {
+				response["errors"] = errors
+			}
+		}
+	}
 	if h == nil || h.AppContext == nil {
 		return response
 	}
@@ -844,13 +883,64 @@ func (h *HTTPHandler) sessionResponseWithBindings(ctx context.Context, rootID, k
 	if err != nil {
 		return response
 	}
-	public := make([]map[string]string, 0, len(bindings))
+	public := make([]map[string]any, 0, len(bindings))
 	for _, binding := range bindings {
-		if strings.TrimSpace(binding.AgentSessionID) != "" {
-			public = append(public, map[string]string{"agent": binding.Agent, "agent_session_id": binding.AgentSessionID})
+		item := map[string]any{
+			"agent": binding.Agent,
+		}
+		if sid := strings.TrimSpace(binding.AgentSessionID); sid != "" {
+			item["agent_session_id"] = sid
+		}
+		// Non-secret provider binding fields for UI (no keys/base URLs).
+		if pid := strings.TrimSpace(binding.ProviderID); pid != "" {
+			item["provider_id"] = pid
+		}
+		if rev := strings.TrimSpace(binding.ProviderRevision); rev != "" {
+			item["provider_revision"] = rev
+		}
+		if proto := strings.TrimSpace(binding.ProviderProtocol); proto != "" {
+			item["provider_protocol"] = proto
+		}
+		if state := strings.TrimSpace(binding.ProviderState); state != "" {
+			item["provider_state"] = state
+		}
+		// Keep legacy rows that only have an agent session id, and new
+		// provider-bound rows even before a native session exists.
+		if len(item) > 1 {
+			public = append(public, item)
 		}
 	}
 	response["agent_bindings"] = public
+	if pool := h.AppContext.GetAgentPool(); pool != nil {
+		runtimes := pool.ListRuntimeInfoForMindFSSession(key)
+		if len(runtimes) > 0 {
+			items := make([]map[string]any, 0, len(runtimes))
+			for _, rt := range runtimes {
+				item := map[string]any{
+					"agent": rt.AgentName,
+					"state": "connected",
+				}
+				if strings.TrimSpace(rt.AgentSession) != "" {
+					item["agent_session_id"] = rt.AgentSession
+				}
+				items = append(items, item)
+			}
+			response["runtimes"] = items
+			// Prefer the session display agent when present among live runtimes.
+			preferred := ""
+			if s != nil {
+				preferred = strings.TrimSpace(session.InferAgentFromSession(s))
+			}
+			active := items[0]
+			for _, item := range items {
+				if preferred != "" && strings.EqualFold(strings.TrimSpace(fmt.Sprint(item["agent"])), preferred) {
+					active = item
+					break
+				}
+			}
+			response["runtime"] = active
+		}
+	}
 	return response
 }
 

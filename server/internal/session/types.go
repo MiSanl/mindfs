@@ -57,6 +57,23 @@ type ExchangeAux struct {
 	Compact   *agenttypes.CompactNotice `json:"compact,omitempty"`
 }
 
+// SessionError is a durable per-session failure for UI replay.
+// AfterMessageID / AfterSeq identify the last user-visible message before the error.
+type SessionError struct {
+	ID             string    `json:"id"`
+	SessionKey     string    `json:"session_key"`
+	RequestID      string    `json:"request_id,omitempty"`
+	AfterMessageID string    `json:"after_message_id,omitempty"`
+	AfterSeq       int       `json:"after_seq,omitempty"`
+	Agent          string    `json:"agent,omitempty"`
+	Model          string    `json:"model,omitempty"`
+	Code           string    `json:"code,omitempty"`
+	Kind           string    `json:"kind,omitempty"`
+	Message        string    `json:"message"`
+	Recoverable    bool      `json:"recoverable,omitempty"`
+	Timestamp      time.Time `json:"timestamp"`
+}
+
 func CompactExchangeAux(aux ExchangeAux) (ExchangeAux, bool) {
 	if aux.ToolCall == nil {
 		if aux.Todo != nil || aux.Plan != nil || aux.Compact != nil {

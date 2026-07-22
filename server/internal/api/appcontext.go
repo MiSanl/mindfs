@@ -1,6 +1,7 @@
 package api
 
 import (
+	"fmt"
 	"context"
 	"errors"
 	"log"
@@ -702,6 +703,55 @@ func (s *AppContext) BroadcastSessionMetaUpdated(rootID string, sess *session.Se
 	})
 }
 
+
+// WireRuntimeStateNotifier connects usecase runtime open/close events to WS clients.
+func WireRuntimeStateNotifier(app *AppContext) {
+	usecase.RuntimeStateNotifier = func(rootID, sessionKey, agentName, state, agentSessionID, message string) {
+		if app == nil {
+			return
+		}
+		app.BroadcastSessionRuntimeChanged(rootID, sessionKey, agentName, state, agentSessionID, message)
+	}
+}
+
+func (s *AppContext) BroadcastSessionRuntimeChanged(rootID, sessionKey, agentName, state, agentSessionID, message string) {
+	if s == nil {
+		return
+	}
+	rootID = strings.TrimSpace(rootID)
+	sessionKey = strings.TrimSpace(sessionKey)
+	agentName = strings.TrimSpace(agentName)
+	state = strings.TrimSpace(state)
+	if rootID == "" || sessionKey == "" || agentName == "" || state == "" {
+		return
+	}
+	payload := map[string]any{
+		"root_id":     rootID,
+		"session_key": sessionKey,
+		"agent":       agentName,
+		"state":       state,
+	}
+	if sid := strings.TrimSpace(agentSessionID); sid != "" {
+		payload["agent_session_id"] = sid
+	}
+	if msg := strings.TrimSpace(message); msg != "" {
+		payload["message"] = msg
+	}
+	hub := s.GetSessionStreamHub()
+	resp := WSResponse{
+		Type:    "session.runtime.changed",
+		Payload: payload,
+	}
+	clientIDs := hub.GetSessionClientIDs(sessionKey, false)
+	if len(clientIDs) == 0 {
+		hub.BroadcastAll(resp)
+		return
+	}
+	for _, clientID := range clientIDs {
+		hub.SendToClient(clientID, resp)
+	}
+}
+
 func (s *AppContext) BroadcastAgentStatusChanged(agentName string) {
 	agentName = strings.TrimSpace(agentName)
 	if s == nil || agentName == "" || s.GetProber() == nil {
@@ -780,6 +830,8 @@ func (s *AppContext) BroadcastSessionErrorWithRequest(rootID, sessionKey, reques
 	}
 	normalized := normalizeAgentErrorMessage(errors.New(trimmed))
 	s.UpdateTaskSessionErrorForSession(rootID, sessionKey, normalized)
+	recoverable := isRecoverableTransportErrorText(normalized)
+	s.persistSessionError(rootID, sessionKey, requestID, "session.message_failed", "turn", normalized, recoverable)
 	hub := s.GetSessionStreamHub()
 	// Still append to reply event log so reconnect/replay can surface the failure.
 	hub.AppendReplyEvent(sessionKey, StreamEvent{
@@ -792,6 +844,7 @@ func (s *AppContext) BroadcastSessionErrorWithRequest(rootID, sessionKey, reques
 		"root_id":     rootID,
 		"session_key": sessionKey,
 		"message":     normalized,
+		"recoverable": recoverable,
 		// Mirror stream error shape so SessionViewer/timeline can read it if needed.
 		"event": map[string]any{
 			"type": "error",
@@ -819,6 +872,86 @@ func (s *AppContext) BroadcastSessionErrorWithRequest(rootID, sessionKey, reques
 	}
 	for _, clientID := range clientIDs {
 		hub.SendToClient(clientID, resp)
+	}
+}
+
+
+func isRecoverableTransportErrorText(message string) bool {
+	value := strings.ToLower(strings.TrimSpace(message))
+	for _, needle := range []string{
+		"peer disconnected",
+		"stream disconnected",
+		"upstream connection error",
+		"connection closed",
+		"connection reset",
+		"broken pipe",
+		"unexpected eof",
+		"websocket: close",
+		"504",
+		"gateway time-out",
+		"gateway timeout",
+	} {
+		if strings.Contains(value, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *AppContext) persistSessionError(rootID, sessionKey, requestID, code, kind, message string, recoverable bool) {
+	if s == nil {
+		return
+	}
+	rootID = strings.TrimSpace(rootID)
+	sessionKey = strings.TrimSpace(sessionKey)
+	if rootID == "" || sessionKey == "" || strings.TrimSpace(message) == "" {
+		return
+	}
+	manager, err := s.GetSessionManager(rootID)
+	if err != nil || manager == nil {
+		log.Printf("[session/error] persist.skip root=%s session=%s err=%v", rootID, sessionKey, err)
+		return
+	}
+	afterSeq := 0
+	agentName := ""
+	model := ""
+	if current, getErr := manager.Get(context.Background(), sessionKey, 0); getErr == nil && current != nil {
+		afterSeq = len(current.Exchanges)
+		for i := len(current.Exchanges) - 1; i >= 0; i-- {
+			ex := current.Exchanges[i]
+			if strings.EqualFold(strings.TrimSpace(ex.Role), "user") && ex.Seq > 0 {
+				afterSeq = ex.Seq
+				break
+			}
+		}
+		agentName = session.InferAgentFromSession(current)
+		model = strings.TrimSpace(current.Model)
+		if model == "" && len(current.Exchanges) > 0 {
+			for i := len(current.Exchanges) - 1; i >= 0; i-- {
+				if m := strings.TrimSpace(current.Exchanges[i].Model); m != "" {
+					model = m
+					break
+				}
+			}
+		}
+	}
+	afterMessageID := strings.TrimSpace(requestID)
+	if afterMessageID == "" && afterSeq > 0 {
+		afterMessageID = fmt.Sprintf("seq-%d", afterSeq)
+	}
+	entry := session.SessionError{
+		RequestID:      strings.TrimSpace(requestID),
+		AfterMessageID: afterMessageID,
+		AfterSeq:       afterSeq,
+		Agent:          agentName,
+		Model:          model,
+		Code:           strings.TrimSpace(code),
+		Kind:           strings.TrimSpace(kind),
+		Message:        strings.TrimSpace(message),
+		Recoverable:    recoverable,
+	}
+	if err := manager.AppendSessionError(context.Background(), sessionKey, entry); err != nil {
+		log.Printf("[session/error] persist.error root=%s session=%s err=%v", rootID, sessionKey, err)
 	}
 }
 

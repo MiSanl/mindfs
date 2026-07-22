@@ -127,6 +127,7 @@ func Start(ctx context.Context, addr string, opts StartOptions) error {
 		WebPush: webpush.NewService(webPushConfig, webPushStore),
 		Notify:  notifyscript.NewService(notifyscript.Config{Script: opts.NotifyScript}),
 	}
+	api.WireRuntimeStateNotifier(services)
 	services.Scheduled = scheduled.NewService(services, services)
 	services.Scheduled.Start(ctx)
 	taskTemplates, err := kanban.NewTemplateStore()

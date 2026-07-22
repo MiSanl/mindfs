@@ -176,14 +176,16 @@ func sessionProviderEndpointRevision(provider agentAPIProvider, protocol string)
 func sessionProviderRuntimeEnv(agentName string, provider agentAPIProvider) map[string]string {
 	switch normalizedAPIProviderAgent(agentName) {
 	case "claude":
+		// Claude CLI appends /v1/messages; strip a trailing /v1 so dual-protocol
+		// OpenAI-style roots (https://host/v1) do not become /v1/v1/messages.
 		return map[string]string{
-			"ANTHROPIC_BASE_URL":   provider.BaseURL,
+			"ANTHROPIC_BASE_URL":   anthropicBaseURL(provider.BaseURL),
 			"ANTHROPIC_API_KEY":    provider.APIKey,
 			"ANTHROPIC_AUTH_TOKEN": provider.APIKey,
 		}
 	case "codex":
 		return map[string]string{
-			"OPENAI_BASE_URL": provider.BaseURL,
+			"OPENAI_BASE_URL": openAIModelsBaseURL(provider.BaseURL),
 			"OPENAI_API_KEY":  provider.APIKey,
 		}
 	default:

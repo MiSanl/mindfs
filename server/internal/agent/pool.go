@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -33,6 +34,16 @@ type sessionEntry struct {
 	protocol   Protocol
 	runtimeKey string
 	session    agenttypes.Session
+}
+
+// RuntimeSessionInfo is a lightweight view of a live pool session.
+type RuntimeSessionInfo struct {
+	PoolKey      string
+	AgentName    string
+	SessionKey   string
+	RuntimeKey   string
+	Protocol     Protocol
+	AgentSession string
 }
 
 // NewPool creates a new agent pool.
@@ -336,6 +347,58 @@ func (p *Pool) Get(sessionKey string) (agenttypes.Session, bool) {
 		return nil, false
 	}
 	return entry.session, true
+}
+
+// GetRuntimeInfo returns metadata for a live pool session if present.
+func (p *Pool) GetRuntimeInfo(sessionKey string) (RuntimeSessionInfo, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	entry, ok := p.sessions[sessionKey]
+	if !ok || entry == nil || entry.session == nil {
+		return RuntimeSessionInfo{}, false
+	}
+	info := RuntimeSessionInfo{
+		PoolKey:    sessionKey,
+		AgentName:  entry.agentName,
+		SessionKey: entry.sessionKey,
+		RuntimeKey: entry.runtimeKey,
+		Protocol:   entry.protocol,
+	}
+	if sid := strings.TrimSpace(entry.session.SessionID()); sid != "" {
+		info.AgentSession = sid
+	}
+	return info, true
+}
+
+// ListRuntimeInfoForMindFSSession returns live runtimes for a MindFS session key.
+func (p *Pool) ListRuntimeInfoForMindFSSession(mindfsSessionKey string) []RuntimeSessionInfo {
+	mindfsSessionKey = strings.TrimSpace(mindfsSessionKey)
+	if mindfsSessionKey == "" {
+		return nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]RuntimeSessionInfo, 0)
+	for poolKey, entry := range p.sessions {
+		if entry == nil || entry.session == nil {
+			continue
+		}
+		if poolKey != mindfsSessionKey && !strings.HasSuffix(poolKey, "-"+mindfsSessionKey) {
+			continue
+		}
+		info := RuntimeSessionInfo{
+			PoolKey:    poolKey,
+			AgentName:  entry.agentName,
+			SessionKey: mindfsSessionKey,
+			RuntimeKey: entry.runtimeKey,
+			Protocol:   entry.protocol,
+		}
+		if sid := strings.TrimSpace(entry.session.SessionID()); sid != "" {
+			info.AgentSession = sid
+		}
+		out = append(out, info)
+	}
+	return out
 }
 
 func (p *Pool) RuntimeKey(sessionKey string) string {

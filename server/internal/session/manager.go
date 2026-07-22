@@ -31,7 +31,11 @@ const (
 	sessionDBLinkExt = ".link"
 	exchangeFileTpl  = "sessions/%s.jsonl"
 	auxFileTpl       = "sessions/%s.aux.jsonl"
+	errorFileTpl     = "sessions/errors/%s.jsonl"
 	pendingFileTpl   = "sessions/pending/%s.json"
+	// maxSessionErrorsKept caps durable per-session error logs returned to the UI
+	// and rewritten on disk after append, so GET session stays bounded.
+	maxSessionErrorsKept = 100
 	selectSessionSQL = `
 	SELECT key, type, parent_session_key, parent_tool_call_id, source, task_id, model, shell, plan_mode, name, related_files_json, related_worktree_json, created_at, updated_at, closed_at
 	FROM sessions`
@@ -337,6 +341,121 @@ func (m *Manager) ReleasePendingTurn(_ context.Context, sessionKey string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.activePending, sessionKey)
+}
+
+// AppendSessionError appends a durable error record under sessions/errors/<key>.jsonl.
+// The on-disk log is trimmed to the newest maxSessionErrorsKept entries.
+func (m *Manager) AppendSessionError(_ context.Context, sessionKey string, entry SessionError) error {
+	sessionKey = strings.TrimSpace(sessionKey)
+	if sessionKey == "" {
+		return errors.New("session key required")
+	}
+	if strings.TrimSpace(entry.Message) == "" {
+		return errors.New("error message required")
+	}
+	if strings.TrimSpace(entry.ID) == "" {
+		entry.ID = "err-" + randomHex(8)
+	}
+	entry.SessionKey = sessionKey
+	if entry.Timestamp.IsZero() {
+		entry.Timestamp = m.now().UTC()
+	} else {
+		entry.Timestamp = entry.Timestamp.UTC()
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	path, err := m.errorPath(sessionKey)
+	if err != nil {
+		return err
+	}
+	existing, err := m.readSessionErrorsUnsafe(path)
+	if err != nil {
+		return err
+	}
+	items := append(existing, entry)
+	if len(items) > maxSessionErrorsKept {
+		items = items[len(items)-maxSessionErrorsKept:]
+	}
+	return m.writeSessionErrorsUnsafe(path, items)
+}
+
+// ListSessionErrors returns durable session errors for UI replay (newest-capped).
+func (m *Manager) ListSessionErrors(_ context.Context, sessionKey string) ([]SessionError, error) {
+	sessionKey = strings.TrimSpace(sessionKey)
+	if sessionKey == "" {
+		return nil, errors.New("session key required")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	path, err := m.errorPath(sessionKey)
+	if err != nil {
+		return nil, err
+	}
+	items, err := m.readSessionErrorsUnsafe(path)
+	if err != nil {
+		return nil, err
+	}
+	if items == nil {
+		return []SessionError{}, nil
+	}
+	if len(items) > maxSessionErrorsKept {
+		items = items[len(items)-maxSessionErrorsKept:]
+	}
+	return items, nil
+}
+
+func (m *Manager) readSessionErrorsUnsafe(path string) ([]SessionError, error) {
+	payload, err := m.root.ReadMetaFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return []SessionError{}, nil
+		}
+		return nil, err
+	}
+	items := make([]SessionError, 0)
+	scanner := jsonlScanner(payload)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var entry SessionError
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			continue
+		}
+		if strings.TrimSpace(entry.Message) == "" {
+			continue
+		}
+		items = append(items, entry)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+func (m *Manager) writeSessionErrorsUnsafe(path string, items []SessionError) error {
+	if len(items) == 0 {
+		metaDir, err := m.root.EnsureMetaDir()
+		if err != nil {
+			return err
+		}
+		full := filepath.Join(metaDir, filepath.FromSlash(path))
+		if err := os.Remove(full); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	}
+	var b strings.Builder
+	for _, entry := range items {
+		payload, err := json.Marshal(entry)
+		if err != nil {
+			return err
+		}
+		b.Write(payload)
+		b.WriteByte('\n')
+	}
+	return m.root.WriteMetaFile(path, []byte(b.String()))
 }
 
 func (m *Manager) GetExchangeAux(_ context.Context, key string, afterSeq int) (map[int][]ExchangeAux, error) {
@@ -1219,6 +1338,17 @@ func (m *Manager) deleteSessionUnsafe(key string) error {
 	if err := os.Remove(filepath.Join(metaDir, filepath.FromSlash(auxPath))); err != nil && !os.IsNotExist(err) {
 		return err
 	}
+	if errorPath, err := m.errorPath(key); err == nil {
+		if err := os.Remove(filepath.Join(metaDir, filepath.FromSlash(errorPath))); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	if pendingPath, err := m.pendingPath(key); err == nil {
+		if err := os.Remove(filepath.Join(metaDir, filepath.FromSlash(pendingPath))); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	delete(m.activePending, key)
 	return nil
 }
 
@@ -1904,6 +2034,19 @@ func (m *Manager) auxPath(key string) (string, error) {
 	return filepath.ToSlash(fmt.Sprintf(auxFileTpl, key)), nil
 }
 
+func (m *Manager) errorPath(key string) (string, error) {
+	if strings.TrimSpace(m.root.MetaDir()) == "" {
+		return "", errors.New("managed dir required")
+	}
+	if key == "" {
+		return "", errors.New("session key required")
+	}
+	if strings.Contains(key, "..") || strings.ContainsRune(key, filepath.Separator) || strings.Contains(key, "/") {
+		return "", fmt.Errorf("invalid session key: %s", key)
+	}
+	return filepath.ToSlash(fmt.Sprintf(errorFileTpl, key)), nil
+}
+
 func (m *Manager) ensureSessionMetaDBUnsafe() (*sql.DB, error) {
 	if m.db != nil {
 		return m.db, nil
@@ -2487,6 +2630,17 @@ func buildSearchSnippet(content string, matchRunes, queryRunes int) string {
 		snippet += "..."
 	}
 	return snippet
+}
+
+func randomHex(n int) string {
+	if n <= 0 {
+		n = 8
+	}
+	buf := make([]byte, n)
+	if _, err := rand.Read(buf); err != nil {
+		return fmt.Sprintf("%d", time.Now().UTC().UnixNano())
+	}
+	return hex.EncodeToString(buf)
 }
 
 func generateKey() string {

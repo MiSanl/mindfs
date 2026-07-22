@@ -751,3 +751,26 @@ func TestProviderModelsSuggestAnthropicRejectsBareOpusHaiku(t *testing.T) {
 		t.Fatal("claude-haiku should promote")
 	}
 }
+
+func TestSessionProviderRuntimeEnvNormalizesBaseURLs(t *testing.T) {
+	provider := agentAPIProvider{
+		BaseURL: "https://relay.example/v1",
+		APIKey:  "secret-key",
+	}
+	claudeEnv := sessionProviderRuntimeEnv("claude", provider)
+	if got := claudeEnv["ANTHROPIC_BASE_URL"]; got != "https://relay.example" {
+		t.Fatalf("claude ANTHROPIC_BASE_URL=%q, want root without /v1", got)
+	}
+	if claudeEnv["ANTHROPIC_API_KEY"] != "secret-key" || claudeEnv["ANTHROPIC_AUTH_TOKEN"] != "secret-key" {
+		t.Fatalf("claude env keys missing: %#v", claudeEnv)
+	}
+	codexEnv := sessionProviderRuntimeEnv("codex", provider)
+	if got := codexEnv["OPENAI_BASE_URL"]; got != "https://relay.example/v1" {
+		t.Fatalf("codex OPENAI_BASE_URL=%q, want /v1 root", got)
+	}
+	// Already-root Anthropic URL must stay stable.
+	rootProvider := agentAPIProvider{BaseURL: "https://relay.example", APIKey: "k"}
+	if got := sessionProviderRuntimeEnv("claude", rootProvider)["ANTHROPIC_BASE_URL"]; got != "https://relay.example" {
+		t.Fatalf("claude root URL mutated: %q", got)
+	}
+}

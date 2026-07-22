@@ -888,6 +888,7 @@ func (s *Service) CloseSession(ctx context.Context, in CloseSessionInput) (*sess
 	if pool := s.Registry.GetAgentPool(); pool != nil && closed != nil {
 		for agentName := range closed.AgentCtxSeq {
 			pool.Close(agentPoolSessionKey(closed.Key, agentName))
+			notifyRuntimeState(in.RootID, closed.Key, agentName, "disconnected", "", "")
 		}
 	}
 	s.Registry.ReleaseFileWatcher(in.RootID, in.Key)
@@ -1091,6 +1092,17 @@ type SessionProviderConfig struct {
 // persisted to session metadata or exposed through WebSocket responses.
 var SessionProviderResolver func(agentName, providerID string) (*SessionProviderConfig, error)
 var ProviderSelectionValidator func(agentName, model, providerID string) error
+
+// RuntimeStateNotifier optionally surfaces per-session agent runtime open/close state.
+// Wired by the API layer to WebSocket clients.
+var RuntimeStateNotifier func(rootID, sessionKey, agentName, state, agentSessionID, message string)
+
+func notifyRuntimeState(rootID, sessionKey, agentName, state, agentSessionID, message string) {
+	if RuntimeStateNotifier == nil {
+		return
+	}
+	RuntimeStateNotifier(rootID, sessionKey, agentName, state, agentSessionID, message)
+}
 
 type RunTransientSlashCommandInput struct {
 	RootID      string
@@ -1761,6 +1773,7 @@ func (s *Service) ensureAgentSession(
 	pool *agent.Pool,
 	manager *session.Manager,
 	current *session.Session,
+	rootID string,
 	agentName string,
 	model string,
 	mode string,
@@ -1771,6 +1784,24 @@ func (s *Service) ensureAgentSession(
 	providerConfig *SessionProviderConfig,
 ) (agenttypes.Session, *int, error) {
 	poolSessionKey := agentPoolSessionKey(current.Key, agentName)
+	mindfsKey := ""
+	if current != nil {
+		mindfsKey = strings.TrimSpace(current.Key)
+	}
+	notifyOpen := func(sess agenttypes.Session, state string, err error) {
+		if mindfsKey == "" || strings.TrimSpace(agentName) == "" {
+			return
+		}
+		sid := ""
+		if sess != nil {
+			sid = strings.TrimSpace(sess.SessionID())
+		}
+		msg := ""
+		if err != nil {
+			msg = err.Error()
+		}
+		notifyRuntimeState(rootID, mindfsKey, agentName, state, sid, msg)
+	}
 	providerRuntimeKey := ""
 	if providerConfig != nil {
 		providerRuntimeKey = agentName + ":" + providerConfig.ID + ":" + providerConfig.Revision
@@ -1846,10 +1877,13 @@ func (s *Service) ensureAgentSession(
 				last := current.AgentCtxSeq[agentName]
 				currentSeq = &last
 			}
+			// Reusing an already-open runtime: do not re-broadcast "connected"
+			// (would spam toasts on every message).
 			return existing, currentSeq, nil
 		}
 		log.Printf("[session/settings] reopen.detected session=%s agent=%s effort_from=%q effort_to=%q fast_service_from=%q fast_service_to=%q action=resume_runtime_session", current.Key, agentName, currentEffort, nextEffort, currentFastService, nextFastService)
 		pool.Close(poolSessionKey)
+		notifyOpen(nil, "disconnected", nil)
 	}
 
 	openCtx := pool.Context()
@@ -1897,6 +1931,7 @@ func (s *Service) ensureAgentSession(
 	} else {
 		log.Printf("[session/model] open session=%s agent=%s model=%q mode=%q effort=%q fast_service=%q pool_session=%s action=open_new_runtime_session", current.Key, agentName, nextModel, nextMode, nextEffort, nextFastService, poolSessionKey)
 	}
+	notifyOpen(nil, "opening", nil)
 	sess, err := pool.GetOrCreate(openCtx, openInput)
 	var ctxSeqOverride *int
 	if err != nil {
@@ -1918,6 +1953,7 @@ func (s *Service) ensureAgentSession(
 			prober.ReportRuntimeFailure(agentName, err)
 		}
 		log.Printf("[session/model] open.error session=%s agent=%s model=%q mode=%q effort=%q fast_service=%q pool_session=%s err=%v", current.Key, agentName, nextModel, nextMode, nextEffort, nextFastService, poolSessionKey, err)
+		notifyOpen(nil, "error", err)
 		return nil, nil, err
 	}
 	if ctxSeqOverride == nil && binding != nil && openInput.AgentSessionID != "" {
@@ -1931,6 +1967,7 @@ func (s *Service) ensureAgentSession(
 		}
 	}
 	log.Printf("[session/model] open.done session=%s agent=%s model=%q mode=%q effort=%q fast_service=%q pool_session=%s", current.Key, agentName, nextModel, nextMode, nextEffort, nextFastService, poolSessionKey)
+	notifyOpen(sess, "connected", nil)
 	return sess, ctxSeqOverride, nil
 }
 
@@ -2273,7 +2310,7 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 		rootAbs = filepath.Clean(runtimeRootPath)
 	}
 	planMode := current != nil && current.PlanMode
-	sess, agentCtxSeq, err := s.ensureAgentSession(turnCtx, agentPool, manager, current, in.Agent, in.Model, in.Mode, in.Effort, in.FastService, rootAbs, binding, providerConfig)
+	sess, agentCtxSeq, err := s.ensureAgentSession(turnCtx, agentPool, manager, current, in.RootID, in.Agent, in.Model, in.Mode, in.Effort, in.FastService, rootAbs, binding, providerConfig)
 	if err != nil {
 		return err
 	}
@@ -2621,7 +2658,7 @@ func (s *Service) RunTransientSlashCommand(ctx context.Context, in RunTransientS
 	if err := s.validateAgentModelForProvider(agentName, in.Model, providerConfig); err != nil {
 		return err
 	}
-	sess, _, err := s.ensureAgentSession(turnCtx, agentPool, manager, current, agentName, in.Model, in.Mode, in.Effort, in.FastService, rootAbs, binding, providerConfig)
+	sess, _, err := s.ensureAgentSession(turnCtx, agentPool, manager, current, in.RootID, agentName, in.Model, in.Mode, in.Effort, in.FastService, rootAbs, binding, providerConfig)
 	if err != nil {
 		return err
 	}
