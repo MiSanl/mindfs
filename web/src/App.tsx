@@ -1618,6 +1618,7 @@ export function App({ onGoHome }: AppProps) {
   const taskTemplateActionMenuRef = useRef<HTMLDivElement | null>(null);
   const taskCreateTemplateMenuRef = useRef<HTMLDivElement | null>(null);
   const [availableAgents, setAvailableAgents] = useState<AgentStatus[]>([]);
+  const availableAgentsRef = useRef<AgentStatus[]>([]);
   const [scheduledAgentDialogOpen, setScheduledAgentDialogOpen] = useState(false);
   const [taskTemplates, setTaskTemplates] = useState<TaskTemplate[]>([]);
   const [taskTemplateDialogOpen, setTaskTemplateDialogOpen] = useState(false);
@@ -2635,6 +2636,7 @@ export function App({ onGoHome }: AppProps) {
     fetchAgents(true)
       .then((items) => {
         if (cancelled) return;
+        availableAgentsRef.current = items;
         setAvailableAgents(items);
       })
       .catch(() => {});
@@ -9680,11 +9682,70 @@ export function App({ onGoHome }: AppProps) {
                 : /peer disconnected|stream disconnected|504|timeout|connection/i.test(
                     errorMessage,
                   );
-            reportError(sessionErrorCode(errorMessage), errorMessage, {
-              recoverable,
+            const errCode = sessionErrorCode(errorMessage);
+            const errRootId = payloadRootId || pending?.rootId || currentRootIdRef.current;
+            const errSessionKey = payloadSessionKey || pending?.sessionKey || null;
+            const providerRecovery =
+              errCode === "session.provider_unavailable" ||
+              errCode === "session.provider_mismatch" ||
+              errCode === "session.provider_changed";
+            reportError(errCode, errorMessage, {
+              recoverable: recoverable || providerRecovery,
+              retryAction: providerRecovery
+                ? async () => {
+                    const root = String(errRootId || "").trim();
+                    const key = String(errSessionKey || "").trim();
+                    if (!root || !key) {
+                      throw new Error(errorMessage);
+                    }
+                    const agentName = String(
+                      (pending as any)?.agent ||
+                        selectedSessionRef.current?.agent ||
+                        "",
+                    ).trim();
+                    const agentInfo = (availableAgentsRef.current || []).find(
+                      (item) => item.name === agentName,
+                    );
+                    const providerId =
+                      agentInfo?.last_config_selection?.type === "api_provider"
+                        ? String(agentInfo.last_config_selection.id || "").trim()
+                        : "";
+                    if (!providerId) {
+                      throw new Error(
+                        "Select a valid API provider in Agent Config, then retry to migrate this session.",
+                      );
+                    }
+                    const migrated = await sessionService.migrateSessionProvider(
+                      root,
+                      key,
+                      {
+                        agent: agentName || undefined,
+                        provider_id: providerId,
+                        model:
+                          String(
+                            (pending as any)?.model ||
+                              selectedSessionRef.current?.model ||
+                              "",
+                          ).trim() || undefined,
+                      },
+                    );
+                    if (!migrated) {
+                      throw new Error("session provider migration failed");
+                    }
+                    const select = handleSelectSessionRef.current;
+                    if (select) {
+                      await select({
+                        ...migrated,
+                        root_id: root,
+                        key: migrated.key || (migrated as any).session_key,
+                        session_key: migrated.key || (migrated as any).session_key,
+                      });
+                    }
+                  }
+                : undefined,
               details: {
-                rootId: payloadRootId || pending?.rootId || currentRootIdRef.current,
-                sessionKey: payloadSessionKey || pending?.sessionKey || null,
+                rootId: errRootId,
+                sessionKey: errSessionKey,
                 requestId: requestId || null,
               },
             });
