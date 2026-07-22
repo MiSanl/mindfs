@@ -158,11 +158,17 @@ func validateProviderSelection(agentName, model, providerID string) error {
 }
 
 func sessionProviderRevision(provider agentAPIProvider) string {
+	keyFingerprint := ""
+	if key := strings.TrimSpace(provider.APIKey); key != "" {
+		sum := sha256.Sum256([]byte(key))
+		keyFingerprint = fmt.Sprintf("%x", sum[:8])
+	}
 	payload := strings.Join([]string{
 		strings.TrimSpace(provider.BaseURL),
 		strings.Join(agentAPIProviderProtocols(provider), ","),
 		strings.Join(provider.Models, "\x00"),
 		strings.TrimSpace(provider.UpdatedAt),
+		keyFingerprint,
 	}, "\x00")
 	sum := sha256.Sum256([]byte(payload))
 	return fmt.Sprintf("%x", sum[:])

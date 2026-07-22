@@ -725,7 +725,7 @@ func TestNormalizeAPIProviderBaseURLRejectsCredentialBearingComponents(t *testin
 	}
 }
 
-func TestSessionProviderRevisionDoesNotDeriveFromAPIKey(t *testing.T) {
+func TestSessionProviderRevisionTracksAPIKeyFingerprint(t *testing.T) {
 	base := agentAPIProvider{
 		BaseURL:   "https://relay.example/v1",
 		Protocols: []string{apiProviderProtocolOpenAICompatible},
@@ -735,8 +735,12 @@ func TestSessionProviderRevisionDoesNotDeriveFromAPIKey(t *testing.T) {
 	}
 	changedKey := base
 	changedKey.APIKey = "key-two"
-	if sessionProviderRevision(base) != sessionProviderRevision(changedKey) {
-		t.Fatal("provider revision must not expose or derive from the API key")
+	if sessionProviderRevision(base) == sessionProviderRevision(changedKey) {
+		t.Fatal("provider revision must change when the API key rotates")
+	}
+	rev := sessionProviderRevision(base)
+	if strings.Contains(rev, "key-one") || strings.Contains(rev, base.APIKey) {
+		t.Fatalf("revision must not embed raw API key: %q", rev)
 	}
 }
 

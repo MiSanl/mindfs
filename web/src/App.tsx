@@ -6443,14 +6443,30 @@ export function App({ onGoHome }: AppProps) {
       const selectedProvider = availableAgents.find(
         (item) => item.name === effectiveAgent,
       )?.last_config_selection;
-      // Always include the UI-selected provider for session-bound agents.
-      // Server-side AllowProviderBind / mismatch checks decide whether bind is
-      // allowed; omitting provider_id on pre-created empty sessions caused
-      // silent global-env fallbacks.
-      const effectiveProviderID =
-        (effectiveAgent === "claude" || effectiveAgent === "codex") &&
+      // Prefer the session's bound provider for existing conversations so a
+      // global provider switch does not force session_provider_mismatch.
+      // Fall back to the UI selection for new/unbound sessions.
+      const boundProviderID = (() => {
+        if (!(effectiveAgent === "claude" || effectiveAgent === "codex")) {
+          return "";
+        }
+        const bindings = Array.isArray((selectedSessionRef.current as any)?.agent_bindings)
+          ? ((selectedSessionRef.current as any).agent_bindings as any[])
+          : [];
+        const match = bindings.find(
+          (item) =>
+            String(item?.agent || "").toLowerCase() === String(effectiveAgent || "").toLowerCase() &&
+            String(item?.provider_id || "").trim(),
+        );
+        return String(match?.provider_id || "").trim();
+      })();
+      const selectedProviderID =
         selectedProvider?.type === "api_provider"
-          ? selectedProvider.id || undefined
+          ? String(selectedProvider.id || "").trim()
+          : "";
+      const effectiveProviderID =
+        (effectiveAgent === "claude" || effectiveAgent === "codex")
+          ? boundProviderID || selectedProviderID || undefined
           : undefined;
       const sent = await sessionService.sendMessage(
         activeRoot,

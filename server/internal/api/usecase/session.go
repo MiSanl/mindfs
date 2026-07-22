@@ -1692,17 +1692,14 @@ func cancelRuntimeAfterNonRecoverableError(sess agenttypes.Session, pool *agent.
 			log.Printf("[session] turn.cancel_after_non_recoverable.error agent=%s cause=%v err=%v", agentName, cause, err)
 		}
 	}
-	if pool != nil && agentName != "" {
-		if _, ok := pool.KillAgentProcess(agentName, 0); ok {
-			log.Printf("[session] runtime.kill_after_non_recoverable.done agent=%s cause=%v", agentName, cause)
-			return
-		}
-	}
+	// Close only this runtime session. Killing the whole agent process would
+	// tear down every concurrent Claude/Codex session (including other providers).
 	if sess != nil {
 		if err := sess.Close(); err != nil {
 			log.Printf("[session] runtime.close_after_non_recoverable.error agent=%s cause=%v err=%v", agentName, cause, err)
 		}
 	}
+	_ = pool
 }
 
 func contextLineCount(exchanges []session.Exchange) int {
@@ -3719,6 +3716,11 @@ func (s *Service) recoverAgentTurn(ctx context.Context, in SendRecoveryInput) (a
 			log.Printf("[session/recovery] wait root=%s session=%s agent=%s attempt=%d/%d delay=%s", in.RootID, in.SessionKey, in.AgentName, attempt, sessionRecoveryAttempts, sessionRecoveryDelay)
 			if err := waitForRecoveryDelay(ctx, sessionRecoveryDelay); err != nil {
 				return nil, err
+			}
+			// Close the dead handle before retrying. Without this, retries keep writing
+			// into a broken stream and never recover from peer disconnects.
+			if in.CurrentSession != nil {
+				_ = in.CurrentSession.Close()
 			}
 		}
 
