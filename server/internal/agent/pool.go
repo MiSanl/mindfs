@@ -398,29 +398,35 @@ func (p *Pool) ListRuntimeInfoForMindFSSession(mindfsSessionKey string, rootID .
 	defer p.mu.Unlock()
 	out := make([]RuntimeSessionInfo, 0)
 	for poolKey, entry := range p.sessions {
-		if root != "" && !strings.Contains(poolKey, root+"::"+mindfsSessionKey) && !strings.HasSuffix(poolKey, "-"+mindfsSessionKey) {
-			// When root is known, require root-scoped keys (or legacy bare suffix).
-			if !strings.Contains(poolKey, root+"::") {
-				continue
-			}
-		}
 		if entry == nil || entry.session == nil {
 			continue
 		}
-		// Pool keys are "agent-mindfsSessionKey" (see agentPoolSessionKey). Match by
-		// exact entry.sessionKey first, then structured prefix form only.
-		matched := strings.TrimSpace(entry.sessionKey) == mindfsSessionKey
-		if !matched {
-			agent := strings.ToLower(strings.TrimSpace(entry.agentName))
-			if agent != "" {
-				if poolKey == agent+"-"+mindfsSessionKey || strings.HasSuffix(poolKey, "-"+mindfsSessionKey) || strings.HasSuffix(poolKey, "::"+mindfsSessionKey) {
-					// Accept agent-<root::>session and agent-session forms.
-					matched = strings.HasSuffix(poolKey, mindfsSessionKey) && (strings.Contains(poolKey, "::") || poolKey == agent+"-"+mindfsSessionKey)
-				}
+		agent := strings.ToLower(strings.TrimSpace(entry.agentName))
+		matched := false
+		if root != "" {
+			// Strict forms only:
+			//   agent-root::session
+			//   root::session
+			//   agent-session (legacy bare, only when entry has no root segment)
+			scoped := root + "::" + mindfsSessionKey
+			if poolKey == scoped || (agent != "" && poolKey == agent+"-"+scoped) {
+				matched = true
+			} else if !strings.Contains(poolKey, "::") && agent != "" && poolKey == agent+"-"+mindfsSessionKey {
+				matched = true
+			} else if !strings.Contains(poolKey, "::") && poolKey == mindfsSessionKey {
+				matched = true
 			}
-		}
-		if !matched && poolKey == mindfsSessionKey {
-			matched = true
+		} else {
+			// No root: exact mindfs key, agent-session, or unique agent-root::session suffix.
+			if poolKey == mindfsSessionKey || strings.TrimSpace(entry.sessionKey) == mindfsSessionKey {
+				matched = true
+			} else if agent != "" && poolKey == agent+"-"+mindfsSessionKey {
+				matched = true
+			} else if strings.HasSuffix(poolKey, "::"+mindfsSessionKey) {
+				matched = true
+			} else if agent != "" && strings.HasSuffix(poolKey, "-"+mindfsSessionKey) && !strings.Contains(poolKey, "::") {
+				matched = true
+			}
 		}
 		if !matched {
 			continue

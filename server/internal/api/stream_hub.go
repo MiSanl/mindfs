@@ -157,7 +157,15 @@ func NewStreamHub(e2eeManager *e2ee.Manager) *StreamHub {
 	}
 }
 
-func pendingClientKey(clientID, sessionKey string) string {
+func pendingClientKey(rootID, clientID, sessionKey string) string {
+	clientID = strings.TrimSpace(clientID)
+	sessionKey = strings.TrimSpace(sessionKey)
+	if clientID == "" || sessionKey == "" {
+		return ""
+	}
+	if root := strings.TrimSpace(rootID); root != "" {
+		return clientID + "::" + root + "::" + sessionKey
+	}
 	return clientID + "::" + sessionKey
 }
 
@@ -294,7 +302,20 @@ func (h *StreamHub) getPendingStateLocked(rootID, sessionKey string) *SessionPen
 	if key == "" {
 		return nil
 	}
-	return h.pendingSessions[key]
+	if state := h.pendingSessions[key]; state != nil {
+		return state
+	}
+	// Read-path migration: legacy bare key -> root-scoped slot.
+	if root := strings.TrimSpace(rootID); root != "" {
+		if legacy := h.pendingSessions[sessionKey]; legacy != nil && (legacy.RootID == "" || legacy.RootID == root) {
+			legacy.RootID = root
+			scoped := pendingKey(root, sessionKey)
+			h.pendingSessions[scoped] = legacy
+			delete(h.pendingSessions, sessionKey)
+			return legacy
+		}
+	}
+	return nil
 }
 
 func (h *StreamHub) ensurePendingSessionLocked(rootID, sessionKey string) *SessionPendingState {
@@ -854,7 +875,7 @@ func (h *StreamHub) ListReplyingSessions() []ReplyingSessionState {
 
 func (h *StreamHub) ReplayPending(rootID, clientID, sessionKey string) {
 	h.mu.Lock()
-	h.replayStates[pendingClientKey(clientID, sessionKey)] = &ClientReplayState{
+	h.replayStates[pendingClientKey(rootID, clientID, sessionKey)] = &ClientReplayState{
 		Status:      ClientStreamStatusReplay,
 		ReplayIndex: 0,
 	}
@@ -1051,7 +1072,7 @@ func (h *StreamHub) collectReplayStep(rootID, clientID, sessionKey string) repla
 }
 
 func (h *StreamHub) nextReplayStepLocked(rootID, clientID, sessionKey string) replayStep {
-	clientKey := pendingClientKey(clientID, sessionKey)
+	clientKey := pendingClientKey(rootID, clientID, sessionKey)
 	replay := h.replayStates[clientKey]
 	if replay == nil {
 		return replayStep{live: true}
