@@ -343,8 +343,8 @@ func (h *StreamHub) ensurePendingSessionLocked(rootID, sessionKey string) *Sessi
 	return state
 }
 
-func (h *StreamHub) clearReplayStatesForSessionLocked(sessionKey string) {
-	for _, replayKey := range h.getReplayKeyListLocked(sessionKey, "") {
+func (h *StreamHub) clearReplayStatesForSessionLocked(rootID, sessionKey string) {
+	for _, replayKey := range h.getReplayKeyListLocked(rootID, sessionKey, "") {
 		delete(h.replayStates, replayKey)
 	}
 }
@@ -379,7 +379,7 @@ func (h *StreamHub) UnregisterClient(clientID string, conn *websocket.Conn) {
 			delete(h.sessionClients, sessionKey)
 		}
 	}
-	for _, replayKey := range h.getReplayKeyListLocked("", clientID) {
+	for _, replayKey := range h.getReplayKeyListLocked("", "", clientID) {
 		delete(h.replayStates, replayKey)
 	}
 }
@@ -451,7 +451,7 @@ func (h *StreamHub) GetSessionClientIDs(rootID, sessionKey string, liveOnly bool
 		if h.clients[clientID] == nil {
 			continue
 		}
-		if liveOnly && h.isReplayClientLocked(clientID, sessionKey) {
+		if liveOnly && h.isReplayClientLocked(rootID, clientID, sessionKey) {
 			continue
 		}
 		out = append(out, clientID)
@@ -495,7 +495,7 @@ func (h *StreamHub) SetPendingUser(rootID, sessionKey, sessionTitle, agent, mode
 	state.ReplyingList = nil
 	state.Summary = ""
 	state.UpdatedAt = state.User.Timestamp
-	h.clearReplayStatesForSessionLocked(sessionKey)
+	h.clearReplayStatesForSessionLocked(rootID, sessionKey)
 	return &PendingUserMessage{
 		Agent:       state.User.Agent,
 		Model:       state.User.Model,
@@ -564,7 +564,7 @@ func (h *StreamHub) EnqueueSessionMessage(rootID, sessionKey, sessionTitle strin
 	}
 	state.Queue = append(state.Queue, item)
 	state.UpdatedAt = item.Timestamp
-	h.clearReplayStatesForSessionLocked(sessionKey)
+	h.clearReplayStatesForSessionLocked(rootID, sessionKey)
 	return cloneQueue(state.Queue)
 }
 
@@ -584,7 +584,7 @@ func (h *StreamHub) RemoveQueuedSessionMessage(rootID, sessionKey, queueID strin
 	}
 	state.Queue = next
 	state.UpdatedAt = time.Now().UTC()
-	h.clearReplayStatesForSessionLocked(sessionKey)
+	h.clearReplayStatesForSessionLocked(rootID, sessionKey)
 	return cloneQueue(state.Queue)
 }
 
@@ -602,7 +602,7 @@ func (h *StreamHub) UpdateQueuedSessionMessage(rootID, sessionKey, queueID, cont
 		}
 	}
 	state.UpdatedAt = time.Now().UTC()
-	h.clearReplayStatesForSessionLocked(sessionKey)
+	h.clearReplayStatesForSessionLocked(rootID, sessionKey)
 	return cloneQueue(state.Queue)
 }
 
@@ -690,7 +690,7 @@ func (h *StreamHub) PopQueuedSessionMessage(rootID, sessionKey, queueID string) 
 	item := state.Queue[index]
 	state.Queue = append(state.Queue[:index], state.Queue[index+1:]...)
 	state.UpdatedAt = time.Now().UTC()
-	h.clearReplayStatesForSessionLocked(sessionKey)
+	h.clearReplayStatesForSessionLocked(rootID, sessionKey)
 	return item, cloneQueue(state.Queue), true
 }
 
@@ -718,7 +718,7 @@ func (h *StreamHub) PromoteQueuedSessionMessage(rootID, sessionKey, queueID stri
 	}
 	state.QueueFrozen = false
 	state.UpdatedAt = time.Now().UTC()
-	h.clearReplayStatesForSessionLocked(sessionKey)
+	h.clearReplayStatesForSessionLocked(rootID, sessionKey)
 	return cloneQueue(state.Queue), true
 }
 
@@ -895,7 +895,7 @@ func (h *StreamHub) ReplayPending(rootID, clientID, sessionKey string) {
 func (h *StreamHub) HasReplayClients(rootID, sessionKey string) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	for _, replayKey := range h.getReplayKeyListLocked(sessionKey, "") {
+	for _, replayKey := range h.getReplayKeyListLocked(rootID, sessionKey, "") {
 		replay := h.replayStates[replayKey]
 		if replay != nil && replay.Status == ClientStreamStatusReplay {
 			return true
@@ -930,7 +930,7 @@ func (h *StreamHub) ClearSessionPending(rootID, sessionKey string) {
 			delete(h.pendingSessions, sessionKey)
 		}
 	}
-	h.clearReplayStatesForSessionLocked(sessionKey)
+	h.clearReplayStatesForSessionLocked(rootID, sessionKey)
 }
 
 func (h *StreamHub) SendToClient(clientID string, resp WSResponse) {
@@ -1129,27 +1129,57 @@ func (h *StreamHub) replayCompletionToClient(rootID, clientID, sessionKey string
 	h.SendToClient(clientID, buildSessionDoneResponse(rootID, sessionKey, requestID, true))
 }
 
-func (h *StreamHub) isReplayClientLocked(clientID, sessionKey string) bool {
-	for _, replayKey := range h.getReplayKeyListLocked(sessionKey, clientID) {
+func (h *StreamHub) isReplayClientLocked(rootID, clientID, sessionKey string) bool {
+	for _, replayKey := range h.getReplayKeyListLocked(rootID, sessionKey, clientID) {
 		state := h.replayStates[replayKey]
-		return state != nil && state.Status != ClientStreamStatusLive
+		if state != nil && state.Status != ClientStreamStatusLive {
+			return true
+		}
 	}
 	return false
 }
 
-func (h *StreamHub) getReplayKeyListLocked(sessionKey, clientID string) []string {
+func (h *StreamHub) getReplayKeyListLocked(rootID, sessionKey, clientID string) []string {
 	if len(h.replayStates) == 0 {
 		return nil
 	}
 	keys := make([]string, 0, len(h.replayStates))
+	rootID = strings.TrimSpace(rootID)
+	sessionKey = strings.TrimSpace(sessionKey)
+	clientID = strings.TrimSpace(clientID)
 	for replayKey := range h.replayStates {
-		if sessionKey != "" && !strings.HasSuffix(replayKey, "::"+sessionKey) {
-			continue
-		}
 		if clientID != "" && !strings.HasPrefix(replayKey, clientID+"::") {
 			continue
 		}
+		if sessionKey != "" {
+			// Prefer exact root-aware suffix client::root::session when root known.
+			if rootID != "" {
+				if !strings.HasSuffix(replayKey, "::"+rootID+"::"+sessionKey) && !strings.HasSuffix(replayKey, "::"+sessionKey) {
+					continue
+				}
+				// If root-aware form exists for this client/session, skip ambiguous bare matches later by preferring exact.
+				if strings.HasSuffix(replayKey, "::"+sessionKey) && !strings.HasSuffix(replayKey, "::"+rootID+"::"+sessionKey) {
+					// bare client::session — only accept when no root-aware key present for same client/session.
+					// Keep for transition; exact root-aware keys still included separately.
+				}
+			} else if !strings.HasSuffix(replayKey, "::"+sessionKey) {
+				continue
+			}
+		}
 		keys = append(keys, replayKey)
+	}
+	// If root known, prefer only root-aware keys when any exist.
+	if rootID != "" && sessionKey != "" {
+		exact := make([]string, 0, len(keys))
+		suffix := "::" + rootID + "::" + sessionKey
+		for _, k := range keys {
+			if strings.HasSuffix(k, suffix) {
+				exact = append(exact, k)
+			}
+		}
+		if len(exact) > 0 {
+			return exact
+		}
 	}
 	return keys
 }
