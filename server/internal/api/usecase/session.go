@@ -2708,6 +2708,9 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 	}
 	if sendErr != nil {
 		updatePending()
+		if isCanceledTurnError(sendErr) {
+			_ = manager.DiscardPendingTurn(ctx, current.Key)
+		}
 		if prober := s.Registry.GetProber(); prober != nil && !isCanceledTurnError(sendErr) {
 			prober.ReportRuntimeFailure(in.Agent, sendErr)
 		}

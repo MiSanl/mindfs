@@ -691,14 +691,19 @@ func (h *WSHandler) handleSessionMessage(ctx context.Context, conn *websocket.Co
 		ClientCtx:       clientCtx,
 		ExcludeClientID: clientID,
 	}
-	if streamHub.IsSessionReplying(key) && sessionType != session.TypeCommand {
+	if sessionType != session.TypeCommand && (streamHub.IsSessionReplying(key) || streamHub.HasQueuedSessionMessages(key)) {
 		queue := streamHub.EnqueueSessionMessage(rootID, key, sessionName, QueuedUserMessage{
 			ID:                 requestID,
 			PendingUserMessage: userMessage,
 			ClientCtx:          clientCtx,
 		})
 		streamHub.BroadcastSessionQueueUpdated(rootID, key, queue)
-		log.Printf("[ws] session.queue.enqueue root=%s session=%s request=%s queue=%d", rootID, key, requestID, len(queue))
+		log.Printf("[ws] session.queue.enqueue root=%s session=%s request=%s queue=%d replying=%v", rootID, key, requestID, len(queue), streamHub.IsSessionReplying(key))
+		// If nothing is actively replying, drain the queue immediately so
+		// leftover items from kanban/scheduled paths cannot be skipped forever.
+		if !streamHub.IsSessionReplying(key) {
+			h.startNextQueuedSessionMessage(rootID, key)
+		}
 		return
 	}
 	if queue, changed := streamHub.UnfreezeQueuedSessionMessages(key); changed {
@@ -987,6 +992,7 @@ func (h *WSHandler) startNextQueuedSessionMessage(rootID, key string) {
 	go h.runSessionMessage(sessionMessageJob{
 		RootID:      rootID,
 		Key:         key,
+		RequestID:   item.ID,
 		SessionType: sessionType,
 		SessionName: sessionName,
 		Shell:       shell,

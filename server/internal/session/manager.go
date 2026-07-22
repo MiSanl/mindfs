@@ -335,12 +335,28 @@ func (m *Manager) CompletePendingTurn(_ context.Context, sessionKey string) erro
 	return err
 }
 
-// ReleasePendingTurn allows a failed or canceled live turn to be recovered by
-// the next session access without discarding its durable snapshot.
+// ReleasePendingTurn ends a live pending turn without forcing recovery.
+// Empty/canceled agent content is discarded; partial assistant output remains
+// for the next session access to recover.
 func (m *Manager) ReleasePendingTurn(_ context.Context, sessionKey string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.activePending, sessionKey)
+	pending, err := m.readPendingTurnUnsafe(sessionKey)
+	if err != nil || pending == nil {
+		return
+	}
+	if strings.TrimSpace(pending.Agent.Content) == "" && len(pending.Aux) == 0 {
+		_ = m.removePendingTurnUnsafe(sessionKey)
+	}
+}
+
+// DiscardPendingTurn drops an in-flight pending snapshot without writing history.
+func (m *Manager) DiscardPendingTurn(_ context.Context, sessionKey string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.activePending, sessionKey)
+	return m.removePendingTurnUnsafe(sessionKey)
 }
 
 // AppendSessionError appends a durable error record under sessions/errors/<key>.jsonl.
@@ -1796,6 +1812,10 @@ func (m *Manager) recoverPendingTurnUnsafe(key string) error {
 	if len(current.Exchanges) < pending.Agent.Seq {
 		if len(current.Exchanges)+1 != pending.Agent.Seq {
 			return errors.New("pending agent sequence does not match session")
+		}
+		// Never materialize an empty canceled/failed agent turn into history.
+		if strings.TrimSpace(pending.Agent.Content) == "" && len(pending.Aux) == 0 {
+			return m.removePendingTurnUnsafe(key)
 		}
 		if err := m.appendExchange(key, pending.Agent); err != nil {
 			return err

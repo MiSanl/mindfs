@@ -383,6 +383,16 @@ func (h *StreamHub) SetPendingUser(rootID, sessionKey, sessionTitle, agent, mode
 	}
 }
 
+func (h *StreamHub) HasQueuedSessionMessages(sessionKey string) bool {
+	if blank(sessionKey) {
+		return false
+	}
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	state := h.pendingSessions[sessionKey]
+	return state != nil && len(state.Queue) > 0 && !state.QueueFrozen
+}
+
 func (h *StreamHub) IsSessionReplying(sessionKey string) bool {
 	if blank(sessionKey) {
 		return false

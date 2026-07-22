@@ -317,6 +317,7 @@ func (s *AppContext) RunAgentStage(ctx context.Context, exec kanban.AgentStageEx
 			s.BroadcastSessionUpdate(exec.RootID, sessionKey, update)
 			if update.Type == agenttypes.EventTypeMessageDone {
 				s.BroadcastSessionDone(exec.RootID, sessionKey, "")
+	s.StartNextQueuedSessionMessage(exec.RootID, sessionKey)
 			}
 		},
 	})
@@ -327,6 +328,7 @@ func (s *AppContext) RunAgentStage(ctx context.Context, exec kanban.AgentStageEx
 		log.Printf("[kanban] session.done.wait_timeout root=%s session=%s task=%s", exec.RootID, sessionKey, exec.Task.ID)
 	}
 	s.BroadcastSessionDone(exec.RootID, sessionKey, "")
+	s.StartNextQueuedSessionMessage(exec.RootID, sessionKey)
 	return err
 }
 
@@ -984,6 +986,25 @@ func (s *AppContext) BroadcastSessionDone(rootID, sessionKey, requestID string) 
 	hub.ClearSessionPending(sessionKey)
 	hub.BroadcastSessionDone(rootID, sessionKey, requestID)
 }
+
+// StartNextQueuedSessionMessage drains one queued user message if the session
+// is idle. Used by non-WS completion paths (kanban/scheduled) so leftovers are
+// not skipped by later direct sends.
+func (s *AppContext) StartNextQueuedSessionMessage(rootID, sessionKey string) {
+	if s == nil {
+		return
+	}
+	hub := s.GetSessionStreamHub()
+	if hub == nil || hub.IsSessionReplying(sessionKey) || !hub.HasQueuedSessionMessages(sessionKey) {
+		return
+	}
+	// Best-effort: only unfreeze/broadcast; actual run requires WS handler.
+	// Mark queue for the next WS message path by ensuring HasQueued remains true.
+	if queue, changed := hub.UnfreezeQueuedSessionMessages(sessionKey); changed {
+		hub.BroadcastSessionQueueUpdated(rootID, sessionKey, queue)
+	}
+}
+
 
 func (s *AppContext) BroadcastScheduledTaskDone(rootID, taskID, taskName, sessionKey, summary string) {
 	s.notifyScheduled(rootID, taskID, taskName, sessionKey, summary, "", true)

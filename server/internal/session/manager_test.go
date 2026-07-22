@@ -785,3 +785,26 @@ func TestManagerMarkPendingAskUserAnsweredMergesAnswers(t *testing.T) {
 		t.Fatalf("answeredAt = %#v, want %s", toolCall.Meta["answeredAt"], answeredAt.Format(time.RFC3339Nano))
 	}
 }
+
+func TestDiscardEmptyPendingTurn(t *testing.T) {
+	dir := t.TempDir()
+	root := rootfs.NewRootInfo("pending-empty", "pending-empty", dir)
+	manager := newTestManager(t, root)
+	created, err := manager.Create(context.Background(), CreateInput{Type: TypeChat, Name: "pending-empty"})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	user := Exchange{Seq: 1, Role: "user", Content: "hello", Timestamp: time.Now().UTC()}
+	agent := Exchange{Seq: 2, Role: "agent", Content: "", Timestamp: time.Now().UTC()}
+	if err := manager.StartPendingTurn(context.Background(), created, user, agent); err != nil {
+		t.Fatalf("start pending: %v", err)
+	}
+	manager.ReleasePendingTurn(context.Background(), created.Key)
+	loaded, err := manager.Get(context.Background(), created.Key, 0)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if len(loaded.Exchanges) != 0 {
+		t.Fatalf("empty canceled pending should not materialize history, got %d exchanges", len(loaded.Exchanges))
+	}
+}
