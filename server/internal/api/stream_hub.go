@@ -363,7 +363,7 @@ func (h *StreamHub) UnregisterClient(clientID string, conn *websocket.Conn) {
 	}
 }
 
-func (h *StreamHub) BindSessionClient(sessionKey, clientID string) {
+func (h *StreamHub) BindSessionClient(rootID, sessionKey, clientID string) {
 	if blank(sessionKey) || blank(clientID) {
 		return
 	}
@@ -372,21 +372,60 @@ func (h *StreamHub) BindSessionClient(sessionKey, clientID string) {
 	if _, ok := h.clients[clientID]; !ok {
 		return
 	}
-	clientSet := h.sessionClients[sessionKey]
+	key := pendingKey(rootID, sessionKey)
+	if key == "" {
+		key = strings.TrimSpace(sessionKey)
+	}
+	clientSet := h.sessionClients[key]
+	if clientSet == nil {
+		// Migrate legacy bare binding when root becomes known.
+		if rootID = strings.TrimSpace(rootID); rootID != "" {
+			if legacy := h.sessionClients[sessionKey]; legacy != nil {
+				clientSet = legacy
+				delete(h.sessionClients, sessionKey)
+			}
+		}
+	}
 	if clientSet == nil {
 		clientSet = make(map[string]struct{})
-		h.sessionClients[sessionKey] = clientSet
 	}
+	h.sessionClients[key] = clientSet
 	clientSet[clientID] = struct{}{}
+	// Also keep bare key for transition callers that still look up without root.
+	if key != sessionKey {
+		bare := h.sessionClients[sessionKey]
+		if bare == nil {
+			bare = make(map[string]struct{})
+			h.sessionClients[sessionKey] = bare
+		}
+		bare[clientID] = struct{}{}
+	}
 }
 
-func (h *StreamHub) GetSessionClientIDs(sessionKey string, liveOnly bool) []string {
+func (h *StreamHub) GetSessionClientIDs(rootID, sessionKey string, liveOnly bool) []string {
 	if blank(sessionKey) {
 		return nil
 	}
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-	clientSet := h.sessionClients[sessionKey]
+	key := pendingKey(rootID, sessionKey)
+	clientSet := h.sessionClients[key]
+	if len(clientSet) == 0 && key != sessionKey {
+		clientSet = h.sessionClients[sessionKey]
+	}
+	if len(clientSet) == 0 && strings.TrimSpace(rootID) == "" {
+		// Union unique root-scoped client sets for this session key.
+		merged := map[string]struct{}{}
+		suffix := "::" + strings.TrimSpace(sessionKey)
+		for mapKey, set := range h.sessionClients {
+			if mapKey == sessionKey || strings.HasSuffix(mapKey, suffix) {
+				for id := range set {
+					merged[id] = struct{}{}
+				}
+			}
+		}
+		clientSet = merged
+	}
 	if len(clientSet) == 0 {
 		return nil
 	}
@@ -901,7 +940,7 @@ func (h *StreamHub) BroadcastSessionStream(rootID, sessionKey string, event *Str
 		return
 	}
 	h.AppendReplyEvent(rootID, sessionKey, *event)
-	for _, clientID := range h.GetSessionClientIDs(sessionKey, true) {
+	for _, clientID := range h.GetSessionClientIDs(rootID, sessionKey, true) {
 		resp := buildSessionStreamResponse(rootID, sessionKey, event)
 		h.SendToClient(clientID, resp)
 	}
@@ -909,13 +948,13 @@ func (h *StreamHub) BroadcastSessionStream(rootID, sessionKey string, event *Str
 
 func (h *StreamHub) BroadcastSessionDone(rootID, sessionKey, requestID string) {
 	h.mu.Lock()
-	h.completed[sessionKey] = &CompletedSessionState{
+	h.completed[pendingKey(rootID, sessionKey)] = &CompletedSessionState{
 		RequestID: requestID,
 		Completed: time.Now().UTC(),
 	}
 	h.mu.Unlock()
 	resp := buildSessionDoneResponse(rootID, sessionKey, requestID, false)
-	for _, clientID := range h.GetSessionClientIDs(sessionKey, false) {
+	for _, clientID := range h.GetSessionClientIDs(rootID, sessionKey, false) {
 		h.SendToClient(clientID, resp)
 	}
 }
@@ -937,7 +976,7 @@ func (h *StreamHub) BroadcastSessionUserMessage(
 ) {
 	pendingUser := h.SetPendingUser(rootID, sessionKey, sessionName, agentName, model, mode, effort, fastService, planMode, content)
 	resp := buildSessionUserMessageResponse(rootID, sessionKey, sessionType, sessionName, agentName, model, mode, effort, fastService, planMode, content, pendingUser.Timestamp, queued)
-	for _, clientID := range h.GetSessionClientIDs(sessionKey, false) {
+	for _, clientID := range h.GetSessionClientIDs(rootID, sessionKey, false) {
 		if clientID == excludeClientID {
 			continue
 		}
@@ -948,7 +987,7 @@ func (h *StreamHub) BroadcastSessionUserMessage(
 func (h *StreamHub) BroadcastSessionQueueUpdated(rootID, sessionKey string, queue []QueuedUserMessage) {
 	_, _, frozen := h.queueSnapshot(sessionKey)
 	resp := buildSessionQueueUpdatedResponse(rootID, sessionKey, queue, frozen)
-	for _, clientID := range h.GetSessionClientIDs(sessionKey, false) {
+	for _, clientID := range h.GetSessionClientIDs(rootID, sessionKey, false) {
 		h.SendToClient(clientID, resp)
 	}
 }

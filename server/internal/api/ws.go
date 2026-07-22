@@ -648,7 +648,7 @@ func (h *WSHandler) handleSessionMessage(ctx context.Context, conn *websocket.Co
 		h.sendWSAccepted(conn, clientID, requestID, rootID, key)
 	}
 	if h.AppContext != nil {
-		streamHub.BindSessionClient(key, clientID)
+		streamHub.BindSessionClient(rootID, key, clientID)
 	}
 	clientCtx := parseClientContext(req.Payload, rootID)
 	allowProviderBind := createdSession
@@ -747,7 +747,7 @@ func (h *WSHandler) handleSessionSlashCommandRun(ctx context.Context, conn *webs
 		h.sendWSAccepted(conn, clientID, requestID, rootID, key)
 	}
 	if h.AppContext != nil {
-		h.AppContext.GetSessionStreamHub().BindSessionClient(key, clientID)
+		h.AppContext.GetSessionStreamHub().BindSessionClient(rootID, key, clientID)
 	}
 
 	uc := &usecase.Service{Registry: h.AppContext}
@@ -1014,7 +1014,7 @@ func (h *WSHandler) handleSessionReady(clientID string, req WSRequest) {
 		return
 	}
 	streamHub := h.AppContext.GetSessionStreamHub()
-	streamHub.BindSessionClient(key, clientID)
+	streamHub.BindSessionClient(rootID, key, clientID)
 	streamHub.ReplayPending(rootID, clientID, key)
 }
 
@@ -1140,7 +1140,7 @@ func (h *WSHandler) handleSessionQueueSendNow(ctx context.Context, conn *websock
 		return
 	}
 	streamHub := h.AppContext.GetSessionStreamHub()
-	streamHub.BindSessionClient(key, clientID)
+	streamHub.BindSessionClient(rootID, key, clientID)
 	queue, ok := streamHub.PromoteQueuedSessionMessage(key, queueID)
 	if !ok {
 		h.sendWSError(conn, clientID, req.ID, "not_found", "queued message not found")

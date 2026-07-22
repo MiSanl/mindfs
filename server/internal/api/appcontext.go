@@ -745,7 +745,7 @@ func (s *AppContext) BroadcastSessionRuntimeChanged(rootID, sessionKey, agentNam
 		Type:    "session.runtime.changed",
 		Payload: payload,
 	}
-	clientIDs := hub.GetSessionClientIDs(sessionKey, false)
+	clientIDs := hub.GetSessionClientIDs(rootID, sessionKey, false)
 	if len(clientIDs) == 0 {
 		hub.BroadcastAll(resp)
 		return
@@ -868,7 +868,7 @@ func (s *AppContext) BroadcastSessionErrorWithRequest(rootID, sessionKey, reques
 	}
 	// Prefer session-bound clients; fall back to all live clients so the sender
 	// still sees the failure if BindSessionClient raced.
-	clientIDs := hub.GetSessionClientIDs(sessionKey, false)
+	clientIDs := hub.GetSessionClientIDs(rootID, sessionKey, false)
 	if len(clientIDs) == 0 {
 		hub.BroadcastAll(resp)
 		return

@@ -204,7 +204,7 @@ func TestBroadcastSessionErrorWithRequestRecordsWithoutNetwork(t *testing.T) {
 	// Bound client without websocket conn: SendToClient no-ops.
 	hub := app.GetSessionStreamHub()
 	hub.RegisterClient("client-a", nil)
-	hub.BindSessionClient("sess-2", "client-a")
+	hub.BindSessionClient("root", "sess-2", "client-a")
 	app.BroadcastSessionErrorWithRequest("root-1", "sess-2", "req-99", "boom")
 }
 
