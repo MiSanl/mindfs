@@ -797,7 +797,7 @@ func (h *HTTPHandler) handleSessionGet(w http.ResponseWriter, r *http.Request) {
 	uc := h.service()
 	var pendingUser *session.Exchange
 	if h.AppContext != nil {
-		pendingUser = h.AppContext.GetSessionStreamHub().GetPendingUserExchange(key)
+		pendingUser = h.AppContext.GetSessionStreamHub().GetPendingUserExchange(rootID, key)
 	}
 	if pendingUser == nil {
 		if _, err := uc.SyncExternalSessionDelta(r.Context(), usecase.SyncExternalSessionDeltaInput{

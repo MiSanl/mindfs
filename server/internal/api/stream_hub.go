@@ -487,23 +487,23 @@ func (h *StreamHub) SetPendingUser(rootID, sessionKey, sessionTitle, agent, mode
 	}
 }
 
-func (h *StreamHub) HasQueuedSessionMessages(sessionKey string) bool {
+func (h *StreamHub) HasQueuedSessionMessages(rootID, sessionKey string) bool {
 	if blank(sessionKey) {
 		return false
 	}
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-	state := h.getPendingStateLocked("", sessionKey)
+	state := h.getPendingStateLocked(rootID, sessionKey)
 	return state != nil && len(state.Queue) > 0 && !state.QueueFrozen
 }
 
-func (h *StreamHub) IsSessionReplying(sessionKey string) bool {
+func (h *StreamHub) IsSessionReplying(rootID, sessionKey string) bool {
 	if blank(sessionKey) {
 		return false
 	}
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-	state := h.getPendingStateLocked("", sessionKey)
+	state := h.getPendingStateLocked(rootID, sessionKey)
 	return state != nil && state.Active
 }
 
@@ -516,10 +516,10 @@ func cloneQueue(queue []QueuedUserMessage) []QueuedUserMessage {
 	return out
 }
 
-func (h *StreamHub) queueSnapshot(sessionKey string) (string, []QueuedUserMessage, bool) {
+func (h *StreamHub) queueSnapshot(rootID, sessionKey string) (string, []QueuedUserMessage, bool) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-	state := h.getPendingStateLocked("", sessionKey)
+	state := h.getPendingStateLocked(rootID, sessionKey)
 	if state == nil {
 		return "", nil, false
 	}
@@ -547,10 +547,10 @@ func (h *StreamHub) EnqueueSessionMessage(rootID, sessionKey, sessionTitle strin
 	return cloneQueue(state.Queue)
 }
 
-func (h *StreamHub) RemoveQueuedSessionMessage(sessionKey, queueID string) []QueuedUserMessage {
+func (h *StreamHub) RemoveQueuedSessionMessage(rootID, sessionKey, queueID string) []QueuedUserMessage {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	state := h.getPendingStateLocked("", sessionKey)
+	state := h.getPendingStateLocked(rootID, sessionKey)
 	if state == nil || queueID == "" {
 		return nil
 	}
@@ -567,10 +567,10 @@ func (h *StreamHub) RemoveQueuedSessionMessage(sessionKey, queueID string) []Que
 	return cloneQueue(state.Queue)
 }
 
-func (h *StreamHub) UpdateQueuedSessionMessage(sessionKey, queueID, content string) []QueuedUserMessage {
+func (h *StreamHub) UpdateQueuedSessionMessage(rootID, sessionKey, queueID, content string) []QueuedUserMessage {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	state := h.getPendingStateLocked("", sessionKey)
+	state := h.getPendingStateLocked(rootID, sessionKey)
 	if state == nil || queueID == "" {
 		return nil
 	}
@@ -585,13 +585,13 @@ func (h *StreamHub) UpdateQueuedSessionMessage(sessionKey, queueID, content stri
 	return cloneQueue(state.Queue)
 }
 
-func (h *StreamHub) FreezeQueuedSessionMessages(sessionKey string) ([]QueuedUserMessage, uint64, bool) {
+func (h *StreamHub) FreezeQueuedSessionMessages(rootID, sessionKey string) ([]QueuedUserMessage, uint64, bool) {
 	if blank(sessionKey) {
 		return nil, 0, false
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	state := h.getPendingStateLocked("", sessionKey)
+	state := h.getPendingStateLocked(rootID, sessionKey)
 	if state == nil || len(state.Queue) == 0 {
 		return nil, 0, false
 	}
@@ -601,13 +601,13 @@ func (h *StreamHub) FreezeQueuedSessionMessages(sessionKey string) ([]QueuedUser
 	return cloneQueue(state.Queue), state.FreezeID, true
 }
 
-func (h *StreamHub) UnfreezeQueuedSessionMessages(sessionKey string) ([]QueuedUserMessage, bool) {
+func (h *StreamHub) UnfreezeQueuedSessionMessages(rootID, sessionKey string) ([]QueuedUserMessage, bool) {
 	if blank(sessionKey) {
 		return nil, false
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	state := h.getPendingStateLocked("", sessionKey)
+	state := h.getPendingStateLocked(rootID, sessionKey)
 	if state == nil || !state.QueueFrozen {
 		if state == nil {
 			return nil, false
@@ -619,13 +619,13 @@ func (h *StreamHub) UnfreezeQueuedSessionMessages(sessionKey string) ([]QueuedUs
 	return cloneQueue(state.Queue), true
 }
 
-func (h *StreamHub) UnfreezeQueuedSessionMessagesIfCurrent(sessionKey string, freezeID uint64) ([]QueuedUserMessage, bool) {
+func (h *StreamHub) UnfreezeQueuedSessionMessagesIfCurrent(rootID, sessionKey string, freezeID uint64) ([]QueuedUserMessage, bool) {
 	if blank(sessionKey) || freezeID == 0 {
 		return nil, false
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	state := h.getPendingStateLocked("", sessionKey)
+	state := h.getPendingStateLocked(rootID, sessionKey)
 	if state == nil || !state.QueueFrozen || state.FreezeID != freezeID {
 		return nil, false
 	}
@@ -634,20 +634,20 @@ func (h *StreamHub) UnfreezeQueuedSessionMessagesIfCurrent(sessionKey string, fr
 	return cloneQueue(state.Queue), true
 }
 
-func (h *StreamHub) IsQueueFreezeCurrent(sessionKey string, freezeID uint64) bool {
+func (h *StreamHub) IsQueueFreezeCurrent(rootID, sessionKey string, freezeID uint64) bool {
 	if blank(sessionKey) || freezeID == 0 {
 		return false
 	}
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-	state := h.getPendingStateLocked("", sessionKey)
+	state := h.getPendingStateLocked(rootID, sessionKey)
 	return state != nil && state.QueueFrozen && state.FreezeID == freezeID
 }
 
-func (h *StreamHub) PopQueuedSessionMessage(sessionKey, queueID string) (QueuedUserMessage, []QueuedUserMessage, bool) {
+func (h *StreamHub) PopQueuedSessionMessage(rootID, sessionKey, queueID string) (QueuedUserMessage, []QueuedUserMessage, bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	state := h.getPendingStateLocked("", sessionKey)
+	state := h.getPendingStateLocked(rootID, sessionKey)
 	if state == nil || len(state.Queue) == 0 {
 		return QueuedUserMessage{}, nil, false
 	}
@@ -673,10 +673,10 @@ func (h *StreamHub) PopQueuedSessionMessage(sessionKey, queueID string) (QueuedU
 	return item, cloneQueue(state.Queue), true
 }
 
-func (h *StreamHub) PromoteQueuedSessionMessage(sessionKey, queueID string) ([]QueuedUserMessage, bool) {
+func (h *StreamHub) PromoteQueuedSessionMessage(rootID, sessionKey, queueID string) ([]QueuedUserMessage, bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	state := h.getPendingStateLocked("", sessionKey)
+	state := h.getPendingStateLocked(rootID, sessionKey)
 	if state == nil || len(state.Queue) == 0 || strings.TrimSpace(queueID) == "" {
 		return nil, false
 	}
@@ -717,20 +717,20 @@ func (h *StreamHub) SetPendingReply(rootID, sessionKey, sessionTitle string) {
 	}
 }
 
-func (h *StreamHub) GetPendingUserExchange(sessionKey string) *session.Exchange {
+func (h *StreamHub) GetPendingUserExchange(rootID, sessionKey string) *session.Exchange {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	state := h.getPendingStateLocked("", sessionKey)
+	state := h.getPendingStateLocked(rootID, sessionKey)
 	if state == nil {
 		return nil
 	}
 	return cloneUserExchange(state.User)
 }
 
-func (h *StreamHub) PendingSessionSnapshot(sessionKey string) PendingSessionSnapshot {
+func (h *StreamHub) PendingSessionSnapshot(rootID, sessionKey string) PendingSessionSnapshot {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-	state := h.getPendingStateLocked("", sessionKey)
+	state := h.getPendingStateLocked(rootID, sessionKey)
 	if state == nil {
 		return PendingSessionSnapshot{}
 	}
@@ -883,16 +883,16 @@ func (h *StreamHub) HasReplayClients(rootID, sessionKey string) bool {
 	return false
 }
 
-func (h *StreamHub) ClearSessionPending(sessionKey string) {
+func (h *StreamHub) ClearSessionPending(rootID, sessionKey string) {
 	if blank(sessionKey) {
 		return
 	}
-	for h.HasReplayClients("", sessionKey) {
+	for h.HasReplayClients(rootID, sessionKey) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	key := h.pendingLookupKey("", sessionKey)
+	key := h.pendingLookupKey(rootID, sessionKey)
 	state := h.pendingSessions[key]
 	if state == nil {
 		return
@@ -981,7 +981,7 @@ func (h *StreamHub) BroadcastSessionUserMessage(
 }
 
 func (h *StreamHub) BroadcastSessionQueueUpdated(rootID, sessionKey string, queue []QueuedUserMessage) {
-	_, _, frozen := h.queueSnapshot(sessionKey)
+	_, _, frozen := h.queueSnapshot(rootID, sessionKey)
 	resp := buildSessionQueueUpdatedResponse(rootID, sessionKey, queue, frozen)
 	for _, clientID := range h.GetSessionClientIDs(rootID, sessionKey, false) {
 		h.SendToClient(clientID, resp)
@@ -1079,7 +1079,7 @@ func (h *StreamHub) replayStepToClient(rootID, clientID, sessionKey string, even
 }
 
 func (h *StreamHub) replayQueueToClient(rootID, clientID, sessionKey string) {
-	stateRoot, queue, frozen := h.queueSnapshot(sessionKey)
+	stateRoot, queue, frozen := h.queueSnapshot(rootID, sessionKey)
 	if rootID == "" {
 		rootID = stateRoot
 	}

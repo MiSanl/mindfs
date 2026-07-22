@@ -982,9 +982,9 @@ func (s *AppContext) UpdateTaskSessionErrorForSession(rootID, sessionKey, messag
 
 func (s *AppContext) BroadcastSessionDone(rootID, sessionKey, requestID string) {
 	hub := s.GetSessionStreamHub()
-	pending := hub.PendingSessionSnapshot(sessionKey)
+	pending := hub.PendingSessionSnapshot(rootID, sessionKey)
 	s.notifySessionDone(rootID, sessionKey, requestID, pending)
-	hub.ClearSessionPending(sessionKey)
+	hub.ClearSessionPending(rootID, sessionKey)
 	hub.BroadcastSessionDone(rootID, sessionKey, requestID)
 	// Drain leftovers after any completion path (WS, kanban, scheduled).
 	s.StartNextQueuedSessionMessage(rootID, sessionKey)
@@ -1002,10 +1002,10 @@ func (s *AppContext) StartNextQueuedSessionMessage(rootID, sessionKey string) {
 		return
 	}
 	hub := s.GetSessionStreamHub()
-	if hub == nil || hub.IsSessionReplying(sessionKey) || !hub.HasQueuedSessionMessages(sessionKey) {
+	if hub == nil || hub.IsSessionReplying(rootID, sessionKey) || !hub.HasQueuedSessionMessages(rootID, sessionKey) {
 		return
 	}
-	if queue, changed := hub.UnfreezeQueuedSessionMessages(sessionKey); changed {
+	if queue, changed := hub.UnfreezeQueuedSessionMessages(rootID, sessionKey); changed {
 		hub.BroadcastSessionQueueUpdated(rootID, sessionKey, queue)
 	}
 }
