@@ -6443,9 +6443,12 @@ export function App({ onGoHome }: AppProps) {
       const selectedProvider = availableAgents.find(
         (item) => item.name === effectiveAgent,
       )?.last_config_selection;
+      // Always include the UI-selected provider for session-bound agents.
+      // Server-side AllowProviderBind / mismatch checks decide whether bind is
+      // allowed; omitting provider_id on pre-created empty sessions caused
+      // silent global-env fallbacks.
       const effectiveProviderID =
         (effectiveAgent === "claude" || effectiveAgent === "codex") &&
-        !sendSessionKey &&
         selectedProvider?.type === "api_provider"
           ? selectedProvider.id || undefined
           : undefined;
