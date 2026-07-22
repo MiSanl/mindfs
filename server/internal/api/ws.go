@@ -1150,8 +1150,21 @@ func (h *WSHandler) handleSessionQueueSendNow(ctx context.Context, conn *websock
 		h.startNextQueuedSessionMessage(rootID, key)
 		return
 	}
+	// Match session.cancel: freeze + generation watchdog so a stuck cancel cannot
+	// leave replying permanently and block the promoted queue item forever.
+	if generation, active := usecase.ActiveSessionTurnGeneration(rootID, key); active {
+		freezeID := uint64(0)
+		if queue, frozenID, ok := streamHub.FreezeQueuedSessionMessages(key); ok {
+			streamHub.BroadcastSessionQueueUpdated(rootID, key, queue)
+			freezeID = frozenID
+		}
+		h.scheduleSessionCancelRecovery(rootID, key, req.ID, generation, freezeID)
+	}
 	uc := &usecase.Service{Registry: h.AppContext}
 	if err := uc.CancelSessionTurn(ctx, usecase.CancelSessionTurnInput{RootID: rootID, Key: key}); err != nil {
+		if queue, changed := streamHub.UnfreezeQueuedSessionMessages(key); changed {
+			streamHub.BroadcastSessionQueueUpdated(rootID, key, queue)
+		}
 		log.Printf("[ws] session.queue.send_now.cancel.error root=%s session=%s request=%s err=%v", rootID, key, req.ID, err)
 	}
 }

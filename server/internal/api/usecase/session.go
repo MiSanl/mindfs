@@ -1630,8 +1630,7 @@ func isCanceledTurnError(err error) bool {
 	return strings.Contains(value, "context canceled") ||
 		strings.Contains(value, "context cancelled") ||
 		strings.Contains(value, "turn canceled") ||
-		strings.Contains(value, "turn cancelled") ||
-		strings.Contains(value, "cancelled")
+		strings.Contains(value, "turn cancelled")
 }
 
 func isNonRecoverableAgentError(err error) bool {
