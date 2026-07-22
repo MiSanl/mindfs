@@ -2292,7 +2292,7 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 			return err
 		}
 		if binding != nil && strings.TrimSpace(binding.ProviderID) != "" {
-			return errors.New("session is provider-bound and cannot run with the global agent configuration")
+			return errors.New("session_provider_mismatch: session is provider-bound and cannot run with the global agent configuration; use a session that has system global provider or create a new kanban-bound session")
 		}
 	} else {
 		binding, providerConfig, err = s.resolveSessionProvider(ctx, manager, current, in.Agent, in.ProviderID, in.AllowProviderBind)
