@@ -631,7 +631,7 @@ func (h *WSHandler) handleSessionMessage(ctx context.Context, conn *websocket.Co
 					h.sendWSError(conn, clientID, req.ID, "session.plan_mode_failed", updateErr.Error())
 					return
 				}
-				h.switchSessionRuntimePlanMode(ctx, key, current, true)
+				h.switchSessionRuntimePlanMode(ctx, rootID, key, current, true)
 				updated, getErr := manager.Get(ctx, key, 0)
 				if getErr == nil && updated != nil {
 					current = updated
@@ -813,7 +813,7 @@ func (h *WSHandler) handleSessionPlanModeSet(ctx context.Context, conn *websocke
 		return
 	}
 	if previous != enabled {
-		h.switchSessionRuntimePlanMode(ctx, key, current, enabled)
+		h.switchSessionRuntimePlanMode(ctx, rootID, key, current, enabled)
 	}
 	updated, err := manager.Get(ctx, key, 0)
 	if err != nil {
@@ -825,10 +825,13 @@ func (h *WSHandler) handleSessionPlanModeSet(ctx context.Context, conn *websocke
 	_ = h.writeWSJSON(clientID, conn, buildSessionDoneResponse(rootID, key, requestID, false))
 }
 
-func wsAgentPoolSessionKey(sessionKey, agentName string) string {
+func wsAgentPoolSessionKey(rootID, sessionKey, agentName string) string {
 	sessionKey = strings.TrimSpace(sessionKey)
 	if sessionKey == "" {
 		return ""
+	}
+	if root := strings.TrimSpace(rootID); root != "" {
+		sessionKey = root + "::" + sessionKey
 	}
 	agentName = strings.TrimSpace(agentName)
 	if agentName == "" {
@@ -837,7 +840,7 @@ func wsAgentPoolSessionKey(sessionKey, agentName string) string {
 	return strings.ToLower(agentName) + "-" + sessionKey
 }
 
-func (h *WSHandler) switchSessionRuntimePlanMode(ctx context.Context, key string, current *session.Session, enabled bool) {
+func (h *WSHandler) switchSessionRuntimePlanMode(ctx context.Context, rootID, key string, current *session.Session, enabled bool) {
 	if h == nil || h.AppContext == nil || current == nil {
 		return
 	}
@@ -846,9 +849,9 @@ func (h *WSHandler) switchSessionRuntimePlanMode(ctx context.Context, key string
 		return
 	}
 	agentName := session.InferAgentFromSession(current)
-	if runtime, ok := pool.Get(wsAgentPoolSessionKey(key, agentName)); ok {
+	if runtime, ok := pool.Get(wsAgentPoolSessionKey(rootID, key, agentName)); ok {
 		if err := runtime.SetPlanMode(ctx, enabled); err != nil {
-			log.Printf("[session/plan] runtime.switch.error session=%s agent=%s plan_mode=%t err=%v", key, agentName, enabled, err)
+			log.Printf("[session/plan] runtime.switch.error root=%s session=%s agent=%s plan_mode=%t err=%v", rootID, key, agentName, enabled, err)
 		}
 	}
 }

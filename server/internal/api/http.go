@@ -919,7 +919,7 @@ func (h *HTTPHandler) sessionResponseWithBindings(ctx context.Context, rootID, k
 	}
 	response["agent_bindings"] = public
 	if pool := h.AppContext.GetAgentPool(); pool != nil {
-		runtimes := pool.ListRuntimeInfoForMindFSSession(key)
+		runtimes := pool.ListRuntimeInfoForMindFSSession(key, rootID)
 		if len(runtimes) > 0 {
 			items := make([]map[string]any, 0, len(runtimes))
 			for _, rt := range runtimes {

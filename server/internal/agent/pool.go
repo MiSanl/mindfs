@@ -385,15 +385,25 @@ func (p *Pool) GetRuntimeInfo(sessionKey string) (RuntimeSessionInfo, bool) {
 }
 
 // ListRuntimeInfoForMindFSSession returns live runtimes for a MindFS session key.
-func (p *Pool) ListRuntimeInfoForMindFSSession(mindfsSessionKey string) []RuntimeSessionInfo {
+func (p *Pool) ListRuntimeInfoForMindFSSession(mindfsSessionKey string, rootID ...string) []RuntimeSessionInfo {
 	mindfsSessionKey = strings.TrimSpace(mindfsSessionKey)
 	if mindfsSessionKey == "" {
 		return nil
+	}
+	root := ""
+	if len(rootID) > 0 {
+		root = strings.TrimSpace(rootID[0])
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	out := make([]RuntimeSessionInfo, 0)
 	for poolKey, entry := range p.sessions {
+		if root != "" && !strings.Contains(poolKey, root+"::"+mindfsSessionKey) && !strings.HasSuffix(poolKey, "-"+mindfsSessionKey) {
+			// When root is known, require root-scoped keys (or legacy bare suffix).
+			if !strings.Contains(poolKey, root+"::") {
+				continue
+			}
+		}
 		if entry == nil || entry.session == nil {
 			continue
 		}

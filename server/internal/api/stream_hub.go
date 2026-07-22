@@ -862,7 +862,7 @@ func (h *StreamHub) ReplayPending(rootID, clientID, sessionKey string) {
 
 	h.replayQueueToClient(rootID, clientID, sessionKey)
 	for {
-		step := h.collectReplayStep(clientID, sessionKey)
+		step := h.collectReplayStep(rootID, clientID, sessionKey)
 		h.replayStepToClient(rootID, clientID, sessionKey, step.events)
 		if step.live {
 			h.replayCompletionToClient(rootID, clientID, sessionKey)
@@ -1044,19 +1044,19 @@ func (h *StreamHub) getConnLock(conn *websocket.Conn) *sync.Mutex {
 	return created
 }
 
-func (h *StreamHub) collectReplayStep(clientID, sessionKey string) replayStep {
+func (h *StreamHub) collectReplayStep(rootID, clientID, sessionKey string) replayStep {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	return h.nextReplayStepLocked(clientID, sessionKey)
+	return h.nextReplayStepLocked(rootID, clientID, sessionKey)
 }
 
-func (h *StreamHub) nextReplayStepLocked(clientID, sessionKey string) replayStep {
+func (h *StreamHub) nextReplayStepLocked(rootID, clientID, sessionKey string) replayStep {
 	clientKey := pendingClientKey(clientID, sessionKey)
 	replay := h.replayStates[clientKey]
 	if replay == nil {
 		return replayStep{live: true}
 	}
-	state := h.getPendingStateLocked("", sessionKey)
+	state := h.getPendingStateLocked(rootID, sessionKey)
 	if state == nil {
 		replay.Status = ClientStreamStatusLive
 		return replayStep{live: true}
