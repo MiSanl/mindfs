@@ -17,6 +17,7 @@ import (
 	"mindfs/server/internal/api/usecase"
 	"mindfs/server/internal/commandexec"
 	"mindfs/server/internal/e2ee"
+	"mindfs/server/internal/feishunotify"
 	"mindfs/server/internal/fs"
 	"mindfs/server/internal/githubimport"
 	"mindfs/server/internal/gitview"
@@ -48,6 +49,7 @@ type AppContext struct {
 	E2EE      *e2ee.Manager
 	WebPush   *webpush.Service
 	Notify    *notifyscript.Service
+	Feishu    *feishunotify.Service
 	Prefs     *preferences.Store
 	Scheduled *scheduled.Service
 	Kanban    *kanban.Service
@@ -524,6 +526,10 @@ func (s *AppContext) GetUpdateService() *update.Service {
 
 func (s *AppContext) GetWebPushService() *webpush.Service {
 	return s.WebPush
+}
+
+func (s *AppContext) GetFeishuService() *feishunotify.Service {
+	return s.Feishu
 }
 
 func (s *AppContext) GetGitHubImportService() *githubimport.Service {
@@ -1166,6 +1172,9 @@ func (s *AppContext) notifyPayload(ctx context.Context, eventID string, payload 
 	}
 	if s.Notify != nil && s.Notify.Enabled() {
 		s.Notify.NotifyPayload(ctx, payload)
+	}
+	if s.Feishu != nil && s.Feishu.Enabled() {
+		s.Feishu.NotifyPayload(ctx, payload)
 	}
 }
 
