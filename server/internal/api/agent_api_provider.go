@@ -701,7 +701,7 @@ func switchAgentAPIProvider(req agentAPIProviderSwitchRequest, app *AppContext) 
 }
 
 // ensureSelectedAPIProviderApplied checks that the agent's last_config api_provider
-// matches the effective runtime endpoint. On mismatch it re-applies once.
+// matches the effective runtime endpoint. On mismatch it returns an error only.
 func ensureSelectedAPIProviderApplied(agentName string, app *AppContext) error {
 	agentName = strings.TrimSpace(agentName)
 	if agentName == "" || app == nil {
@@ -749,13 +749,19 @@ func selectedProviderMatchesEffective(agentName string, provider agentAPIProvide
 	wantOpenAI := openAIModelsBaseURL(provider.BaseURL)
 	switch normalizedAPIProviderAgent(agentName) {
 	case "claude":
-		env := map[string]string{}
-		if app != nil && app.GetAgentPool() != nil {
-			env = app.GetAgentPool().GetAgentEnv(agentName)
+		// Claude CLI reads ~/.claude/settings.json env; pool env is secondary and
+		// is cleared when the process is killed after provider switch.
+		got, err := readClaudeSettingsBaseURL()
+		if err != nil || strings.TrimSpace(got) == "" {
+			if app != nil && app.GetAgentPool() != nil {
+				env := app.GetAgentPool().GetAgentEnv(agentName)
+				if v := strings.TrimSpace(env["ANTHROPIC_BASE_URL"]); v != "" {
+					got = v
+				}
+			}
 		}
-		got := strings.TrimSpace(env["ANTHROPIC_BASE_URL"])
-		if got == "" {
-			return false, "missing ANTHROPIC_BASE_URL in agent env"
+		if strings.TrimSpace(got) == "" {
+			return false, "missing ANTHROPIC_BASE_URL in ~/.claude/settings.json"
 		}
 		if normalizeURLForCompare(got) != normalizeURLForCompare(wantClaude) {
 			return false, "ANTHROPIC_BASE_URL=" + got
@@ -772,7 +778,7 @@ func selectedProviderMatchesEffective(agentName string, provider agentAPIProvide
 			}
 		}
 		if strings.TrimSpace(got) == "" {
-			return false, "pending_process_reopen"
+			return false, "missing codex base_url in config.toml for selected provider"
 		}
 		if normalizeURLForCompare(got) != normalizeURLForCompare(wantOpenAI) {
 			return false, "codex base_url=" + got
@@ -808,6 +814,30 @@ func normalizeURLForCompare(raw string) string {
 	raw = strings.TrimSpace(strings.ToLower(raw))
 	raw = strings.TrimRight(raw, "/")
 	return raw
+}
+
+func readClaudeSettingsBaseURL() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	settingsPath := filepath.Join(home, ".claude", "settings.json")
+	b, err := os.ReadFile(settingsPath)
+	if err != nil {
+		return "", err
+	}
+	var settings map[string]any
+	if err := json.Unmarshal(b, &settings); err != nil {
+		return "", err
+	}
+	env, _ := settings["env"].(map[string]any)
+	if env == nil {
+		return "", fmt.Errorf("env missing")
+	}
+	if v, ok := env["ANTHROPIC_BASE_URL"].(string); ok {
+		return strings.TrimSpace(v), nil
+	}
+	return "", fmt.Errorf("ANTHROPIC_BASE_URL missing")
 }
 
 func readCodexProviderBaseURL(providerTable string) (string, error) {

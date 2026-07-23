@@ -2143,8 +2143,10 @@ func SessionProviderIsolationAgent(agentName string) bool {
 
 func sessionProviderIsolationAgent(agentName string) bool {
 	_ = agentName
-	// Per-session provider isolation removed: never inject session-scoped
-	// provider env/args or bind providers onto mindfs sessions.
+	// HARD OFF for this delivery line. Remaining call sites are tripwires only:
+	// resume fail-without-fallback, UseGlobalAgentConfig mismatch, login gates,
+	// ProviderSelectionValidator, and WS allowProviderBind. Do not re-enable
+	// without restoring full session-scoped RuntimeEnv injection.
 	return false
 }
 
