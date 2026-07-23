@@ -2555,7 +2555,10 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 	if current.Type == session.TypeCommand {
 		return s.sendCommandMessage(turnCtx, in, manager, current)
 	}
-	if strings.TrimSpace(in.ProviderID) != "" && ProviderSelectionValidator != nil {
+	// Isolation-off: provider_id on the wire is ignored for runtime env injection.
+	// Do not hard-fail SendMessage when the client still echoes a legacy bound
+	// provider (or a deleted provider id) after isolation was disabled.
+	if sessionProviderIsolationAgent(in.Agent) && strings.TrimSpace(in.ProviderID) != "" && ProviderSelectionValidator != nil {
 		if err := ProviderSelectionValidator(in.Agent, in.Model, in.ProviderID); err != nil {
 			return err
 		}
