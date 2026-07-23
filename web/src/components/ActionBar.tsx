@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { type SessionMode } from "./ModeSelector";
 import { ModeSelector } from "./ModeSelector";
-import { AgentModelSelector } from "./AgentModelSelector";
+import { AgentSelector } from "./AgentSelector";
 import { fetchAgents, fetchShells, restartAgent, type AgentStatus, type ShellStatus } from "../services/agents";
 import { fetchCandidates, type CandidateItem } from "../services/candidates";
 import { reportError } from "../services/error";
@@ -1310,11 +1310,7 @@ export function ActionBar({
       ? t(blurPlaceholderKey)
       : t(modePlaceholderKeys[mode]);
   // Agent/model/mode/effort/fast 合并为单控件后，右侧工具栏最紧凑；runtime 已移出输入框。
-  const editorRightInset = isMultiLine
-    ? 14
-    : mode === "command"
-      ? isMobile ? 92 : 116
-      : isMobile ? 118 : 148;
+  const editorRightInset = isMultiLine ? 14 : mode === "command" ? (isMobile ? 92 : 116) : isMobile ? 124 : 148;
   const editorBottomInset = isMultiLine ? 44 : 12;
   const editorMinHeight = 44;
   const mobileFileSidebarButton = isMobile ? (
@@ -1880,84 +1876,31 @@ export function ActionBar({
 
               <ModeSelector mode={mode} onModeChange={setMode} compact={true} disabled={isModeLocked} />
               {mode !== "command" ? (
-                <div style={{ display: "flex", alignItems: "center", minWidth: 0 }}>
-                  <AgentModelSelector
+                <div>
+                  <AgentSelector
                     agent={agent}
-                    agents={agents}
                     model={model}
                     mode={agentMode}
                     effort={effort}
                     fastService={fastService}
+                    agents={agents}
                     compact={true}
                     warnUnavailable={isSelectedAgentUnavailable}
-                    maxButtonWidth={isMobile ? "min(42vw, 168px)" : "210px"}
-                    onAgentChange={(nextAgent) => {
-                      const prevAgent = agent;
+                    onAgentChange={(nextAgent, nextModel) => {
                       const nextStatus = agents.find((item) => item.name === nextAgent);
                       const defaults = getAgentDefaults(nextStatus);
                       setAgent(nextAgent);
-                      setModel(defaults.model);
+                      setModel(nextModel || defaults.model);
                       setAgentMode("");
-                      setEffort(getModelDefaultEffort(nextStatus, defaults.model));
+                      setEffort(getModelDefaultEffort(nextStatus, nextModel || defaults.model));
                       setFastService(defaults.fastService);
-                      if (nextAgent && nextAgent !== prevAgent) {
-                        reportError(
-                          "agent.switched",
-                          t("session.runtime.willUse", { agent: nextAgent }),
-                          {
-                            severity: "info",
-                            recoverable: false,
-                            details: { from: prevAgent, to: nextAgent },
-                          },
-                        );
-                        if (nextStatus && nextStatus.available === false) {
-                          reportError("agent.unavailable", undefined, {
-                            details: { agent: nextAgent },
-                          });
-                        }
-                      }
-                    }}
-                    onModelChange={(nextModel) => {
-                      const defaults = getAgentDefaults(selectedAgent);
-                      setModel(nextModel);
-                      setAgentMode("");
-                      setEffort(getModelDefaultEffort(selectedAgent, nextModel));
-                      setFastService(defaults.fastService);
-                    }}
-                    onAgentModelChange={(nextAgent, nextModel) => {
-                      const prevAgent = agent;
-                      const nextStatus = agents.find((item) => item.name === nextAgent) || null;
-                      const defaults = getAgentDefaults(nextStatus);
-                      const modelID = nextModel || defaults.model;
-                      setAgent(nextAgent);
-                      setModel(modelID);
-                      setAgentMode("");
-                      setEffort(getModelDefaultEffort(nextStatus, modelID));
-                      setFastService(defaults.fastService);
-                      if (nextAgent && nextAgent !== prevAgent) {
-                        reportError(
-                          "agent.switched",
-                          t("session.runtime.willUse", { agent: nextAgent }),
-                          {
-                            severity: "info",
-                            recoverable: false,
-                            details: { from: prevAgent, to: nextAgent },
-                          },
-                        );
-                        if (nextStatus && nextStatus.available === false) {
-                          reportError("agent.unavailable", undefined, {
-                            details: { agent: nextAgent },
-                          });
-                        }
-                      }
                     }}
                     onModeChange={(nextAgentMode) => setAgentMode(nextAgentMode || "")}
                     onEffortChange={(nextEffort) => setEffort(nextEffort || "")}
                     onFastServiceChange={(nextFastService) => setFastService(nextFastService || "")}
-                    onAgentRestart={async (targetAgent) => {
-                      await restartAgent(targetAgent);
-                      const items = await fetchAgents(true);
-                      setAgents(items);
+                    onAgentRestart={async (target) => {
+                      await restartAgent(target);
+                      await refreshAgents();
                     }}
                   />
                   {mindfsSessionID ? (
