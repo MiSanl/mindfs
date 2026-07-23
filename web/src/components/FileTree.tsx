@@ -713,13 +713,21 @@ function AgentConfigPopover({
               selectedAgent={selectedAgent}
               maxHeight="220px"
               renderEnd={(agent) => {
+                // When no API-provider/backup is stored, surface the global default
+                // so the switch UI matches send-path fallback behavior.
+                const selectionType = String(agent.last_config_selection?.type || "").trim();
                 const name = String(agent.last_config_selection?.name || "").trim();
-                if (!name) {
-                  return null;
-                }
+                const label =
+                  selectionType === "api_provider" || selectionType === "backup"
+                    ? name || selectionType
+                    : t("agentConfig.systemGlobal");
+                const title =
+                  selectionType === "api_provider" || selectionType === "backup"
+                    ? t("agentConfig.lastSelected", { name: label })
+                    : t("agentConfig.systemGlobalHint");
                 return (
                   <span
-                    title={t("agentConfig.lastSelected", { name })}
+                    title={title}
                     style={{
                       maxWidth: "120px",
                       minWidth: 0,
@@ -731,7 +739,7 @@ function AgentConfigPopover({
                       color: agent.name === selectedAgent ? "var(--accent-color)" : "var(--text-secondary)",
                     }}
                   >
-                    {name}
+                    {label}
                   </span>
                 );
               }}
