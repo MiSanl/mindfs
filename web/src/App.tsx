@@ -6386,6 +6386,21 @@ export function App({ onGoHome }: AppProps) {
       const now = new Date().toISOString();
       const requestId = sessionService.createRequestId("msg");
       const tempKey = sendSessionKey ? "" : session?.key || "";
+      // Immediate "actual request" snapshot for UI (before server round-trip).
+      // Prefer the agent's last_config_selection api_provider; empty => system_global.
+      const sendProviderSel = (availableAgentsRef.current || []).find(
+        (item) => item.name === effectiveAgent,
+      )?.last_config_selection as
+        | { type?: string; id?: string; name?: string }
+        | undefined;
+      const sendProviderID =
+        sendProviderSel?.type === "api_provider"
+          ? String(sendProviderSel.id || "").trim()
+          : "";
+      const sendProviderName =
+        sendProviderSel?.type === "api_provider"
+          ? String(sendProviderSel.name || sendProviderSel.id || "").trim()
+          : "";
       const userEx: Exchange = {
         role: "user",
         agent: effectiveAgent,
@@ -6396,6 +6411,21 @@ export function App({ onGoHome }: AppProps) {
         content: message,
         timestamp: now,
         pending_ack: true,
+        provider_id: sendProviderID || undefined,
+        provider_name: sendProviderName || undefined,
+      } as Exchange;
+      // Optimistic turn-request chip so it shows right after send, not after reply.
+      const optimisticTurnRequest = {
+        id: `turn-local-${requestId}`,
+        kind: "turn_request",
+        code: "session.turn_request",
+        after_seq: 0, // filled after we know seq; UI also falls back to exchange fields
+        agent: effectiveAgent,
+        provider_id: sendProviderID || undefined,
+        provider_name: sendProviderName || undefined,
+        model: effectiveModel,
+        message: `request provider=${sendProviderName || "system_global"} model=${effectiveModel || ""}`,
+        timestamp: now,
       };
       if (sendSessionKey) {
         const targetSessionKey = sendSessionKey;
@@ -6442,9 +6472,23 @@ export function App({ onGoHome }: AppProps) {
         const prevExchanges = Array.isArray((cached as any).exchanges)
           ? ((cached as any).exchanges as Exchange[])
           : [];
+        const nextUserSeq =
+          Math.max(
+            0,
+            ...prevExchanges.map((ex) => Number((ex as any)?.seq || 0) || 0),
+          ) + 1;
+        const userExWithSeq = { ...(userEx as any), seq: nextUserSeq };
+        const turnReq = {
+          ...optimisticTurnRequest,
+          after_seq: nextUserSeq,
+        };
+        const prevTurnReqs = Array.isArray((cached as any).turn_requests)
+          ? ([...(cached as any).turn_requests] as any[])
+          : [];
         sessionCacheRef.current[ck] = {
           ...(cached as any),
-          exchanges: [...prevExchanges, userEx],
+          exchanges: [...prevExchanges, userExWithSeq],
+          turn_requests: [...prevTurnReqs, turnReq],
           mode: effectiveAgentMode,
           effort: effectiveEffort,
           fast_service: effectiveFastService,
@@ -6469,9 +6513,11 @@ export function App({ onGoHome }: AppProps) {
           requestId,
           tempKey,
         };
+        const draftTurn = { ...optimisticTurnRequest, after_seq: 1 };
         const draftSession = {
           ...(session as any),
-          exchanges: [userEx],
+          exchanges: [{ ...(userEx as any), seq: 1 }],
+          turn_requests: [draftTurn],
           updated_at: now,
         } as Session;
         if (tempSessionKey) {

@@ -349,6 +349,24 @@ func (p *Pool) SetAgentEnv(agentName string, env map[string]string) error {
 	return errors.New("agent not configured: " + agentName)
 }
 
+// GetAgentEnv returns the effective env map for an agent (runtime overrides + config).
+func (p *Pool) GetAgentEnv(agentName string) map[string]string {
+	if p == nil || strings.TrimSpace(agentName) == "" {
+		return nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if env, ok := p.runtimeEnv[agentName]; ok && len(env) > 0 {
+		return cloneEnv(env)
+	}
+	for i := range p.cfg.Agents {
+		if p.cfg.Agents[i].Name == agentName {
+			return cloneEnv(p.cfg.Agents[i].Env)
+		}
+	}
+	return nil
+}
+
 func (p *Pool) applyRuntimeEnvOverridesLocked(cfg Config) Config {
 	if len(p.runtimeEnv) == 0 {
 		return cfg

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"io"
 	"net/http"
 	"net/url"
@@ -30,7 +31,20 @@ import (
 // mindFSConfigDir is overridable in tests.
 var mindFSConfigDir = configpkg.MindFSConfigDir
 
+// providerConsistencyApp is set from AppContext so SendMessage can verify
+// last_config provider matches the effective agent endpoint.
+var providerConsistencyApp *AppContext
+
+func WireProviderConsistencyChecker(app *AppContext) {
+	providerConsistencyApp = app
+	usecase.ProviderConsistencyChecker = func(agentName string) error {
+		return ensureSelectedAPIProviderApplied(agentName, providerConsistencyApp)
+	}
+}
+
+
 func init() {
+
 	// Allow send/resume to accept models from the active API provider catalog
 	// even when the agent probe ListModels catalog is still native/stale.
 	usecase.AgentAPIProviderModelAllowed = agentModelAllowedByActiveProvider
@@ -686,6 +700,169 @@ func switchAgentAPIProvider(req agentAPIProviderSwitchRequest, app *AppContext) 
 	}
 	triggerAgentConfigSwitchProbe(app, agentName)
 	return provider, nil
+}
+
+// ensureSelectedAPIProviderApplied checks that the agent's last_config api_provider
+// matches the effective runtime endpoint. On mismatch it re-applies once.
+func ensureSelectedAPIProviderApplied(agentName string, app *AppContext) error {
+	agentName = strings.TrimSpace(agentName)
+	if agentName == "" || app == nil {
+		return nil
+	}
+	prefs := app.GetPreferences()
+	if prefs == nil {
+		return nil
+	}
+	sel := prefs.AgentLastConfigSelection(agentName)
+	if sel == nil || !strings.EqualFold(strings.TrimSpace(sel.Type), "api_provider") {
+		return nil
+	}
+	providerID := strings.TrimSpace(sel.ID)
+	if providerID == "" {
+		return nil
+	}
+	providers, err := readAgentAPIProviders()
+	if err != nil {
+		return fmt.Errorf("session_provider_config_unavailable: cannot read providers: %w", err)
+	}
+	var provider *agentAPIProvider
+	for i := range providers {
+		if strings.TrimSpace(providers[i].ID) == providerID {
+			provider = &providers[i]
+			break
+		}
+	}
+	if provider == nil {
+		return fmt.Errorf("session_provider_unavailable: provider %q was deleted; re-select a provider", providerID)
+	}
+	ok, detail := selectedProviderMatchesEffective(agentName, *provider, app)
+	if ok {
+		return nil
+	}
+	log.Printf("[provider/consistency] mismatch agent=%s provider=%s detail=%s action=reapply", agentName, provider.Name, detail)
+	if err := applyAgentAPIProvider(agentName, *provider, app); err != nil {
+		return fmt.Errorf("session_provider_config_mismatch: re-apply failed for %q: %w", provider.Name, err)
+	}
+	if app.GetAgentPool() != nil {
+		app.GetAgentPool().KillAgentProcess(agentName, 0)
+	}
+	ok, detail = selectedProviderMatchesEffective(agentName, *provider, app)
+	if ok || detail == "pending_process_reopen" {
+		return nil
+	}
+	return fmt.Errorf("session_provider_config_mismatch: selected provider %q (%s) does not match effective agent endpoint (%s); re-select the provider in Agent Config", provider.Name, strings.TrimSpace(provider.BaseURL), detail)
+}
+
+func selectedProviderMatchesEffective(agentName string, provider agentAPIProvider, app *AppContext) (bool, string) {
+	wantClaude := anthropicBaseURL(provider.BaseURL)
+	wantOpenAI := openAIModelsBaseURL(provider.BaseURL)
+	switch normalizedAPIProviderAgent(agentName) {
+	case "claude":
+		env := map[string]string{}
+		if app != nil && app.GetAgentPool() != nil {
+			env = app.GetAgentPool().GetAgentEnv(agentName)
+		}
+		got := strings.TrimSpace(env["ANTHROPIC_BASE_URL"])
+		if got == "" {
+			return false, "missing ANTHROPIC_BASE_URL in agent env"
+		}
+		if normalizeURLForCompare(got) != normalizeURLForCompare(wantClaude) {
+			return false, "ANTHROPIC_BASE_URL=" + got
+		}
+		return true, ""
+	case "codex":
+		got, err := readCodexProviderBaseURL(agentAPIProviderConfigName(provider))
+		if err != nil || strings.TrimSpace(got) == "" {
+			if app != nil && app.GetAgentPool() != nil {
+				env := app.GetAgentPool().GetAgentEnv(agentName)
+				if v := strings.TrimSpace(env["OPENAI_BASE_URL"]); v != "" {
+					got = v
+				}
+			}
+		}
+		if strings.TrimSpace(got) == "" {
+			return false, "pending_process_reopen"
+		}
+		if normalizeURLForCompare(got) != normalizeURLForCompare(wantOpenAI) {
+			return false, "codex base_url=" + got
+		}
+		return true, ""
+	default:
+		if app == nil || app.GetAgentPool() == nil {
+			return true, ""
+		}
+		env := app.GetAgentPool().GetAgentEnv(agentName)
+		if len(env) == 0 {
+			return true, ""
+		}
+		for _, key := range []string{"OPENAI_BASE_URL", "ANTHROPIC_BASE_URL", "GOOGLE_GEMINI_BASE_URL", "COPILOT_PROVIDER_BASE_URL"} {
+			if got := strings.TrimSpace(env[key]); got != "" {
+				want := wantOpenAI
+				if key == "ANTHROPIC_BASE_URL" {
+					want = wantClaude
+				} else if key == "GOOGLE_GEMINI_BASE_URL" || key == "COPILOT_PROVIDER_BASE_URL" {
+					want = strings.TrimSpace(provider.BaseURL)
+				}
+				if normalizeURLForCompare(got) != normalizeURLForCompare(want) {
+					return false, key + "=" + got
+				}
+				return true, ""
+			}
+		}
+		return true, ""
+	}
+}
+
+func normalizeURLForCompare(raw string) string {
+	raw = strings.TrimSpace(strings.ToLower(raw))
+	raw = strings.TrimRight(raw, "/")
+	return raw
+}
+
+func readCodexProviderBaseURL(providerTable string) (string, error) {
+	providerTable = strings.TrimSpace(providerTable)
+	if providerTable == "" {
+		return "", fmt.Errorf("provider table required")
+	}
+	dir, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	configPath := filepath.Join(dir, ".codex", "config.toml")
+	b, err := os.ReadFile(configPath)
+	if err != nil {
+		return "", err
+	}
+	section := "[model_providers." + providerTable + "]"
+	text := string(b)
+	idx := strings.Index(text, section)
+	if idx < 0 {
+		section = "[model_providers." + strconv.Quote(providerTable) + "]"
+		idx = strings.Index(text, section)
+	}
+	if idx < 0 {
+		return "", fmt.Errorf("section not found")
+	}
+	rest := text[idx+len(section):]
+	if cut := strings.Index(rest, "\n["); cut >= 0 {
+		rest = rest[:cut]
+	}
+	for _, line := range strings.Split(rest, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "base_url") {
+			continue
+		}
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		val := strings.TrimSpace(parts[1])
+		if unquoted, err := strconv.Unquote(val); err == nil {
+			return strings.TrimSpace(unquoted), nil
+		}
+		return strings.Trim(val, " \"'"), nil
+	}
+	return "", fmt.Errorf("base_url not found")
 }
 
 func applyAgentAPIProvider(agentName string, provider agentAPIProvider, app *AppContext) error {

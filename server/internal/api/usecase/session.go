@@ -1092,6 +1092,10 @@ type SessionProviderConfig struct {
 // returned environment is used in memory to open Claude/Codex and is never
 // persisted to session metadata or exposed through WebSocket responses.
 var SessionProviderResolver func(agentName, providerID string) (*SessionProviderConfig, error)
+// ProviderConsistencyChecker optionally verifies last_config provider matches
+// the effective agent endpoint before SendMessage. Wired by the API layer.
+var ProviderConsistencyChecker func(agentName string) error
+
 var ProviderSelectionValidator func(agentName, model, providerID string) error
 
 // RuntimeStateNotifier optionally surfaces per-session agent runtime open/close state.
@@ -2398,6 +2402,11 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 	}
 	if err != nil {
 		return err
+	}
+	if ProviderConsistencyChecker != nil {
+		if err := ProviderConsistencyChecker(in.Agent); err != nil {
+			return err
+		}
 	}
 	resolvedRequestedModel := resolveRuntimeModel(in.Agent, current, nil, in.Model)
 	if err := s.validateAgentModelForProvider(in.Agent, resolvedRequestedModel, providerConfig); err != nil {

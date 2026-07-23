@@ -284,12 +284,14 @@ function formatAssistantExchangeMeta(
   if (item.type !== "assistant_text") {
     return "";
   }
-  const provider = `${item.providerName || (item as any).provider_name || item.providerId || (item as any).provider_id || ""}`.trim();
+  const providerRaw = `${item.providerName || (item as any).provider_name || item.providerId || (item as any).provider_id || ""}`.trim();
+  // No api_provider on the exchange snapshot => system/native agent config.
+  const provider = providerRaw || "system_global";
   const modelLabel =
     `${item.modelDisplayName || ""}`.trim() ||
     modelDisplayName(agents, item.agent, item.model);
   const parts = [
-    provider || null,
+    provider,
     modelLabel || null,
     item.effort,
   ]
