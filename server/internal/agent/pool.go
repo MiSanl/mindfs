@@ -61,6 +61,11 @@ func NewPool(cfg Config) *Pool {
 	}
 }
 
+// OpenSessionHook, when set, replaces openSession for GetOrCreate. Tests use this
+// to inject fake agent sessions and exercise SendMessage paths without real agents.
+// Production code must leave this nil.
+var OpenSessionHook func(ctx context.Context, in agenttypes.OpenSessionInput) (agenttypes.Session, error)
+
 // GetOrCreate returns an existing session handle or creates a new one.
 func (p *Pool) GetOrCreate(ctx context.Context, in agenttypes.OpenSessionInput) (agenttypes.Session, error) {
 	if in.SessionKey == "" {
@@ -94,7 +99,13 @@ func (p *Pool) GetOrCreate(ctx context.Context, in agenttypes.OpenSessionInput) 
 	p.mu.Unlock()
 
 	// openSession starts subprocesses and can be slow, so keep it outside the pool lock.
-	sess, err := p.openSession(ctx, protocol, def, in)
+	var sess agenttypes.Session
+	var err error
+	if OpenSessionHook != nil {
+		sess, err = OpenSessionHook(ctx, in)
+	} else {
+		sess, err = p.openSession(ctx, protocol, def, in)
+	}
 	if err != nil {
 		return nil, err
 	}

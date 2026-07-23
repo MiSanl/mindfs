@@ -2161,6 +2161,7 @@ func TestForceCancelSessionTurnIfCurrentSkipsReplacementTurn(t *testing.T) {
 type commandTestRegistry struct {
 	root    rootfs.RootInfo
 	manager *session.Manager
+	pool    *agent.Pool
 }
 
 func (r *commandTestRegistry) GetRoot(rootID string) (rootfs.RootInfo, error) {
@@ -2191,7 +2192,7 @@ func (r *commandTestRegistry) ListRoots() []rootfs.RootInfo {
 }
 
 func (r *commandTestRegistry) GetAgentPool() *agent.Pool {
-	return nil
+	return r.pool
 }
 
 func (r *commandTestRegistry) GetPreferences() *preferences.Store {
