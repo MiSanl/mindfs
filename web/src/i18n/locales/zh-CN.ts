@@ -377,6 +377,8 @@ export const zhCN = {
   "session.messageSendFailedNotReady": "消息发送失败：连接未就绪，请稍后重试",
   "session.messageSendFailed": "消息发送失败",
   "session.copySessionId": "复制会话 ID",
+  "session.errorExpand": "展开",
+  "session.errorCollapse": "折叠",
   "session.errorPanelTitle": "发送失败",
   "session.errorsTitle": "会话错误记录",
   "session.turnRequest": "实际请求",

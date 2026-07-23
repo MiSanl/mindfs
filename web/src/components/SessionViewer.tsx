@@ -1096,6 +1096,12 @@ function SessionViewerInner({
     ? ((session as any).errors as Array<Record<string, any>>)
     : [];
 
+  // Error panels: historical default collapsed; newly arrived errors during this
+  // mounted session view default expanded. Refresh/remount resets to collapsed.
+  const [errorPanelExpanded, setErrorPanelExpanded] = React.useState<Record<string, boolean>>({});
+  const seenErrorPanelIdsRef = React.useRef<Set<string>>(new Set());
+  const seededErrorsRef = React.useRef(false);
+
   const sessionTurnRequests = Array.isArray((session as any)?.turn_requests)
     ? ((session as any).turn_requests as Array<Record<string, any>>)
     : [];
@@ -1123,53 +1129,114 @@ function SessionViewerInner({
 
   const renderInlineSessionErrorPanel = (items: Array<Record<string, any>>, keyPrefix: string) => {
     if (!items.length) return null;
+    const panelKey = keyPrefix;
+    const expanded = errorPanelExpanded[panelKey] === true;
+    const first = items[0] || {};
+    const summaryMessage = String(first.message || t("session.errorPanelTitle"));
+    const summaryShort =
+      summaryMessage.length > 96 ? `${summaryMessage.slice(0, 96)}…` : summaryMessage;
+
     return (
       <div
-        key={keyPrefix}
+        key={panelKey}
         style={{
           marginTop: "8px",
           border: "1px solid color-mix(in srgb, var(--danger-color, #d14343) 45%, var(--border-color))",
           background: "color-mix(in srgb, var(--danger-color, #d14343) 8%, var(--panel-bg, var(--bg-color)))",
           borderRadius: "10px",
-          padding: "10px 12px",
+          padding: "8px 10px",
           width: "100%",
           boxSizing: "border-box",
         }}
       >
-        {items.map((item, index) => {
-          const key = String(item.id || item.request_id || `${keyPrefix}-${index}`);
-          const ts = item.timestamp ? String(item.timestamp) : "";
-          return (
-            <div
-              key={key}
-              style={{
-                borderTop: index === 0 ? "none" : "1px solid var(--border-color)",
-                paddingTop: index === 0 ? 0 : 8,
-                fontSize: "12px",
-                color: "var(--text-primary)",
-                whiteSpace: "pre-wrap",
-                wordBreak: "break-word",
-              }}
-            >
-              <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", marginBottom: 4, color: "var(--text-secondary)" }}>
-                <span>{t("session.errorPanelTitle")}</span>
-                {item.agent ? <span>{String(item.agent)}</span> : null}
-                {(item as any).provider_name || (item as any).provider_id ? (
-                  <span>{String((item as any).provider_name || (item as any).provider_id)}</span>
-                ) : null}
-                {item.model ? <span>{String(item.model)}</span> : null}
-                {item.recoverable ? <span>{t("session.errorRecoverable")}</span> : null}
-                {ts ? <span>{ts}</span> : null}
-              </div>
-              <div>{String(item.message || "")}</div>
-              {item.request_id ? (
-                <div style={{ marginTop: 4, color: "var(--text-secondary)" }}>
-                  request: {String(item.request_id)}
+        <button
+          type="button"
+          onClick={() =>
+            setErrorPanelExpanded((prev) => ({
+              ...prev,
+              [panelKey]: !expanded,
+            }))
+          }
+          style={{
+            all: "unset",
+            cursor: "pointer",
+            display: "flex",
+            width: "100%",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: "8px",
+            color: "var(--danger-color, #d14343)",
+            fontSize: "12px",
+            fontWeight: 600,
+            boxSizing: "border-box",
+          }}
+          aria-expanded={expanded}
+          title={expanded ? t("session.errorCollapse") : t("session.errorExpand")}
+        >
+          <span
+            style={{
+              minWidth: 0,
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: expanded ? "normal" : "nowrap",
+              flex: 1,
+            }}
+          >
+            {expanded
+              ? t("session.errorPanelTitle")
+              : `${t("session.errorPanelTitle")} · ${summaryShort}`}
+          </span>
+          <span style={{ flexShrink: 0, color: "var(--text-secondary)", fontWeight: 500 }}>
+            {expanded ? `${t("session.errorCollapse")} ▾` : `${t("session.errorExpand")} ▸`}
+          </span>
+        </button>
+        {expanded ? (
+          <div style={{ marginTop: "8px", display: "grid", gap: "8px" }}>
+            {items.map((item, index) => {
+              const key = String(item.id || item.request_id || `${keyPrefix}-${index}`);
+              const ts = item.timestamp ? String(item.timestamp) : "";
+              return (
+                <div
+                  key={key}
+                  style={{
+                    borderTop: "1px solid var(--border-color)",
+                    paddingTop: 8,
+                    fontSize: "12px",
+                    color: "var(--text-primary)",
+                    whiteSpace: "pre-wrap",
+                    wordBreak: "break-word",
+                  }}
+                >
+                  <div
+                    style={{
+                      display: "flex",
+                      gap: "8px",
+                      flexWrap: "wrap",
+                      marginBottom: 4,
+                      color: "var(--text-secondary)",
+                    }}
+                  >
+                    {item.agent ? <span>{String(item.agent)}</span> : null}
+                    {(item as any).provider_name || (item as any).provider_id ? (
+                      <span>
+                        {String((item as any).provider_name || (item as any).provider_id)}
+                      </span>
+                    ) : null}
+                    {item.model ? <span>{String(item.model)}</span> : null}
+                    {item.recoverable ? <span>{t("session.errorRecoverable")}</span> : null}
+                    {ts ? <span>{ts}</span> : null}
+                  </div>
+                  <div>{String(item.message || "")}</div>
+                  {item.request_id ? (
+                    <div style={{ marginTop: 4, color: "var(--text-secondary)" }}>
+                      request: {String(item.request_id)}
+                    </div>
+                  ) : null}
                 </div>
-              ) : null}
-            </div>
-          );
-        })}
+              );
+            })}
+          </div>
+        ) : null}
       </div>
     );
   };
@@ -1195,6 +1262,61 @@ function SessionViewerInner({
       </div>
     );
   };
+
+  React.useEffect(() => {
+    seededErrorsRef.current = false;
+    seenErrorPanelIdsRef.current = new Set();
+    setErrorPanelExpanded({});
+  }, [sessionKey]);
+
+  React.useEffect(() => {
+    const panelIds: Array<{ panelKey: string; identity: string }> = [];
+    errorsByAfterSeq.forEach((items, seq) => {
+      const itemKeys = items.map((item, index) =>
+        String(item.id || item.request_id || `err-${seq}-${index}`),
+      );
+      panelIds.push({
+        panelKey: `err-${seq}`,
+        identity: itemKeys.join("|") || `err-${seq}`,
+      });
+    });
+    if (!panelIds.length) return;
+
+    if (!seededErrorsRef.current) {
+      for (const panel of panelIds) {
+        seenErrorPanelIdsRef.current.add(panel.identity);
+      }
+      seededErrorsRef.current = true;
+      setErrorPanelExpanded((prev) => {
+        const next = { ...prev };
+        let changed = false;
+        for (const panel of panelIds) {
+          if (next[panel.panelKey] === undefined) {
+            next[panel.panelKey] = false;
+            changed = true;
+          }
+        }
+        return changed ? next : prev;
+      });
+      return;
+    }
+
+    const newcomers = panelIds.filter(
+      (panel) => !seenErrorPanelIdsRef.current.has(panel.identity),
+    );
+    if (!newcomers.length) return;
+    for (const panel of newcomers) {
+      seenErrorPanelIdsRef.current.add(panel.identity);
+    }
+    setErrorPanelExpanded((prev) => {
+      const next = { ...prev };
+      for (const panel of newcomers) {
+        next[panel.panelKey] = true;
+      }
+      return next;
+    });
+  }, [errorsByAfterSeq, sessionKey]);
+
   const { timeline, isStreaming, streamVersion, streamStatusText } = useSessionStream(
     sessionKey,
     exchanges,
