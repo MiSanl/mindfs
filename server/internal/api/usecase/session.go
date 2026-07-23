@@ -1568,6 +1568,9 @@ const autoCompactPrompt = "/compact\nPlease compact this conversation to free co
 // Mid-turn overflow (after some assistant chunks) is allowed: partial output is
 // already in pending aux/responseText, and retry continues the turn after compact.
 // Callers may still pass sawAssistantChunk for logging/metrics; it no longer blocks.
+// TODO(opencode-context-ui): Ensure OpenCode/ACP usage/context window fields are
+// populated on agent updates so the frontend ContextWindowBadge can show live
+// context pressure for opencode sessions (not only overflow recovery).
 func shouldAttemptContextOverflowCompact(sendErr error, agentName string, _sawAssistantChunk bool) bool {
 	return sendErr != nil &&
 		!isCanceledTurnError(sendErr) &&

@@ -378,6 +378,7 @@ export const enUS = {
   "session.commandSendFailedNotReady": "Command send failed: connection is not ready. Try again later.",
   "session.messageSendFailedNotReady": "Message send failed: connection is not ready. Try again later.",
   "session.messageSendFailed": "Failed to send message",
+  "session.copySessionId": "Copy session ID",
   "session.errorsTitle": "Session diagnostics / errors",
   "session.turnRequest": "actual request",
   "session.errorsEmpty": "No recorded errors",

@@ -1876,7 +1876,7 @@ export function ActionBar({
 
               <ModeSelector mode={mode} onModeChange={setMode} compact={true} disabled={isModeLocked} />
               {mode !== "command" ? (
-                <div>
+                <>
                   <AgentSelector
                     agent={agent}
                     model={model}
@@ -1907,14 +1907,27 @@ export function ActionBar({
                     <button
                       type="button"
                       onClick={copySessionID}
-                      title="Copy MindFS session ID"
-                      aria-label="Copy MindFS session ID"
-                      style={{ width: "28px", height: "28px", borderRadius: "8px", border: "none", background: "transparent", color: "var(--text-secondary)", display: "inline-flex", alignItems: "center", justifyContent: "center", cursor: "pointer" }}
+                      title={t("session.copySessionId")}
+                      aria-label={t("session.copySessionId")}
+                      style={{
+                        width: "28px",
+                        height: "28px",
+                        borderRadius: "8px",
+                        border: "none",
+                        background: "transparent",
+                        color: "var(--text-secondary)",
+                        display: "inline-flex",
+                        alignItems: "center",
+                        justifyContent: "center",
+                        cursor: "pointer",
+                        flexShrink: 0,
+                        marginLeft: "2px",
+                      }}
                     >
                       <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="9" y="9" width="11" height="11" rx="2" /><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" /></svg>
                     </button>
                   ) : null}
-                </div>
+                </>
               ) : (
                 <ShellSelector
                   shell={shell}
