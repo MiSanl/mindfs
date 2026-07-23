@@ -5340,6 +5340,9 @@ export function App({ onGoHome }: AppProps) {
         }
       } catch (err) {
         setSelectedSessionLoading(false);
+      } finally {
+        // Durable error logs are not part of list/cache payloads. Always fetch.
+        refreshSessionErrors();
       }
     },
     [
