@@ -88,6 +88,7 @@ export const enUS = {
   "fileTree.swapSidebars": "Swap sidebars",
   "fileTree.sideBySideDiff": "Side-by-side diff",
   "fileTree.enterKeySend": "Enter sends",
+  "fileTree.showTurnRequest": "Show actual request (provider/model)",
   "fileTree.emptyProjectHint": "Add a project from the menu above to start vibing",
   "fileTree.hideUpdateNotes": "Hide update notes",
   "fileTree.showUpdateNotes": "Show update notes",

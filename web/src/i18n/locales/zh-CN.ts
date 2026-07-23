@@ -86,6 +86,7 @@ export const zhCN = {
   "fileTree.swapSidebars": "交换左右侧边栏",
   "fileTree.sideBySideDiff": "双栏 diff 视图",
   "fileTree.enterKeySend": "回车键发送",
+  "fileTree.showTurnRequest": "展示实际请求（provider/model）",
   "fileTree.emptyProjectHint": "通过上面菜单中的添加项目，添加一个项目开始 vibe 吧",
   "fileTree.hideUpdateNotes": "隐藏更新说明",
   "fileTree.showUpdateNotes": "显示更新说明",

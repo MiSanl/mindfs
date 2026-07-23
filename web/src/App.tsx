@@ -1,3 +1,4 @@
+import { getShowHiddenFiles, setShowHiddenFiles as persistShowHiddenFiles } from "./services/uiPrefs";
 import React, {
   useCallback,
   useEffect,
@@ -2542,7 +2543,7 @@ export function App({ onGoHome }: AppProps) {
   const pluginQueryRef = useRef<Record<string, string>>(
     readURLState().pluginQuery,
   );
-  const [showHiddenFiles, setShowHiddenFiles] = useState(false);
+  const [showHiddenFiles, setShowHiddenFiles] = useState(() => getShowHiddenFiles());
   const [projectTreeTabRequest, setProjectTreeTabRequest] = useState<{
     tab: "files" | "git" | "worktrees" | "related";
     nonce: number;
@@ -14161,7 +14162,10 @@ export function App({ onGoHome }: AppProps) {
             sortMode={treeSortMode}
             showHiddenFiles={showHiddenFiles}
             onSortModeChange={setTreeSortMode}
-            onShowHiddenFilesChange={setShowHiddenFiles}
+            onShowHiddenFilesChange={(next) => {
+              setShowHiddenFiles(next);
+              persistShowHiddenFiles(next);
+            }}
             selectedDirKey={selectedDirKey}
             selectedPath={file?.path}
             rootId={currentRootId}

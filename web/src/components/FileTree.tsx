@@ -16,7 +16,8 @@ import {
   getAppearanceMode,
   setAppearanceMode,
   type AppearanceMode,
-} from "../services/appearance";
+} from "../services/appearance"
+import { getShowTurnRequest, setShowTurnRequest, UI_PREFS_CHANGE_EVENT } from "../services/uiPrefs";
 import { useI18n, type Locale, type MessageKey } from "../i18n";
 import { AgentMenuList } from "./AgentMenuList";
 import { AgentIcon } from "./AgentIcon";
@@ -1708,6 +1709,19 @@ export function FileTree({
     return key ? t(key) : t("directory.defaultSort");
   }, [t]);
   const expandedSet = new Set(expanded);
+  const [showTurnRequest, setShowTurnRequestState] = React.useState(() => getShowTurnRequest());
+  React.useEffect(() => {
+    const onPrefs = (event: Event) => {
+      const detail = (event as CustomEvent).detail || {};
+      if (typeof detail.showTurnRequest === "boolean") {
+        setShowTurnRequestState(detail.showTurnRequest);
+      } else {
+        setShowTurnRequestState(getShowTurnRequest());
+      }
+    };
+    window.addEventListener(UI_PREFS_CHANGE_EVENT, onPrefs as EventListener);
+    return () => window.removeEventListener(UI_PREFS_CHANGE_EVENT, onPrefs as EventListener);
+  }, []);
   const [isMenuOpen, setIsMenuOpen] = React.useState(false);
   const [projectTreeTab, setProjectTreeTab] = React.useState<ProjectTreeTab>(() => {
     if (typeof window === "undefined") {
@@ -3566,6 +3580,32 @@ export function FileTree({
                   <span style={{ fontSize: "11px", opacity: enterKeySends ? 1 : 0 }}>✓</span>
                 </button>
               ) : null}
+                <button
+                  type="button"
+                  onClick={() => {
+                    const next = !showTurnRequest;
+                    setShowTurnRequestState(next);
+                    setShowTurnRequest(next);
+                  }}
+                  style={{
+                    width: "100%",
+                    border: "none",
+                    background: showTurnRequest ? "var(--selection-bg)" : "transparent",
+                    color: showTurnRequest ? "var(--accent-color)" : "var(--text-primary)",
+                    borderRadius: "8px",
+                    padding: "8px 10px",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    gap: "8px",
+                    textAlign: "left",
+                    cursor: "pointer",
+                    fontSize: "12px",
+                  }}
+                >
+                  <span>{t("fileTree.showTurnRequest")}</span>
+                  <span style={{ fontSize: "11px", opacity: showTurnRequest ? 1 : 0 }}>✓</span>
+                </button>
             </div>
           ) : null}
           {projectAddOverlay ? (

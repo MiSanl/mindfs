@@ -13,6 +13,7 @@ import { reportError } from "../services/error";
 import { rootBadgeButtonStyle } from "./rootBadgeStyle";
 import { copyText } from "../services/clipboard";
 import type { AgentStatus } from "../services/agents";
+import { getShowTurnRequest, UI_PREFS_CHANGE_EVENT } from "../services/uiPrefs";
 import { useI18n, type Locale } from "../i18n";
 
 type SessionItem = {
@@ -1101,6 +1102,20 @@ function SessionViewerInner({
   const [errorPanelExpanded, setErrorPanelExpanded] = React.useState<Record<string, boolean>>({});
   const seenErrorPanelIdsRef = React.useRef<Set<string>>(new Set());
   const seededErrorsRef = React.useRef(false);
+
+  const [showTurnRequest, setShowTurnRequestState] = React.useState(() => getShowTurnRequest());
+  React.useEffect(() => {
+    const onPrefs = (event: Event) => {
+      const detail = (event as CustomEvent).detail || {};
+      if (typeof detail.showTurnRequest === "boolean") {
+        setShowTurnRequestState(detail.showTurnRequest);
+      } else {
+        setShowTurnRequestState(getShowTurnRequest());
+      }
+    };
+    window.addEventListener(UI_PREFS_CHANGE_EVENT, onPrefs as EventListener);
+    return () => window.removeEventListener(UI_PREFS_CHANGE_EVENT, onPrefs as EventListener);
+  }, []);
 
   const sessionTurnRequests = Array.isArray((session as any)?.turn_requests)
     ? ((session as any).turn_requests as Array<Record<string, any>>)
@@ -2746,7 +2761,7 @@ if (useInnerScrollContainer && !container) {
                   }}
                 >
                   {node}
-                  {renderTurnRequestChip(turnReq)}
+                  {showTurnRequest ? renderTurnRequestChip(turnReq) : null}
                   {renderInlineSessionErrorPanel(inlineErrors, `err-${seq || idx}`)}
                 </div>
               );
