@@ -2,9 +2,7 @@ import React, { useCallback, useEffect, useRef, useState } from "react";
 import { type SessionMode } from "./ModeSelector";
 import { ModeSelector } from "./ModeSelector";
 import { AgentModelSelector } from "./AgentModelSelector";
-import { AgentModeSelector } from "./AgentModeSelector";
-import { EffortSelector } from "./EffortSelector";
-import { FastServiceSelector } from "./FastServiceSelector";
+import { AgentSettingsSelector } from "./AgentSettingsSelector";
 import { fetchAgents, fetchShells, restartAgent, type AgentStatus, type ShellStatus } from "../services/agents";
 import { fetchCandidates, type CandidateItem } from "../services/candidates";
 import { reportError } from "../services/error";
@@ -1299,12 +1297,12 @@ export function ActionBar({
     : mode === "chat" && !isFocused
       ? t(blurPlaceholderKey)
       : t(modePlaceholderKeys[mode]);
-  // Agent+Model 合并后右侧工具栏更窄；runtime 已移出输入框。
+  // Agent+Model 与 mode/effort/fast 均合并后，右侧工具栏更紧凑；runtime 已移出输入框。
   const editorRightInset = isMultiLine
     ? 14
     : mode === "command"
       ? isMobile ? 92 : 116
-      : isMobile ? 168 : 210;
+      : isMobile ? 140 : 176;
   const editorBottomInset = isMultiLine ? 44 : 12;
   const editorMinHeight = 44;
   const mobileFileSidebarButton = isMobile ? (
@@ -1944,25 +1942,16 @@ export function ActionBar({
                       setAgents(items);
                     }}
                   />
-                  <AgentModeSelector
-                    agent={selectedAgent}
-                    mode={agentMode}
-                    compact
-                    maxButtonWidth={isMobile ? "min(22vw, 80px)" : "110px"}
-                    onModeChange={(nextAgentMode) => setAgentMode(nextAgentMode || "")}
-                  />
-                  <EffortSelector
+                  <AgentSettingsSelector
                     agent={selectedAgent}
                     model={model}
+                    mode={agentMode}
                     effort={effort}
-                    compact
-                    maxButtonWidth={isMobile ? "min(22vw, 80px)" : "110px"}
-                    onEffortChange={(nextEffort) => setEffort(nextEffort || "")}
-                  />
-                  <FastServiceSelector
-                    agent={selectedAgent}
                     fastService={fastService}
                     compact
+                    maxButtonWidth={isMobile ? "min(28vw, 112px)" : "140px"}
+                    onModeChange={(nextAgentMode) => setAgentMode(nextAgentMode || "")}
+                    onEffortChange={(nextEffort) => setEffort(nextEffort || "")}
                     onFastServiceChange={(nextFastService) => setFastService(nextFastService || "")}
                   />
                   {mindfsSessionID ? (
