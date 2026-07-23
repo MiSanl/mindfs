@@ -202,6 +202,19 @@ function runtimeStatusMeta(
       state: "error",
     };
   }
+  if (
+    state === "disconnected" &&
+    (!selectedAgent || !runtimeAgent || runtimeAgent.toLowerCase() === selectedAgent.toLowerCase())
+  ) {
+    return {
+      color: "#94a3b8",
+      label:
+        String(runtime?.message || "").trim() ||
+        t("session.runtime.disconnected", { agent: runtimeAgent || selectedAgent || "?" }),
+      agent: runtimeAgent || selectedAgent,
+      state: "disconnected",
+    };
+  }
   if (agentStatus && agentStatus.available === false) {
     return {
       color: "#ef4444",

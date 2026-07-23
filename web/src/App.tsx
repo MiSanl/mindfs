@@ -557,12 +557,14 @@ function toSessionItem(
     closed_at:
       typeof session?.closed_at === "string" ? session.closed_at : undefined,
     context_window:
-      session?.context_window &&
-      Number(session.context_window.totalTokens) > 0 &&
-      Number(session.context_window.modelContextWindow) > 0
+      session?.context_window && Number(session.context_window.totalTokens) > 0
         ? {
             totalTokens: Number(session.context_window.totalTokens),
-            modelContextWindow: Number(session.context_window.modelContextWindow),
+            // 0 is valid: some agents report usage without a known window size.
+            modelContextWindow: Math.max(
+              0,
+              Number(session.context_window.modelContextWindow || 0),
+            ),
           }
         : undefined,
     search_seq:
@@ -4340,7 +4342,8 @@ export function App({ onGoHome }: AppProps) {
     ) => {
       const totalTokens = Math.max(0, Number(contextWindow?.totalTokens || 0));
       const modelContextWindow = Math.max(0, Number(contextWindow?.modelContextWindow || 0));
-      if (!totalTokens || !modelContextWindow) {
+      // Keep usage even when model window is unknown (0); badge shows absolute tokens.
+      if (!totalTokens) {
         return;
       }
       const cacheKey = rootSessionKey(rootID, sessionKey);
@@ -5708,12 +5711,26 @@ export function App({ onGoHome }: AppProps) {
                 syncedExchange.timestamp === localExchange.timestamp,
             ),
         );
+        const serverPending =
+          typeof (synced as any)?.pending === "boolean"
+            ? !!(synced as any).pending
+            : undefined;
+        // Authoritative server pending=false must clear sticky local generating
+        // (same semantics as session select / GET). Live turns still win via
+        // pendingBySessionRef when server omits/true.
+        if (serverPending === false && localPending) {
+          delete pendingBySessionRef.current[cacheKey];
+        }
+        const pending =
+          serverPending === false
+            ? false
+            : !!pendingBySessionRef.current[cacheKey] ||
+              localPending ||
+              serverPending === true;
         const normalized = {
           ...(synced as any),
           key: sessionKey,
-          // Do not let a disk-only sync clear a turn that is still active in
-          // this browser. session.done/error remains the terminal authority.
-          pending: localPending || (synced as any)?.pending === true,
+          pending,
           exchanges: [...syncedExchanges, ...pendingExchanges],
         } as Session;
         sessionCacheRef.current[cacheKey] = normalized;
@@ -6510,8 +6527,20 @@ export function App({ onGoHome }: AppProps) {
         if (!(effectiveAgent === "claude" || effectiveAgent === "codex")) {
           return "";
         }
-        const bindings = Array.isArray((selectedSessionRef.current as any)?.agent_bindings)
-          ? ((selectedSessionRef.current as any).agent_bindings as any[])
+        // Resolve bindings from the *send target* session (drawer/bound key can
+        // differ from the main selected session).
+        const targetKey = String(sendSessionKey || "").trim();
+        const targetCache =
+          targetKey && activeRoot
+            ? sessionCacheRef.current[rootSessionKey(activeRoot, targetKey)]
+            : null;
+        const targetSession =
+          (targetCache as any) ||
+          (session as any) ||
+          (selectedSessionRef.current as any) ||
+          null;
+        const bindings = Array.isArray(targetSession?.agent_bindings)
+          ? (targetSession.agent_bindings as any[])
           : [];
         const match = bindings.find(
           (item) =>
@@ -14328,7 +14357,10 @@ export function App({ onGoHome }: AppProps) {
               agentsVersion={agentsVersion}
               onRuntimeReconnect={async (targetAgent) => {
                 const root = currentRootIdRef.current || "";
+                // Prefer the ActionBar-bound session (drawer may differ from main select).
                 const key =
+                  (actionBarSession as any)?.key ||
+                  (actionBarSession as any)?.session_key ||
                   selectedSessionRef.current?.key ||
                   selectedSessionRef.current?.session_key ||
                   "";
@@ -14339,18 +14371,31 @@ export function App({ onGoHome }: AppProps) {
                   console.warn("[runtime/reconnect] restart failed", err);
                 }
                 setAgentsVersion((v) => v + 1);
-                // Process restart does not open a session runtime. Mark idle so the
-                // pill does not stick on "opening" until the next user send.
+                // Process restart is not a session open. Mark disconnected (not opening)
+                // and fan out to cache/selected/drawer so GET/sync cannot rehydrate stale
+                // "connected" from an old cache entry.
                 if (root && key) {
+                  const cacheKey = rootSessionKey(root, key);
+                  delete pendingBySessionRef.current[cacheKey];
+                  const runtime = {
+                    agent: targetAgent,
+                    state: "disconnected",
+                    message: "agent process restarted; next message will reconnect",
+                  };
+                  const cached = sessionCacheRef.current[cacheKey];
+                  if (cached && typeof cached === "object") {
+                    sessionCacheRef.current[cacheKey] = {
+                      ...(cached as any),
+                      pending: false,
+                      runtime,
+                    } as any;
+                  }
                   setSelectedSession((prev) =>
                     prev && (prev.key === key || prev.session_key === key)
                       ? ({
                           ...(prev as any),
-                          runtime: {
-                            agent: targetAgent,
-                            state: "disconnected",
-                            message: "agent process restarted; next message will reconnect",
-                          },
+                          pending: false,
+                          runtime,
                         } as SessionItem)
                       : prev,
                   );
@@ -14358,13 +14403,11 @@ export function App({ onGoHome }: AppProps) {
                   if (drawer && (drawer.key === key || (drawer as any).session_key === key)) {
                     setDrawerSessionForRoot(root, {
                       ...(drawer as any),
-                      runtime: {
-                        agent: targetAgent,
-                        state: "disconnected",
-                        message: "agent process restarted; next message will reconnect",
-                      },
+                      pending: false,
+                      runtime,
                     } as any);
                   }
+                  bumpCacheVersion();
                 }
               }}
               currentRootId={currentRootId}
