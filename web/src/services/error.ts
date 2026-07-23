@@ -14,6 +14,7 @@ export type ErrorCode =
   | "session.slash_command_failed"
   | "session.provider_unavailable"
   | "session.provider_mismatch"
+  | "session.provider_config_mismatch"
   | "session.provider_changed"
   | "app.init_failed"
   // Root/project errors
@@ -178,6 +179,11 @@ class ErrorService {
       },
       "session.provider_mismatch": {
         messageKey: "error.session.providerMismatch",
+        severity: "error",
+        recoverable: false,
+      },
+      "session.provider_config_mismatch": {
+        messageKey: "error.session.providerConfigMismatch",
         severity: "error",
         recoverable: false,
       },

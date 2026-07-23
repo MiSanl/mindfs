@@ -751,6 +751,7 @@ export const zhCN = {
   "error.session.resumeFailed": "恢复会话失败",
   "error.session.providerUnavailable": "该会话绑定的 API 供应商不可用。请恢复该供应商，或在新会话中选择其他供应商继续。",
   "error.session.providerMismatch": "当前选择的供应商与会话绑定不一致。",
+  "error.session.providerConfigMismatch": "当前选中的 API Provider 尚未写入 Agent 运行配置。请打开 Agent 配置并再次选择该 Provider 以重写配置后发送。",
   "error.session.providerChanged": "绑定的供应商配置已变更。请确认兼容后再继续，或新建会话。",
   "error.session.deleteFailed": "删除会话失败",
   "error.session.importFailed": "导入会话失败",

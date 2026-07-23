@@ -225,6 +225,9 @@ function sessionErrorCode(message: string): ErrorCode {
   if (normalized.includes("session_provider_unavailable")) {
     return "session.provider_unavailable";
   }
+  if (normalized.includes("session_provider_config_mismatch") || normalized.includes("is not applied to the agent runtime")) {
+    return "session.provider_config_mismatch";
+  }
   if (normalized.includes("session_provider_mismatch")) {
     return "session.provider_mismatch";
   }

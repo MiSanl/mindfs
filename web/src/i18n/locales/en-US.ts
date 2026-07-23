@@ -753,6 +753,7 @@ export const enUS = {
   "error.session.resumeFailed": "Failed to resume session",
   "error.session.providerUnavailable": "This session provider is unavailable. Restore the provider or continue in a new session with another provider.",
   "error.session.providerMismatch": "The selected provider does not match this session binding.",
+  "error.session.providerConfigMismatch": "The selected API provider is not applied to the agent runtime. Open Agent Config and select this provider again to rewrite settings, then resend.",
   "error.session.providerChanged": "The bound provider configuration changed. Continue only after validating compatibility or starting a new session.",
   "error.session.deleteFailed": "Failed to delete session",
   "error.session.importFailed": "Failed to import session",

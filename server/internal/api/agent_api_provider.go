@@ -680,11 +680,9 @@ func switchAgentAPIProvider(req agentAPIProviderSwitchRequest, app *AppContext) 
 		return agentAPIProvider{}, fmt.Errorf("provider protocols %s are not compatible with agent %s", strings.Join(agentAPIProviderProtocols(provider), ", "), agentName)
 	}
 	provider.activeProtocol = selectedProtocol
-	isSessionBoundAgent := normalizedAPIProviderAgent(agentName) == "claude" || normalizedAPIProviderAgent(agentName) == "codex"
-	if !isSessionBoundAgent {
-		if err := applyAgentAPIProvider(agentName, provider, app); err != nil {
-			return agentAPIProvider{}, err
-		}
+	// Isolation-off delivery: always rewrite agent config/env on provider switch.
+	if err := applyAgentAPIProvider(agentName, provider, app); err != nil {
+		return agentAPIProvider{}, err
 	}
 	if app != nil && app.GetPreferences() != nil {
 		if err := app.GetPreferences().UpdateAgentLastConfigSelection(agentName, preferences.LastConfigSelection{
@@ -695,7 +693,7 @@ func switchAgentAPIProvider(req agentAPIProviderSwitchRequest, app *AppContext) 
 			return agentAPIProvider{}, err
 		}
 	}
-	if app != nil && app.GetAgentPool() != nil && !isSessionBoundAgent {
+	if app != nil && app.GetAgentPool() != nil {
 		app.GetAgentPool().KillAgentProcess(agentName, 0)
 	}
 	triggerAgentConfigSwitchProbe(app, agentName)
@@ -733,25 +731,18 @@ func ensureSelectedAPIProviderApplied(agentName string, app *AppContext) error {
 		}
 	}
 	if provider == nil {
-		return fmt.Errorf("session_provider_unavailable: provider %q was deleted; re-select a provider", providerID)
+		return fmt.Errorf("session_provider_unavailable: provider %q was deleted; re-select a provider in Agent Config", providerID)
 	}
 	ok, detail := selectedProviderMatchesEffective(agentName, *provider, app)
 	if ok {
 		return nil
 	}
-	log.Printf("[provider/consistency] mismatch agent=%s provider=%s detail=%s action=reapply", agentName, provider.Name, detail)
-	if err := applyAgentAPIProvider(agentName, *provider, app); err != nil {
-		return fmt.Errorf("session_provider_config_mismatch: re-apply failed for %q: %w", provider.Name, err)
-	}
-	if app.GetAgentPool() != nil {
-		app.GetAgentPool().KillAgentProcess(agentName, 0)
-	}
-	ok, detail = selectedProviderMatchesEffective(agentName, *provider, app)
-	if ok || detail == "pending_process_reopen" {
-		return nil
-	}
-	return fmt.Errorf("session_provider_config_mismatch: selected provider %q (%s) does not match effective agent endpoint (%s); re-select the provider in Agent Config", provider.Name, strings.TrimSpace(provider.BaseURL), detail)
+	// Do not silently rewrite global agent config here. Provider apply is an
+	// explicit user action (switch provider in Agent Config).
+	log.Printf("[provider/consistency] mismatch agent=%s provider=%s detail=%s action=require_user_reselect", agentName, provider.Name, detail)
+	return fmt.Errorf("session_provider_config_mismatch: selected provider %q is not applied to the agent runtime (%s). Open Agent Config and select this provider again to rewrite agent settings", provider.Name, detail)
 }
+
 
 func selectedProviderMatchesEffective(agentName string, provider agentAPIProvider, app *AppContext) (bool, string) {
 	wantClaude := anthropicBaseURL(provider.BaseURL)
