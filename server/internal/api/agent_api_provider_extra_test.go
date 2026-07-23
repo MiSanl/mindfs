@@ -2,7 +2,10 @@ package api
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"mindfs/server/internal/agent"
@@ -224,5 +227,54 @@ func TestSuccessfulProbeProtocolsPriority(t *testing.T) {
 	}
 	if got := successfulProbeProtocols(map[string][]string{}); len(got) != 0 {
 		t.Fatalf("empty = %#v", got)
+	}
+}
+
+func TestCodexHomeDirPrefersCODEX_HOME(t *testing.T) {
+	t.Setenv("CODEX_HOME", filepath.Join(t.TempDir(), "custom-codex"))
+	got, err := codexHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != filepath.Clean(os.Getenv("CODEX_HOME")) {
+		t.Fatalf("codexHomeDir=%q want CODEX_HOME", got)
+	}
+	cfg, err := codexConfigPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Base(cfg) != "config.toml" || filepath.Dir(cfg) != got {
+		t.Fatalf("config path=%q", cfg)
+	}
+}
+
+func TestSelectedProviderMatchesEffectiveCodexUsesCodexHome(t *testing.T) {
+	dir := t.TempDir()
+	codexDir := filepath.Join(dir, ".codex")
+	if err := os.MkdirAll(codexDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CODEX_HOME", codexDir)
+	// Write a mismatched config (active provider points elsewhere).
+	config := `model = "gpt"
+model_provider = "other"
+
+[model_providers.other]
+name = "other"
+base_url = "https://other.example/v1"
+`
+	if err := os.WriteFile(filepath.Join(codexDir, "config.toml"), []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ok, detail := selectedProviderMatchesEffective("codex", agentAPIProvider{
+		ID:      "api-want",
+		Name:    "want",
+		BaseURL: "https://want.example",
+	}, nil)
+	if ok {
+		t.Fatalf("expected mismatch, detail=%q", detail)
+	}
+	if !strings.Contains(detail, "model_provider=other") {
+		t.Fatalf("detail=%q", detail)
 	}
 }

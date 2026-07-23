@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"log"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -173,6 +175,9 @@ func (p *Pool) openSession(ctx context.Context, protocol Protocol, def Definitio
 			value := in.ForkPoint.CodexUserOrdinal
 			codexUserOrdinal = &value
 		}
+		// Ensure codex app-server reads the same config MindFS apply/check use.
+		// CODEX_HOME wins over USERPROFILE/.codex on Windows.
+		env = ensureCodexHomeEnv(env)
 		return p.codex.OpenSession(ctx, codex.OpenOptions{
 			AgentName:        in.AgentName,
 			SessionKey:       in.SessionKey,
@@ -260,6 +265,30 @@ func cloneEnv(env map[string]string) map[string]string {
 	for key, value := range env {
 		out[key] = value
 	}
+	return out
+}
+
+// ensureCodexHomeEnv pins CODEX_HOME so the app-server uses the same config
+// directory MindFS wrote/checked. Prefer an already-set CODEX_HOME (process or
+// agent env); otherwise default to $HOME/.codex / %USERPROFILE%\.codex via
+// os.UserHomeDir semantics in the child after CODEX_HOME is set explicitly.
+func ensureCodexHomeEnv(env map[string]string) map[string]string {
+	out := cloneEnv(env)
+	if out == nil {
+		out = map[string]string{}
+	}
+	if v := strings.TrimSpace(out["CODEX_HOME"]); v != "" {
+		return out
+	}
+	if v := strings.TrimSpace(os.Getenv("CODEX_HOME")); v != "" {
+		out["CODEX_HOME"] = v
+		return out
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || strings.TrimSpace(home) == "" {
+		return out
+	}
+	out["CODEX_HOME"] = filepath.Join(home, ".codex")
 	return out
 }
 

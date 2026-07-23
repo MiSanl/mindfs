@@ -696,6 +696,20 @@ func switchAgentAPIProvider(req agentAPIProviderSwitchRequest, app *AppContext) 
 	if app != nil && app.GetAgentPool() != nil {
 		app.GetAgentPool().KillAgentProcess(agentName, 0)
 	}
+	// Drop resumed agent_session_ids so next send opens a fresh runtime against the
+	// newly applied config (resume can keep the old provider base_url).
+	if app != nil {
+		for _, mgr := range app.LoadedSessionManagers() {
+			if mgr == nil {
+				continue
+			}
+			if n, err := mgr.ClearAgentSessionIDsForAgent(context.Background(), agentName); err != nil {
+				log.Printf("[provider/switch] clear_agent_sessions.error agent=%s err=%v", agentName, err)
+			} else if n > 0 {
+				log.Printf("[provider/switch] clear_agent_sessions.done agent=%s cleared=%d", agentName, n)
+			}
+		}
+	}
 	triggerAgentConfigSwitchProbe(app, agentName)
 	return provider, nil
 }
@@ -759,20 +773,25 @@ func selectedProviderMatchesEffective(agentName string, provider agentAPIProvide
 		}
 		return true, ""
 	case "codex":
+		cfgPath, _ := codexConfigPath()
+		label := cfgPath
+		if strings.TrimSpace(label) == "" {
+			label = "~/.codex/config.toml"
+		}
 		active, err := readCodexActiveModelProvider()
 		if err != nil || strings.TrimSpace(active) == "" {
-			return false, "missing model_provider in ~/.codex/config.toml"
+			return false, "missing model_provider in " + label
 		}
 		wantName := agentAPIProviderConfigName(provider)
 		if strings.TrimSpace(active) != strings.TrimSpace(wantName) {
-			return false, "~/.codex/config.toml model_provider=" + active
+			return false, label + " model_provider=" + active + " (selected=" + wantName + ")"
 		}
 		got, err := readCodexProviderBaseURL(wantName)
 		if err != nil || strings.TrimSpace(got) == "" {
-			return false, "missing base_url for selected provider in ~/.codex/config.toml"
+			return false, "missing base_url for selected provider in " + label
 		}
 		if normalizeURLForCompare(got) != normalizeURLForCompare(wantOpenAI) {
-			return false, "~/.codex/config.toml base_url=" + got
+			return false, label + " base_url=" + got + " (selected=" + wantOpenAI + ")"
 		}
 		return true, ""
 	case "gemini":
@@ -853,18 +872,45 @@ func readOpenCodeBaseURL() (string, error) {
 	return "", fmt.Errorf("baseURL missing")
 }
 
-func readCodexActiveModelProvider() (string, error) {
+// codexHomeDir is the directory that both MindFS apply/check and the codex
+// app-server must use. Prefer CODEX_HOME (what codex itself honors); otherwise
+// ~/.codex via os.UserHomeDir (which on Windows follows USERPROFILE/HOME).
+// Without this, apply can write an isolated HOME while codex still reads the
+// real user profile — consistency passes, request hits a different base_url.
+func codexHomeDir() (string, error) {
+	if v := strings.TrimSpace(os.Getenv("CODEX_HOME")); v != "" {
+		return filepath.Clean(v), nil
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
 	}
-	configPath := filepath.Join(home, ".codex", "config.toml")
+	return filepath.Join(home, ".codex"), nil
+}
+
+func codexConfigPath() (string, error) {
+	dir, err := codexHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "config.toml"), nil
+}
+
+func readCodexActiveModelProvider() (string, error) {
+	configPath, err := codexConfigPath()
+	if err != nil {
+		return "", err
+	}
 	b, err := os.ReadFile(configPath)
 	if err != nil {
 		return "", err
 	}
+	// Only the top-level model_provider key (before any [table]).
 	for _, line := range strings.Split(string(b), "\n") {
 		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "[") {
+			break
+		}
 		if !strings.HasPrefix(trimmed, "model_provider") {
 			continue
 		}
@@ -880,7 +926,7 @@ func readCodexActiveModelProvider() (string, error) {
 		val = strings.Trim(val, "'")
 		return strings.TrimSpace(val), nil
 	}
-	return "", fmt.Errorf("model_provider missing")
+	return "", fmt.Errorf("model_provider missing in %s", configPath)
 }
 
 
@@ -919,11 +965,10 @@ func readCodexProviderBaseURL(providerTable string) (string, error) {
 	if providerTable == "" {
 		return "", fmt.Errorf("provider table required")
 	}
-	dir, err := os.UserHomeDir()
+	configPath, err := codexConfigPath()
 	if err != nil {
 		return "", err
 	}
-	configPath := filepath.Join(dir, ".codex", "config.toml")
 	b, err := os.ReadFile(configPath)
 	if err != nil {
 		return "", err
@@ -936,7 +981,7 @@ func readCodexProviderBaseURL(providerTable string) (string, error) {
 		idx = strings.Index(text, section)
 	}
 	if idx < 0 {
-		return "", fmt.Errorf("section not found")
+		return "", fmt.Errorf("section not found in %s", configPath)
 	}
 	rest := text[idx+len(section):]
 	if cut := strings.Index(rest, "\n["); cut >= 0 {
@@ -965,6 +1010,26 @@ func applyAgentAPIProvider(agentName string, provider agentAPIProvider, app *App
 	case "codex":
 		if err := applyCodexAPIProvider(provider); err != nil {
 			return err
+		}
+		// Pin app-server to the same config dir we just wrote (Windows often has
+		// USERPROFILE != Go UserHomeDir when MindFS is launched with isolated HOME).
+		if dir, err := codexHomeDir(); err == nil && strings.TrimSpace(dir) != "" {
+			env, mergeErr := mergeAgentEnvConfig(agentName, map[string]string{
+				"CODEX_HOME": dir,
+			})
+			if mergeErr != nil {
+				return mergeErr
+			}
+			if app != nil && app.GetAgentPool() != nil {
+				if err := app.GetAgentPool().SetAgentEnv(agentName, env); err != nil {
+					return err
+				}
+			}
+			if app != nil && app.GetProber() != nil {
+				if err := app.GetProber().SetAgentEnv(agentName, env); err != nil {
+					return err
+				}
+			}
 		}
 	case "claude":
 		if err := applyClaudeAPIProvider(provider); err != nil {
@@ -1068,11 +1133,10 @@ func copilotAPIProviderEnv(provider agentAPIProvider) map[string]string {
 }
 
 func applyCodexAPIProvider(provider agentAPIProvider) error {
-	home, err := os.UserHomeDir()
+	dir, err := codexHomeDir()
 	if err != nil {
 		return err
 	}
-	dir := filepath.Join(home, ".codex")
 	configPath := filepath.Join(dir, "config.toml")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return apperr.Wrap("mkdir", dir, err)
