@@ -86,6 +86,7 @@ function getSelectionPreview(text?: string): string {
 type ActionBarProps = {
   status?: WSStatus;
   agentsVersion?: number;
+  onRuntimeReconnect?: (agent: string) => void | Promise<void>;
   currentRootId?: string | null;
   currentSession?: SessionInfo | null;
   pendingPlanMode?: boolean;
@@ -512,6 +513,7 @@ function stripPlanCommandPrefix(input: string): string {
 export function ActionBar({
   status = "disconnected",
   agentsVersion = 0,
+  onRuntimeReconnect,
   currentRootId,
   currentSession,
   pendingPlanMode = false,
@@ -1830,9 +1832,29 @@ export function ActionBar({
                     compact={true}
                     warnUnavailable={isSelectedAgentUnavailable}
                   />
-                  <span
-                    title={runtimeMeta.label}
+                  <button
+                    type="button"
+                    title={
+                      runtimeMeta.state === "connected"
+                        ? runtimeMeta.label
+                        : `${runtimeMeta.label} · ${t("session.runtime.reconnectHint")}`
+                    }
                     aria-label={`${t("session.runtime.label")}: ${runtimeMeta.label}`}
+                    onClick={async () => {
+                      const target = String(runtimeMeta.agent || agent || "").trim();
+                      if (!target || runtimeMeta.state === "opening") return;
+                      try {
+                        if (onRuntimeReconnect) {
+                          await onRuntimeReconnect(target);
+                        } else {
+                          await restartAgent(target);
+                          const items = await fetchAgents(true);
+                          setAgents(items);
+                        }
+                      } catch (err) {
+                        console.warn("[runtime/reconnect] failed", err);
+                      }
+                    }}
                     style={{
                       display: "inline-flex",
                       alignItems: "center",
@@ -1850,6 +1872,7 @@ export function ActionBar({
                       overflow: "hidden",
                       textOverflow: "ellipsis",
                       flexShrink: 1,
+                      cursor: runtimeMeta.state === "opening" ? "default" : "pointer",
                     }}
                   >
                     <span
@@ -1864,7 +1887,7 @@ export function ActionBar({
                     <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>
                       {runtimeMeta.agent || runtimeMeta.label}
                     </span>
-                  </span>
+                  </button>
                   <ModelSelector
                     agent={selectedAgent}
                     model={model}

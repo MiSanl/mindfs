@@ -567,7 +567,7 @@ func (p *Process) SendMessage(ctx context.Context, sessionKey, content string) e
 	sess := p.getSessionByKey(sessionKey)
 
 	if sess == nil {
-		return nil
+		return errors.New("acp session not found")
 	}
 	log.Printf("[agent/acp] send.begin agent=%s session_key=%s content=%q", p.agentLabel(), sessionKey, content)
 

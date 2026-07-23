@@ -1664,6 +1664,24 @@ func isNonRecoverableAgentError(err error) bool {
 		"remote compaction failed",
 		"compact_remote",
 		"responsetoomanyfailedattempts",
+		// Context overflow / auto-compact failures (OpenCode/Claude/provider).
+		"context length",
+		"context_length",
+		"context window",
+		"maximum context",
+		"max context",
+		"prompt is too long",
+		"prompt too long",
+		"request too large",
+		"tokens exceed",
+		"exceeds the context",
+		"exceeded the context",
+		"too many tokens",
+		"token limit",
+		"max_tokens",
+		"model context",
+		"input is too long",
+		"message is too long",
 	}
 	for _, needle := range needles {
 		if strings.Contains(value, needle) {
@@ -2729,6 +2747,27 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 		updatePending()
 		if isCanceledTurnError(sendErr) {
 			_ = manager.DiscardPendingTurn(ctx, current.Key)
+		} else if sawAssistantChunk || strings.TrimSpace(responseText) != "" || len(auxBuffer) > 0 {
+			// Persist partial goal/agent output before surfacing the terminal error so
+			// MindFS history does not lose in-progress work when provider fails mid-turn.
+			for i := range auxBuffer {
+				auxBuffer[i] = hydratePendingToolCallAux(ctx, manager, current.Key, auxBuffer[i])
+			}
+			updatePending()
+			if err := manager.CompletePendingTurn(ctx, current.Key); err != nil {
+				log.Printf("[session] pending.complete_on_error.error root=%s session=%s err=%v", in.RootID, current.Key, err)
+			}
+		} else {
+			// No assistant output: keep the user message and an error marker so the
+			// failed turn is visible in MindFS history (empty agent content would be discarded).
+			marker := "Error: " + strings.TrimSpace(sendErr.Error())
+			if marker == "Error:" {
+				marker = "Error: agent turn failed"
+			}
+			_ = manager.UpdatePendingTurn(ctx, current.Key, marker, nil)
+			if err := manager.CompletePendingTurn(ctx, current.Key); err != nil {
+				log.Printf("[session] pending.complete_error_marker.error root=%s session=%s err=%v", in.RootID, current.Key, err)
+			}
 		}
 		if prober := s.Registry.GetProber(); prober != nil && !isCanceledTurnError(sendErr) {
 			prober.ReportRuntimeFailure(in.Agent, sendErr)

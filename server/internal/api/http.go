@@ -825,6 +825,38 @@ func (h *HTTPHandler) handleSessionGet(w http.ResponseWriter, r *http.Request) {
 		Key:    key,
 		Seq:    afterSeq,
 	})
+	if exchangeAux == nil {
+		exchangeAux = map[int][]session.ExchangeAux{}
+	}
+	// Include durable pending turn progress (active goal/agent stream) so a
+	// session refresh mid-turn still shows partial agent output.
+	if h.AppContext != nil {
+		if manager, mErr := h.AppContext.GetSessionManager(rootID); mErr == nil && manager != nil {
+			if pending, pErr := manager.PeekPendingTurn(r.Context(), key); pErr == nil && pending != nil {
+				if pendingUser == nil && strings.TrimSpace(pending.User.Content) != "" {
+					userCopy := pending.User
+					pendingUser = &userCopy
+				}
+				if strings.TrimSpace(pending.Agent.Content) != "" || len(pending.Aux) > 0 {
+					agentCopy := pending.Agent
+					// Avoid duplicating if already recovered into exchanges.
+					already := false
+					for _, ex := range out.Exchanges {
+						if ex.Seq == agentCopy.Seq && strings.EqualFold(ex.Role, "agent") {
+							already = true
+							break
+						}
+					}
+					if !already {
+						out.Exchanges = append(append([]session.Exchange{}, out.Exchanges...), agentCopy)
+						if len(pending.Aux) > 0 {
+							exchangeAux[agentCopy.Seq] = append([]session.ExchangeAux{}, pending.Aux...)
+						}
+					}
+				}
+			}
+		}
+	}
 	respondJSON(w, http.StatusOK, h.sessionResponseWithBindings(r.Context(), rootID, key, out, pendingUser, contextWindow, exchangeAux))
 }
 

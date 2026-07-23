@@ -192,6 +192,20 @@ function sessionErrorCode(message: string): ErrorCode {
     return "session.provider_changed";
   }
   if (
+    normalized.includes("context length") ||
+    normalized.includes("context_length") ||
+    normalized.includes("context window") ||
+    normalized.includes("maximum context") ||
+    normalized.includes("prompt is too long") ||
+    normalized.includes("prompt too long") ||
+    normalized.includes("too many tokens") ||
+    normalized.includes("token limit") ||
+    normalized.includes("max_tokens") ||
+    normalized.includes("remote compaction failed")
+  ) {
+    return "agent.crashed";
+  }
+  if (
     normalized.includes("peer disconnected") ||
     normalized.includes("stream disconnected") ||
     normalized.includes("upstream connection error") ||
@@ -14272,6 +14286,41 @@ export function App({ onGoHome }: AppProps) {
             <ActionBar
               status={status}
               agentsVersion={agentsVersion}
+              onRuntimeReconnect={async (targetAgent) => {
+                const root = currentRootIdRef.current || "";
+                const key =
+                  selectedSessionRef.current?.key ||
+                  selectedSessionRef.current?.session_key ||
+                  "";
+                try {
+                  const { restartAgent } = await import("./services/agents");
+                  await restartAgent(targetAgent);
+                } catch (err) {
+                  console.warn("[runtime/reconnect] restart failed", err);
+                }
+                setAgentsVersion((v) => v + 1);
+                if (root && key) {
+                  const cacheKey = rootSessionKey(root, key);
+                  delete pendingBySessionRef.current[cacheKey];
+                  setSelectedSession((prev) =>
+                    prev && (prev.key === key || prev.session_key === key)
+                      ? ({
+                          ...(prev as any),
+                          pending: false,
+                          runtime: { agent: targetAgent, state: "opening" },
+                        } as SessionItem)
+                      : prev,
+                  );
+                  const drawer = drawerSessionByRootRef.current[root];
+                  if (drawer && (drawer.key === key || (drawer as any).session_key === key)) {
+                    setDrawerSessionForRoot(root, {
+                      ...(drawer as any),
+                      pending: false,
+                      runtime: { agent: targetAgent, state: "opening" },
+                    } as any);
+                  }
+                }
+              }}
               currentRootId={currentRootId}
               currentSession={actionBarSession}
               pendingPlanMode={pendingPlanMode}

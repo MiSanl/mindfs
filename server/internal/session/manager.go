@@ -359,6 +359,18 @@ func (m *Manager) DiscardPendingTurn(_ context.Context, sessionKey string) error
 	return m.removePendingTurnUnsafe(sessionKey)
 }
 
+// PeekPendingTurn returns the live/durable pending turn snapshot without completing it.
+// Used by session GET so goal/kanban mid-turn progress can refresh into the UI.
+func (m *Manager) PeekPendingTurn(_ context.Context, sessionKey string) (*PendingTurn, error) {
+	sessionKey = strings.TrimSpace(sessionKey)
+	if sessionKey == "" {
+		return nil, errors.New("session key required")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.readPendingTurnUnsafe(sessionKey)
+}
+
 // AppendSessionError appends a durable error record under sessions/errors/<key>.jsonl.
 // The on-disk log is trimmed to the newest maxSessionErrorsKept entries.
 func (m *Manager) AppendSessionError(_ context.Context, sessionKey string, entry SessionError) error {
