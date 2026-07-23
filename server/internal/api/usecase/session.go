@@ -2754,10 +2754,20 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 			} else {
 				sess = reopened
 				setActiveTurnSession(in.RootID, current.Key, sess)
-				compactPrompt := "/compact" + string([]byte{10}) + "Please compact this conversation to free context window, keep critical decisions and file paths, drop verbose tool logs."
-				if compactErr := sendWithAttachedUpdates(turnCtx, sess, compactPrompt); compactErr != nil && !isCanceledTurnError(compactErr) {
+				// Compact without attaching stream updates into the user-visible pending turn.
+				compactPrompt := "/compact\nPlease compact this conversation to free context window, keep critical decisions and file paths, drop verbose tool logs."
+				if compactErr := sess.SendMessage(turnCtx, compactPrompt); compactErr != nil && !isCanceledTurnError(compactErr) {
 					log.Printf("[session] compact.prompt.failed root=%s session=%s agent=%s err=%v", in.RootID, current.Key, in.Agent, compactErr)
 					// Still try resending original prompt after reopen; some agents compact on resume.
+				} else if in.OnUpdate != nil {
+					in.OnUpdate(agenttypes.Event{
+						Type: agenttypes.EventTypeCompact,
+						Data: agenttypes.CompactNotice{
+							ID:      "auto-compact-done-" + randomHex(4),
+							Status:  "complete",
+							Summary: "Compact request finished; retrying the original turn.",
+						},
+					})
 				}
 				retryErr := sendWithAttachedUpdates(turnCtx, sess, prompt)
 				if retryErr == nil {
@@ -2770,42 +2780,45 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 				}
 			}
 		}
-		if sendErr != nil && isNonRecoverableAgentError(sendErr) {
-			log.Printf("[session] turn.send.non_recoverable root=%s session=%s agent=%s action=fail_without_recovery err=%v", in.RootID, current.Key, in.Agent, sendErr)
-			cancelRuntimeAfterNonRecoverableError(sess, agentPool, in.RootID, current.Key, in.Agent, sendErr)
-		} else if sendErr != nil && !sawAssistantChunk && !isRecoverableTransportError(sendErr) {
-			log.Printf("[session] turn.send.no_response root=%s session=%s agent=%s action=fail_without_recovery", in.RootID, current.Key, in.Agent)
-		} else {
-			recoveryCtx, cancelRecovery := context.WithCancel(turnCtx)
-			setActiveTurnRetryCancel(in.RootID, current.Key, cancelRecovery)
-			recoveredSess, recoveredErr := s.recoverAgentTurn(recoveryCtx, SendRecoveryInput{
-				RootID:             in.RootID,
-				SessionKey:         current.Key,
-				Manager:            manager,
-				Current:            current,
-				AgentName:          in.Agent,
-				Model:              in.Model,
-				Mode:               in.Mode,
-				Effort:             in.Effort,
-				FastService:        in.FastService,
-				PlanMode:           planMode,
-				RootAbs:            rootAbs,
-				Pool:               agentPool,
-				Binding:            binding,
-				ProviderConfig:     providerConfig,
-				CurrentSession:     sess,
-				Prompt:             prompt,
-				SawAssistantChunk:  sawAssistantChunk,
-				SendWithAttachment: sendWithAttachedUpdates,
-				OnUpdate:           in.OnUpdate,
-			})
-			setActiveTurnRetryCancel(in.RootID, current.Key, nil)
-			cancelRecovery()
-			if recoveredErr != nil {
-				sendErr = recoveredErr
+		// Only enter failure/recovery paths when the turn is still failing.
+		if sendErr != nil {
+			if isNonRecoverableAgentError(sendErr) {
+				log.Printf("[session] turn.send.non_recoverable root=%s session=%s agent=%s action=fail_without_recovery err=%v", in.RootID, current.Key, in.Agent, sendErr)
+				cancelRuntimeAfterNonRecoverableError(sess, agentPool, in.RootID, current.Key, in.Agent, sendErr)
+			} else if !sawAssistantChunk && !isRecoverableTransportError(sendErr) {
+				log.Printf("[session] turn.send.no_response root=%s session=%s agent=%s action=fail_without_recovery", in.RootID, current.Key, in.Agent)
 			} else {
-				sess = recoveredSess
-				sendErr = nil
+				recoveryCtx, cancelRecovery := context.WithCancel(turnCtx)
+				setActiveTurnRetryCancel(in.RootID, current.Key, cancelRecovery)
+				recoveredSess, recoveredErr := s.recoverAgentTurn(recoveryCtx, SendRecoveryInput{
+					RootID:             in.RootID,
+					SessionKey:         current.Key,
+					Manager:            manager,
+					Current:            current,
+					AgentName:          in.Agent,
+					Model:              in.Model,
+					Mode:               in.Mode,
+					Effort:             in.Effort,
+					FastService:        in.FastService,
+					PlanMode:           planMode,
+					RootAbs:            rootAbs,
+					Pool:               agentPool,
+					Binding:            binding,
+					ProviderConfig:     providerConfig,
+					CurrentSession:     sess,
+					Prompt:             prompt,
+					SawAssistantChunk:  sawAssistantChunk,
+					SendWithAttachment: sendWithAttachedUpdates,
+					OnUpdate:           in.OnUpdate,
+				})
+				setActiveTurnRetryCancel(in.RootID, current.Key, nil)
+				cancelRecovery()
+				if recoveredErr != nil {
+					sendErr = recoveredErr
+				} else {
+					sess = recoveredSess
+					sendErr = nil
+				}
 			}
 		}
 	}

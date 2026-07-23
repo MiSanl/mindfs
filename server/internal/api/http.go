@@ -868,7 +868,8 @@ func (h *HTTPHandler) handleSessionGet(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	respondJSON(w, http.StatusOK, resp)}
+	respondJSON(w, http.StatusOK, resp)
+}
 
 func (h *HTTPHandler) handleSessionSync(w http.ResponseWriter, r *http.Request) {
 	rootID := r.URL.Query().Get("root")
