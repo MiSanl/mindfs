@@ -2381,4 +2381,133 @@ func TestContextOverflowRetryPrecedence(t *testing.T) {
 	if !isNonRecoverableAgentError(err) {
 		t.Fatal("overflow remains terminal after failed compact")
 	}
+	if !shouldAttemptContextOverflowCompact(err, "opencode", false) {
+		t.Fatal("expected compact attempt for overflow on opencode")
+	}
+	if shouldAttemptContextOverflowCompact(err, "opencode", true) {
+		t.Fatal("must not compact-retry after assistant chunks already streamed")
+	}
+	if shouldAttemptContextOverflowCompact(err, "unknown-agent-xyz", false) {
+		t.Fatal("unknown agent must not compact-retry")
+	}
+	if shouldAttemptContextOverflowCompact(errors.New("peer disconnected"), "opencode", false) {
+		t.Fatal("transport errors must not compact-retry")
+	}
+}
+
+func TestRunContextOverflowCompactRetrySuccess(t *testing.T) {
+	var notices []agenttypes.CompactNotice
+	var steps []string
+	err := runContextOverflowCompactRetry(
+		context.Background(),
+		"original user prompt",
+		func() error {
+			steps = append(steps, "reopen")
+			return nil
+		},
+		func(_ context.Context, compactPrompt string) error {
+			steps = append(steps, "compact:"+compactPrompt[:8])
+			if !strings.HasPrefix(compactPrompt, "/compact") {
+				t.Fatalf("compact prompt = %q", compactPrompt)
+			}
+			return nil
+		},
+		func(_ context.Context, prompt string) error {
+			steps = append(steps, "retry:"+prompt)
+			return nil
+		},
+		func(notice agenttypes.CompactNotice) {
+			notices = append(notices, notice)
+		},
+	)
+	if err != nil {
+		t.Fatalf("compact retry: %v", err)
+	}
+	if len(steps) != 3 || steps[0] != "reopen" || !strings.HasPrefix(steps[1], "compact:") || steps[2] != "retry:original user prompt" {
+		t.Fatalf("steps = %#v", steps)
+	}
+	if len(notices) != 2 {
+		t.Fatalf("notices = %#v, want auto+complete", notices)
+	}
+	if notices[0].Status != "auto" || notices[1].Status != "complete" {
+		t.Fatalf("notice statuses = %q, %q", notices[0].Status, notices[1].Status)
+	}
+}
+
+func TestRunContextOverflowCompactRetryPersistsNoticesOnCompactFailure(t *testing.T) {
+	var notices []agenttypes.CompactNotice
+	err := runContextOverflowCompactRetry(
+		context.Background(),
+		"prompt",
+		func() error { return nil },
+		func(context.Context, string) error {
+			return errors.New("compact command rejected")
+		},
+		func(context.Context, string) error {
+			return nil // retry still succeeds after reopen
+		},
+		func(notice agenttypes.CompactNotice) {
+			notices = append(notices, notice)
+		},
+	)
+	if err != nil {
+		t.Fatalf("expected retry success after compact prompt failure: %v", err)
+	}
+	// Compact prompt failed → only the initial "auto" notice is emitted.
+	if len(notices) != 1 || notices[0].Status != "auto" {
+		t.Fatalf("notices = %#v", notices)
+	}
+}
+
+func TestRunContextOverflowCompactRetryFailure(t *testing.T) {
+	err := runContextOverflowCompactRetry(
+		context.Background(),
+		"prompt",
+		func() error { return nil },
+		func(context.Context, string) error { return nil },
+		func(context.Context, string) error {
+			return errors.New("prompt is too long for the model context window")
+		},
+		nil,
+	)
+	if err == nil {
+		t.Fatal("expected compact retry failure")
+	}
+	if !strings.Contains(err.Error(), "context overflow persists after compact retry") {
+		t.Fatalf("err = %v", err)
+	}
+	if !isContextOverflowAgentError(err) && !strings.Contains(strings.ToLower(err.Error()), "context overflow") {
+		t.Fatalf("failed retry should stay terminal overflow-ish: %v", err)
+	}
+}
+
+func TestDurableCompactNoticeShapeForPendingAux(t *testing.T) {
+	// Mirrors emitDurableCompact in SendMessage: compact notices are stored on
+	// ExchangeAux so GET/mid-turn refresh can replay them.
+	var aux []session.ExchangeAux
+	emit := func(notice agenttypes.CompactNotice) {
+		compactCopy := notice
+		aux = append(aux, session.ExchangeAux{
+			Seq:     2,
+			Line:    0,
+			Compact: &compactCopy,
+		})
+	}
+	_ = runContextOverflowCompactRetry(
+		context.Background(),
+		"hi",
+		func() error { return nil },
+		func(context.Context, string) error { return nil },
+		func(context.Context, string) error { return nil },
+		emit,
+	)
+	if len(aux) != 2 {
+		t.Fatalf("aux len=%d want 2", len(aux))
+	}
+	if aux[0].Compact == nil || aux[0].Compact.Status != "auto" {
+		t.Fatalf("aux[0]=%#v", aux[0])
+	}
+	if aux[1].Compact == nil || aux[1].Compact.Status != "complete" {
+		t.Fatalf("aux[1]=%#v", aux[1])
+	}
 }

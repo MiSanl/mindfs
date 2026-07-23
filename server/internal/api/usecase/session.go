@@ -1692,6 +1692,62 @@ func supportsPromptCompactRetry(agentName string) bool {
 	}
 }
 
+const autoCompactPrompt = "/compact\nPlease compact this conversation to free context window, keep critical decisions and file paths, drop verbose tool logs."
+
+// shouldAttemptContextOverflowCompact is the gate used by SendMessage before
+// entering the one-shot compact→retry path.
+func shouldAttemptContextOverflowCompact(sendErr error, agentName string, sawAssistantChunk bool) bool {
+	return sendErr != nil &&
+		!isCanceledTurnError(sendErr) &&
+		isContextOverflowAgentError(sendErr) &&
+		supportsPromptCompactRetry(agentName) &&
+		!sawAssistantChunk
+}
+
+// runContextOverflowCompactRetry performs reopen + /compact + original-prompt retry.
+// emitCompact is called for durable/UI notices (auto start and complete).
+// reopen must replace the live runtime so compact runs on a clean stream.
+func runContextOverflowCompactRetry(
+	turnCtx context.Context,
+	prompt string,
+	reopen func() error,
+	sendCompact func(ctx context.Context, compactPrompt string) error,
+	sendRetry func(ctx context.Context, prompt string) error,
+	emitCompact func(notice agenttypes.CompactNotice),
+) error {
+	if emitCompact != nil {
+		emitCompact(agenttypes.CompactNotice{
+			ID:      "auto-compact-" + randomHex(6),
+			Status:  "auto",
+			Summary: "Context overflow detected; requesting compact and retrying this turn.",
+		})
+	}
+	if reopen != nil {
+		if err := reopen(); err != nil {
+			return fmt.Errorf("context overflow and compact reopen failed: %v", err)
+		}
+	}
+	if sendCompact != nil {
+		if compactErr := sendCompact(turnCtx, autoCompactPrompt); compactErr != nil && !isCanceledTurnError(compactErr) {
+			// Still try resending original prompt after reopen; some agents compact on resume.
+			log.Printf("[session] compact.prompt.failed err=%v", compactErr)
+		} else if emitCompact != nil {
+			emitCompact(agenttypes.CompactNotice{
+				ID:      "auto-compact-done-" + randomHex(4),
+				Status:  "complete",
+				Summary: "Compact request finished; retrying the original turn.",
+			})
+		}
+	}
+	if sendRetry == nil {
+		return errors.New("context overflow compact retry missing send function")
+	}
+	if retryErr := sendRetry(turnCtx, prompt); retryErr != nil {
+		return fmt.Errorf("context overflow persists after compact retry: %v", retryErr)
+	}
+	return nil
+}
+
 func isNonRecoverableAgentError(err error) bool {
 	if err == nil {
 		return false
@@ -2733,51 +2789,56 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 	sendErr := sendWithAttachedUpdates(turnCtx, sess, prompt)
 	if sendErr != nil && !isCanceledTurnError(sendErr) {
 		// One-shot context overflow recovery: ask the agent to compact, then resend.
-		if isContextOverflowAgentError(sendErr) && supportsPromptCompactRetry(in.Agent) && !sawAssistantChunk {
+		if shouldAttemptContextOverflowCompact(sendErr, in.Agent, sawAssistantChunk) {
 			log.Printf("[session] turn.send.context_overflow root=%s session=%s agent=%s action=compact_and_retry err=%v", in.RootID, current.Key, in.Agent, sendErr)
-			if in.OnUpdate != nil {
-				in.OnUpdate(agenttypes.Event{
-					Type: agenttypes.EventTypeCompact,
-					Data: agenttypes.CompactNotice{
-						ID:      "auto-compact-" + randomHex(6),
-						Status:  "auto",
-						Summary: "Context overflow detected; requesting compact and retrying this turn.",
-					},
+			// Persist compact notices into pending aux so refresh mid-turn still
+			// shows auto-compact progress (not only a transient WS event).
+			emitDurableCompact := func(notice agenttypes.CompactNotice) {
+				compactCopy := notice
+				auxBuffer = append(auxBuffer, session.ExchangeAux{
+					Seq:     plannedAssistantSeq,
+					Line:    currentAssistantLine(responseText),
+					Compact: &compactCopy,
 				})
+				updatePending()
+				if in.OnUpdate != nil {
+					in.OnUpdate(agenttypes.Event{
+						Type: agenttypes.EventTypeCompact,
+						Data: notice,
+					})
+				}
 			}
 			// Close and reopen runtime so compact is applied on a clean stream.
 			cancelRuntimeAfterNonRecoverableError(sess, agentPool, in.RootID, current.Key, in.Agent, sendErr)
-			reopened, _, reopenErr := s.ensureAgentSession(turnCtx, agentPool, manager, current, in.RootID, in.Agent, in.Model, in.Mode, in.Effort, in.FastService, rootAbs, binding, providerConfig)
-			if reopenErr != nil {
-				log.Printf("[session] compact.reopen.failed root=%s session=%s agent=%s err=%v", in.RootID, current.Key, in.Agent, reopenErr)
-				sendErr = fmt.Errorf("context overflow and compact reopen failed: %v (original: %w)", reopenErr, sendErr)
+			compactErr := runContextOverflowCompactRetry(
+				turnCtx,
+				prompt,
+				func() error {
+					reopened, _, reopenErr := s.ensureAgentSession(turnCtx, agentPool, manager, current, in.RootID, in.Agent, in.Model, in.Mode, in.Effort, in.FastService, rootAbs, binding, providerConfig)
+					if reopenErr != nil {
+						log.Printf("[session] compact.reopen.failed root=%s session=%s agent=%s err=%v", in.RootID, current.Key, in.Agent, reopenErr)
+						return reopenErr
+					}
+					sess = reopened
+					setActiveTurnSession(in.RootID, current.Key, sess)
+					return nil
+				},
+				// Compact without attaching stream updates into the user-visible pending turn text.
+				func(ctx context.Context, compactPrompt string) error {
+					return sess.SendMessage(ctx, compactPrompt)
+				},
+				func(ctx context.Context, retryPrompt string) error {
+					return sendWithAttachedUpdates(ctx, sess, retryPrompt)
+				},
+				emitDurableCompact,
+			)
+			if compactErr == nil {
+				log.Printf("[session] compact.retry.ok root=%s session=%s agent=%s", in.RootID, current.Key, in.Agent)
+				sendErr = nil
 			} else {
-				sess = reopened
-				setActiveTurnSession(in.RootID, current.Key, sess)
-				// Compact without attaching stream updates into the user-visible pending turn.
-				compactPrompt := "/compact\nPlease compact this conversation to free context window, keep critical decisions and file paths, drop verbose tool logs."
-				if compactErr := sess.SendMessage(turnCtx, compactPrompt); compactErr != nil && !isCanceledTurnError(compactErr) {
-					log.Printf("[session] compact.prompt.failed root=%s session=%s agent=%s err=%v", in.RootID, current.Key, in.Agent, compactErr)
-					// Still try resending original prompt after reopen; some agents compact on resume.
-				} else if in.OnUpdate != nil {
-					in.OnUpdate(agenttypes.Event{
-						Type: agenttypes.EventTypeCompact,
-						Data: agenttypes.CompactNotice{
-							ID:      "auto-compact-done-" + randomHex(4),
-							Status:  "complete",
-							Summary: "Compact request finished; retrying the original turn.",
-						},
-					})
-				}
-				retryErr := sendWithAttachedUpdates(turnCtx, sess, prompt)
-				if retryErr == nil {
-					log.Printf("[session] compact.retry.ok root=%s session=%s agent=%s", in.RootID, current.Key, in.Agent)
-					sendErr = nil
-				} else {
-					log.Printf("[session] compact.retry.failed root=%s session=%s agent=%s err=%v", in.RootID, current.Key, in.Agent, retryErr)
-					sendErr = fmt.Errorf("context overflow persists after compact retry: %v", retryErr)
-					cancelRuntimeAfterNonRecoverableError(sess, agentPool, in.RootID, current.Key, in.Agent, sendErr)
-				}
+				log.Printf("[session] compact.retry.failed root=%s session=%s agent=%s err=%v", in.RootID, current.Key, in.Agent, compactErr)
+				sendErr = compactErr
+				cancelRuntimeAfterNonRecoverableError(sess, agentPool, in.RootID, current.Key, in.Agent, sendErr)
 			}
 		}
 		// Only enter failure/recovery paths when the turn is still failing.
