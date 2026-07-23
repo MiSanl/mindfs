@@ -911,15 +911,15 @@ func isRecoverableTransportErrorText(message string) bool {
 	return false
 }
 
-// persistSessionError writes a durable session error and returns the after_seq used
-// for UI attachment under the corresponding user message.
+// persistSessionError writes a durable session error and returns after_seq for UI.
 //
-// Attachment rules (must match optimistic FE nextUserSeq / StartPendingTurn):
-//  1. Live pending turn → pending user seq (error after StartPendingTurn).
-//  2. request_id present (send/resume path) → next user seq = len(exchanges)+1
-//     so pre-pending failures (e.g. provider consistency) pin under the just-sent
-//     optimistic user bubble, not the previous one.
-//  3. Otherwise → last committed user seq (background / non-send failures).
+// Single rule: after_seq is always a USER exchange seq (never an agent/assistant
+// seq). Errors render under that user bubble; refresh must keep the same place.
+// Resolution order:
+//  1. Live pending user seq (turn started, not yet completed)
+//  2. Last committed user exchange seq
+// Callers that fail before any user message exists should materialize the user
+// exchange first (StartPendingTurn + CompletePendingTurn with empty agent).
 func (s *AppContext) persistSessionError(rootID, sessionKey, requestID, code, kind, message string, recoverable bool) int {
 	if s == nil {
 		return 0
@@ -938,8 +938,6 @@ func (s *AppContext) persistSessionError(rootID, sessionKey, requestID, code, ki
 	agentName := ""
 	model := ""
 
-	// Prefer the in-flight pending user turn when present. Get() intentionally does
-	// not merge active pending into Exchanges, so last-user-from-history is stale.
 	if pending, pErr := manager.PeekPendingTurn(context.Background(), sessionKey); pErr == nil && pending != nil {
 		if pending.User.Seq > 0 {
 			afterSeq = pending.User.Seq
@@ -968,22 +966,12 @@ func (s *AppContext) persistSessionError(rootID, sessionKey, requestID, code, ki
 			}
 		}
 		if afterSeq <= 0 {
-			lastUserSeq := 0
 			for i := len(current.Exchanges) - 1; i >= 0; i-- {
 				ex := current.Exchanges[i]
 				if strings.EqualFold(strings.TrimSpace(ex.Role), "user") && ex.Seq > 0 {
-					lastUserSeq = ex.Seq
+					afterSeq = ex.Seq
 					break
 				}
-			}
-			if strings.TrimSpace(requestID) != "" {
-				// Send-path failure before StartPendingTurn: attach to the outbound
-				// user message seq (same formula StartPendingTurn uses).
-				afterSeq = len(current.Exchanges) + 1
-			} else if lastUserSeq > 0 {
-				afterSeq = lastUserSeq
-			} else {
-				afterSeq = len(current.Exchanges)
 			}
 		}
 	}

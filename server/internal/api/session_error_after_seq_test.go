@@ -11,12 +11,11 @@ import (
 	"mindfs/server/internal/session"
 )
 
-// TestPersistSessionErrorAfterSeqAttachRules covers the three attachment modes
-// for durable session errors:
-//  1. request_id present before StartPendingTurn → next user seq (len+1)
-//  2. live pending turn → pending user seq
-//  3. no request_id / no pending → last committed user seq
-func TestPersistSessionErrorAfterSeqAttachRules(t *testing.T) {
+// TestPersistSessionErrorAlwaysUserSeq: after_seq is always a USER exchange seq.
+//  1. pending user → that user seq
+//  2. no pending → last committed user seq
+// Never invents next-seq-from-len and never attaches to agent seq.
+func TestPersistSessionErrorAlwaysUserSeq(t *testing.T) {
 	dir := t.TempDir()
 	rootPath := filepath.Join(dir, "project")
 	if err := os.MkdirAll(rootPath, 0o755); err != nil {
@@ -44,8 +43,8 @@ func TestPersistSessionErrorAfterSeqAttachRules(t *testing.T) {
 		t.Fatalf("create: %v", err)
 	}
 
-	// Seed one completed user/agent pair (seq 1 user, seq 2 agent).
 	now := time.Now().UTC()
+	// Seed completed user(1)/agent(2).
 	if err := manager.StartPendingTurn(context.Background(), created,
 		session.Exchange{Seq: 1, Role: "user", Agent: "claude", Content: "first", Timestamp: now},
 		session.Exchange{Seq: 2, Role: "agent", Agent: "claude", Content: "ok", Timestamp: now},
@@ -56,21 +55,13 @@ func TestPersistSessionErrorAfterSeqAttachRules(t *testing.T) {
 		t.Fatalf("complete seed: %v", err)
 	}
 
-	// 1) Pre-pending send-path failure (consistency check): request_id set, no pending.
-	//    Must attach to next user seq = 3 (len(exchanges)=2 → +1).
-	got := app.persistSessionError(root.ID, created.Key, "msg-pre", "session.message_failed", "turn", "provider mismatch", false)
-	if got != 3 {
-		t.Fatalf("pre-pending after_seq=%d want 3", got)
-	}
-	items, err := manager.ListSessionErrors(context.Background(), created.Key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(items) == 0 || items[len(items)-1].AfterSeq != 3 {
-		t.Fatalf("stored pre-pending entry=%#v", items)
+	// No pending: attach under last committed user (seq 1), not agent seq 2.
+	got := app.persistSessionError(root.ID, created.Key, "msg-bg", "session.message_failed", "turn", "background", false)
+	if got != 1 {
+		t.Fatalf("no-pending after_seq=%d want 1 (last user)", got)
 	}
 
-	// 2) After StartPendingTurn for the next user message (seq 3): pending wins.
+	// Start next turn: user seq 3 pending.
 	current, err := manager.Get(context.Background(), created.Key, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -83,14 +74,26 @@ func TestPersistSessionErrorAfterSeqAttachRules(t *testing.T) {
 	}
 	got = app.persistSessionError(root.ID, created.Key, "msg-mid", "session.message_failed", "turn", "runtime boom", false)
 	if got != 3 {
-		t.Fatalf("pending after_seq=%d want 3", got)
+		t.Fatalf("pending after_seq=%d want 3 (pending user)", got)
 	}
 
-	// 3) Non-send failure (no request_id) with no pending: last committed user.
-	//    Release pending without committing so history still ends at user seq 1.
-	_ = manager.DiscardPendingTurn(context.Background(), created.Key)
-	got = app.persistSessionError(root.ID, created.Key, "", "session.message_failed", "turn", "background fail", false)
-	if got != 1 {
-		t.Fatalf("background after_seq=%d want 1 (last committed user)", got)
+	// Complete user-only (empty agent discarded) then error: still under user 3.
+	if err := manager.CompletePendingTurn(context.Background(), created.Key); err != nil {
+		t.Fatalf("complete user only: %v", err)
+	}
+	got = app.persistSessionError(root.ID, created.Key, "msg-after", "session.message_failed", "turn", "consistency", false)
+	if got != 3 {
+		t.Fatalf("after user-only complete after_seq=%d want 3", got)
+	}
+	items, err := manager.ListSessionErrors(context.Background(), created.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range items {
+		if item.AfterSeq%2 == 0 && item.AfterSeq > 0 {
+			// Agent seqs in this fixture are even; errors must never use them.
+			// User seqs are odd. (Not a universal invariant, but true for this test.)
+			t.Fatalf("error attached to even/agent-like seq: %#v", item)
+		}
 	}
 }

@@ -66,7 +66,7 @@ type ExchangeAux struct {
 }
 
 // SessionError is a durable per-session failure for UI replay.
-// AfterMessageID / AfterSeq identify the last user-visible message before the error.
+// AfterSeq is the USER exchange seq the error panel attaches under (never agent).
 type SessionError struct {
 	ID             string    `json:"id"`
 	SessionKey     string    `json:"session_key"`

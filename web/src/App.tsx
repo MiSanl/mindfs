@@ -9891,9 +9891,8 @@ export function App({ onGoHome }: AppProps) {
                   : /peer disconnected|stream disconnected|504|timeout|connection/i.test(
                       errorMessage,
                     );
-              // Prefer server after_seq; else attach under the optimistic/latest user
-              // exchange so pre-pending failures (consistency check) do not pin to the
-              // previous message while after_seq is still 0.
+              // after_seq always pins under a USER message. Prefer server value; fall back
+              // to the latest local user exchange seq (optimistic bubble).
               const payloadAfterSeq = Number((payload as any)?.after_seq || 0);
               const cachedForSeq =
                 sessionCacheRef.current[cacheKey] ||

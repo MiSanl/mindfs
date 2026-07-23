@@ -2384,51 +2384,13 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 	if err != nil {
 		return err
 	}
-	if ProviderConsistencyChecker != nil {
-		if err := ProviderConsistencyChecker(in.Agent); err != nil {
-			return err
-		}
-	}
-	resolvedRequestedModel := resolveRuntimeModel(in.Agent, current, nil, in.Model)
-	if err := s.validateAgentModelForProvider(in.Agent, resolvedRequestedModel, providerConfig); err != nil {
-		log.Printf("[session/model] validate.error root=%s session=%s agent=%s model=%q err=%v", in.RootID, in.Key, strings.TrimSpace(in.Agent), strings.TrimSpace(in.Model), err)
-		return err
-	}
-	isInitial := len(current.Exchanges) == 0
-	agentPool := s.Registry.GetAgentPool()
-	if agentPool == nil {
-		return errors.New("agent pool not configured")
-	}
-	watcher, _ := s.Registry.GetFileWatcher(in.RootID, manager)
-	if watcher != nil {
-		watcher.RegisterSession(current.Key)
-		watcher.MarkSessionActive(current.Key)
-	}
-	root := manager.Root()
-	managedRootAbs, _ := root.RootDir()
-	rootAbs := managedRootAbs
-	if runtimeRootPath := strings.TrimSpace(in.RuntimeRootPath); runtimeRootPath != "" {
-		rootAbs = filepath.Clean(runtimeRootPath)
-	}
-	planMode := current != nil && current.PlanMode
-	sess, agentCtxSeq, err := s.ensureAgentSession(turnCtx, agentPool, manager, current, in.RootID, in.Agent, in.Model, in.Mode, in.Effort, in.FastService, rootAbs, binding, providerConfig)
-	if err != nil {
-		return err
-	}
-	setActiveTurnSession(in.RootID, current.Key, sess)
 
-	prompt := s.BuildPrompt(BuildPromptInput{
-		Session:        current,
-		Manager:        manager,
-		Agent:          in.Agent,
-		Message:        in.Content,
-		ClientContext:  in.ClientCtx,
-		AgentCtxSeq:    agentCtxSeq,
-		RuntimeRootAbs: rootAbs,
-		IsInitial:      isInitial,
-	})
+	// Materialize the outbound USER turn first so every later failure (consistency,
+	// model validate, open runtime, send) attaches the error under this user
+	// message — and refresh still shows that user bubble + error panel.
+	isInitial := len(current.Exchanges) == 0
 	resolvedMode := resolveRuntimeMode(in.Agent, current, in.Mode)
-	resolvedModel := resolveRuntimeModel(in.Agent, current, sess, in.Model)
+	resolvedModel := resolveRuntimeModel(in.Agent, current, nil, in.Model)
 	resolvedEffort := resolveRuntimeEffort(in.Agent, current, in.Effort)
 	resolvedFastService := resolveRuntimeFastService(in.Agent, current, in.FastService)
 	modelDisplayName := s.resolveExchangeModelDisplayName(in.Agent, resolvedModel)
@@ -2441,6 +2403,12 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 		session.Exchange{Seq: agentSeq, Role: "agent", Agent: in.Agent, ProviderID: providerID, ProviderName: providerName, Model: resolvedModel, ModelDisplayName: modelDisplayName, Mode: resolvedMode, Effort: resolvedEffort, FastService: resolvedFastService, Timestamp: turnStartedAt},
 	); err != nil {
 		return err
+	}
+	// CompletePendingTurn with empty agent content keeps only the user exchange.
+	commitUserOnly := func() {
+		if cerr := manager.CompletePendingTurn(ctx, current.Key); cerr != nil {
+			log.Printf("[session] pending.complete_user_only.error root=%s session=%s err=%v", in.RootID, current.Key, cerr)
+		}
 	}
 	// Durable diagnostic for UI (survives refresh): real request provider + model.
 	providerLabel := providerName
@@ -2466,6 +2434,55 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 	}); err != nil {
 		log.Printf("[session/turn] diagnostic.persist.error root=%s session=%s err=%v", in.RootID, current.Key, err)
 	}
+
+	if ProviderConsistencyChecker != nil {
+		if err := ProviderConsistencyChecker(in.Agent); err != nil {
+			commitUserOnly()
+			return err
+		}
+	}
+	if err := s.validateAgentModelForProvider(in.Agent, resolvedModel, providerConfig); err != nil {
+		log.Printf("[session/model] validate.error root=%s session=%s agent=%s model=%q err=%v", in.RootID, in.Key, strings.TrimSpace(in.Agent), strings.TrimSpace(in.Model), err)
+		commitUserOnly()
+		return err
+	}
+	agentPool := s.Registry.GetAgentPool()
+	if agentPool == nil {
+		commitUserOnly()
+		return errors.New("agent pool not configured")
+	}
+	watcher, _ := s.Registry.GetFileWatcher(in.RootID, manager)
+	if watcher != nil {
+		watcher.RegisterSession(current.Key)
+		watcher.MarkSessionActive(current.Key)
+	}
+	root := manager.Root()
+	managedRootAbs, _ := root.RootDir()
+	rootAbs := managedRootAbs
+	if runtimeRootPath := strings.TrimSpace(in.RuntimeRootPath); runtimeRootPath != "" {
+		rootAbs = filepath.Clean(runtimeRootPath)
+	}
+	planMode := current != nil && current.PlanMode
+	sess, agentCtxSeq, err := s.ensureAgentSession(turnCtx, agentPool, manager, current, in.RootID, in.Agent, in.Model, in.Mode, in.Effort, in.FastService, rootAbs, binding, providerConfig)
+	if err != nil {
+		commitUserOnly()
+		return err
+	}
+	setActiveTurnSession(in.RootID, current.Key, sess)
+	// Re-resolve model against the live runtime session (may refine display/defaults).
+	resolvedModel = resolveRuntimeModel(in.Agent, current, sess, in.Model)
+	modelDisplayName = s.resolveExchangeModelDisplayName(in.Agent, resolvedModel)
+
+	prompt := s.BuildPrompt(BuildPromptInput{
+		Session:        current,
+		Manager:        manager,
+		Agent:          in.Agent,
+		Message:        in.Content,
+		ClientContext:  in.ClientCtx,
+		AgentCtxSeq:    agentCtxSeq,
+		RuntimeRootAbs: rootAbs,
+		IsInitial:      isInitial,
+	})
 	var responseText string
 	sawAssistantChunk := false
 	plannedAssistantSeq := len(current.Exchanges) + 2
