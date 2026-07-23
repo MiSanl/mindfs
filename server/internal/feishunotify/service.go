@@ -314,8 +314,12 @@ func (s *Service) NotifyPayload(ctx context.Context, payload notify.Payload) {
 	if !s.Enabled() || !s.allowsEvent(payload.Type) || !s.shouldSend(notify.EventID(payload)) {
 		return
 	}
+	eventID := notify.EventID(payload)
 	go func() {
 		if err := s.send(ctx, payload); err != nil {
+			// Release the dedup reservation so a later retry of the same
+			// stable event (e.g. session requestID) can still deliver.
+			s.clearRecent(eventID)
 			log.Printf("[feishu-notify] send.error type=%s tag=%s err=%v", payload.Type, payload.Tag, err)
 		}
 	}()
@@ -368,8 +372,20 @@ func (s *Service) shouldSend(eventID string) bool {
 	if _, ok := s.recent[eventID]; ok {
 		return false
 	}
+	// Reserve the id before the async send so concurrent NotifyPayload calls
+	// for the same event collapse. clearRecent undoes this on send failure.
 	s.recent[eventID] = now
 	return true
+}
+
+func (s *Service) clearRecent(eventID string) {
+	eventID = strings.TrimSpace(eventID)
+	if eventID == "" || s == nil {
+		return
+	}
+	s.mu.Lock()
+	delete(s.recent, eventID)
+	s.mu.Unlock()
 }
 
 func (s *Service) send(ctx context.Context, payload notify.Payload) error {

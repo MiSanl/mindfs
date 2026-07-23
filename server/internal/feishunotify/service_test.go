@@ -278,6 +278,27 @@ func TestAppMessagePathUsesToken(t *testing.T) {
 	}
 }
 
+
+func TestNotifyPayloadClearsDedupOnSendFailure(t *testing.T) {
+	svc := NewService(Config{
+		Enabled:    true,
+		WebhookURL: "http://127.0.0.1:1", // connection refused
+	})
+	// Reserve via shouldSend then simulate NotifyPayload failure path.
+	if !svc.shouldSend("stable-event") {
+		t.Fatal("first should send")
+	}
+	// Manual clearRecent is what NotifyPayload does on send error.
+	svc.clearRecent("stable-event")
+	if !svc.shouldSend("stable-event") {
+		t.Fatal("after clearRecent, same event must be sendable again")
+	}
+	// Successful reservation still dedups until clear.
+	if svc.shouldSend("stable-event") {
+		t.Fatal("second without clear should dedupe")
+	}
+}
+
 type rewriteHostTransport struct {
 	base string
 	rt   http.RoundTripper

@@ -2203,16 +2203,24 @@ func (s *Service) ensureAgentSession(
 	sess, err := pool.GetOrCreate(openCtx, openInput)
 	var ctxSeqOverride *int
 	if err != nil {
-		if openInput.AgentSessionID != "" && binding != nil && strings.TrimSpace(binding.ProviderID) != "" {
-			log.Printf("[session/provider] resume.error session=%s agent=%s provider_id=%s model=%q action=fail_without_fallback err=%v", current.Key, agentName, binding.ProviderID, nextModel, err)
-		} else if openInput.AgentSessionID != "" {
-			log.Printf("[session/model] resume.error session=%s agent=%s model=%q mode=%q effort=%q fast_service=%q pool_session=%s agent_session_id=%s err=%v fallback=open_new_runtime_session", current.Key, agentName, nextModel, nextMode, nextEffort, nextFastService, poolSessionKey, openInput.AgentSessionID, err)
-			openInput.AgentSessionID = ""
-			openInput.AgentCtxSeq = 0
-			sess, err = pool.GetOrCreate(openCtx, openInput)
-			if err == nil {
-				zero := 0
-				ctxSeqOverride = &zero
+		if openInput.AgentSessionID != "" {
+			// Isolation-off: never hard-fail resume solely because a legacy
+			// ProviderID binding exists; fall back to a new runtime session.
+			if binding != nil && strings.TrimSpace(binding.ProviderID) != "" && sessionProviderIsolationAgent(agentName) {
+				log.Printf("[session/provider] resume.error session=%s agent=%s provider_id=%s model=%q action=fail_without_fallback err=%v", current.Key, agentName, binding.ProviderID, nextModel, err)
+			} else {
+				if binding != nil && strings.TrimSpace(binding.ProviderID) != "" {
+					log.Printf("[session/provider] resume.error session=%s agent=%s provider_id=%s model=%q action=fallback_open_new_runtime_session err=%v", current.Key, agentName, binding.ProviderID, nextModel, err)
+				} else {
+					log.Printf("[session/model] resume.error session=%s agent=%s model=%q mode=%q effort=%q fast_service=%q pool_session=%s agent_session_id=%s err=%v fallback=open_new_runtime_session", current.Key, agentName, nextModel, nextMode, nextEffort, nextFastService, poolSessionKey, openInput.AgentSessionID, err)
+				}
+				openInput.AgentSessionID = ""
+				openInput.AgentCtxSeq = 0
+				sess, err = pool.GetOrCreate(openCtx, openInput)
+				if err == nil {
+					zero := 0
+					ctxSeqOverride = &zero
+				}
 			}
 		}
 	}
@@ -2559,7 +2567,8 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 		if err != nil {
 			return err
 		}
-		if binding != nil && strings.TrimSpace(binding.ProviderID) != "" {
+		// Isolation-off: legacy ProviderID rows must not block kanban/goal.
+		if binding != nil && strings.TrimSpace(binding.ProviderID) != "" && sessionProviderIsolationAgent(in.Agent) {
 			return errors.New("session_provider_mismatch: session is provider-bound and cannot run with the global agent configuration; use a session that has system global provider or create a new kanban-bound session")
 		}
 	} else {
@@ -3015,7 +3024,7 @@ func (s *Service) RunTransientSlashCommand(ctx context.Context, in RunTransientS
 		if err != nil {
 			return err
 		}
-		if binding != nil && strings.TrimSpace(binding.ProviderID) != "" {
+		if binding != nil && strings.TrimSpace(binding.ProviderID) != "" && sessionProviderIsolationAgent(agentName) {
 			return errors.New("codex login is unavailable for an API-provider-bound session")
 		}
 	} else {
