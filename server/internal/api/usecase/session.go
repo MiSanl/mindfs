@@ -3020,7 +3020,8 @@ func (s *Service) RunTransientSlashCommand(ctx context.Context, in RunTransientS
 	var binding *session.AgentBinding
 	var providerConfig *SessionProviderConfig
 	if command == "login" {
-		if strings.TrimSpace(in.ProviderID) != "" {
+		// Isolation-off: wire provider_id is ignored (global config path).
+		if sessionProviderIsolationAgent(agentName) && strings.TrimSpace(in.ProviderID) != "" {
 			return errors.New("codex login is only available with the global agent configuration")
 		}
 		binding, err = manager.FindAgentBinding(ctx, current.Key, agentName)
