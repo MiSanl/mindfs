@@ -32,7 +32,6 @@ const (
 	exchangeFileTpl  = "sessions/%s.jsonl"
 	auxFileTpl       = "sessions/%s.aux.jsonl"
 	errorFileTpl       = "sessions/session-logs/%s.errors.jsonl"
-	legacyErrorFileTpl = "sessions/errors/%s.jsonl"
 	turnRequestFileTpl = "sessions/session-logs/%s.turn-requests.jsonl"
 	pendingFileTpl     = "sessions/pending/%s.json"
 	// maxSessionErrorsKept caps durable per-session error logs returned to the UI
@@ -406,32 +405,12 @@ func (m *Manager) AppendSessionError(ctx context.Context, sessionKey string, ent
 	if err != nil {
 		return err
 	}
-	if len(existing) == 0 {
-		if legacy, lerr := m.legacyErrorPath(sessionKey); lerr == nil {
-			if oldItems, oerr := m.readSessionLogEntriesUnsafe(legacy); oerr == nil && len(oldItems) > 0 {
-				// Drop any historical turn_request rows mixed into legacy errors.
-				filtered := make([]SessionError, 0, len(oldItems))
-				for _, it := range oldItems {
-					if strings.EqualFold(strings.TrimSpace(it.Kind), "turn_request") {
-						continue
-					}
-					filtered = append(filtered, it)
-				}
-				existing = filtered
-			}
-		}
-	}
 	items := append(existing, entry)
 	if len(items) > maxSessionErrorsKept {
 		items = items[len(items)-maxSessionErrorsKept:]
 	}
 	if err := m.writeSessionLogEntriesUnsafe(path, items); err != nil {
 		return err
-	}
-	if legacy, lerr := m.legacyErrorPath(sessionKey); lerr == nil {
-		if metaDir, merr := m.root.EnsureMetaDir(); merr == nil {
-			_ = os.Remove(filepath.Join(metaDir, filepath.FromSlash(legacy)))
-		}
 	}
 	return nil
 }
@@ -498,29 +477,14 @@ func (m *Manager) ListSessionErrors(_ context.Context, sessionKey string) ([]Ses
 	if err != nil {
 		return nil, err
 	}
-	if len(items) == 0 {
-		if legacy, lerr := m.legacyErrorPath(sessionKey); lerr == nil {
-			if oldItems, oerr := m.readSessionLogEntriesUnsafe(legacy); oerr == nil {
-				filtered := make([]SessionError, 0, len(oldItems))
-				for _, it := range oldItems {
-					if strings.EqualFold(strings.TrimSpace(it.Kind), "turn_request") {
-						continue
-					}
-					filtered = append(filtered, it)
-				}
-				items = filtered
-			}
+	filtered := make([]SessionError, 0, len(items))
+	for _, it := range items {
+		if strings.EqualFold(strings.TrimSpace(it.Kind), "turn_request") {
+			continue
 		}
-	} else {
-		filtered := make([]SessionError, 0, len(items))
-		for _, it := range items {
-			if strings.EqualFold(strings.TrimSpace(it.Kind), "turn_request") {
-				continue
-			}
-			filtered = append(filtered, it)
-		}
-		items = filtered
+		filtered = append(filtered, it)
 	}
+	items = filtered
 	if items == nil {
 		return []SessionError{}, nil
 	}
@@ -1490,7 +1454,7 @@ func (m *Manager) deleteSessionUnsafe(key string) error {
 	if err := os.Remove(filepath.Join(metaDir, filepath.FromSlash(auxPath))); err != nil && !os.IsNotExist(err) {
 		return err
 	}
-	for _, pathFn := range []func(string) (string, error){m.errorPath, m.legacyErrorPath, m.turnRequestPath} {
+	for _, pathFn := range []func(string) (string, error){m.errorPath, m.turnRequestPath} {
 		if p, err := pathFn(key); err == nil {
 			if err := os.Remove(filepath.Join(metaDir, filepath.FromSlash(p))); err != nil && !os.IsNotExist(err) {
 				return err
@@ -2200,13 +2164,6 @@ func (m *Manager) errorPath(key string) (string, error) {
 	return filepath.ToSlash(fmt.Sprintf(errorFileTpl, key)), nil
 }
 
-func (m *Manager) legacyErrorPath(key string) (string, error) {
-	key = strings.TrimSpace(key)
-	if key == "" {
-		return "", errors.New("session key required")
-	}
-	return filepath.ToSlash(fmt.Sprintf(legacyErrorFileTpl, key)), nil
-}
 
 func (m *Manager) turnRequestPath(key string) (string, error) {
 	key = strings.TrimSpace(key)
