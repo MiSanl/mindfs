@@ -571,6 +571,7 @@ function toSessionItem(
     runtime: session?.runtime && typeof session.runtime === "object" ? session.runtime : undefined,
     runtimes: Array.isArray(session?.runtimes) ? session.runtimes : undefined,
     errors: Array.isArray(session?.errors) ? session.errors : undefined,
+    turn_requests: Array.isArray((session as any)?.turn_requests) ? (session as any).turn_requests : undefined,
     shell: typeof session?.shell === "string" ? session.shell : "",
     mode:
       typeof session?.mode === "string" && session.mode.trim()
@@ -5325,7 +5326,9 @@ export function App({ onGoHome }: AppProps) {
         }
       };
       const refreshSessionErrors = () => {
-        void sessionService.getSessionErrors(targetRoot, key).then((serverErrors) => {
+        void sessionService.getSessionLogs(targetRoot, key).then((logs) => {
+          const serverErrors = logs ? logs.errors : null;
+          const turnRequests = logs ? logs.turn_requests : [];
           // null means fetch failed — keep existing optimistic/local errors.
           if (serverErrors == null || !Array.isArray(serverErrors)) return;
           const existing = sessionCacheRef.current[cacheKey];
@@ -5344,6 +5347,7 @@ export function App({ onGoHome }: AppProps) {
             sessionCacheRef.current[cacheKey] = {
               ...(existing as any),
               errors: merged,
+                    turn_requests: (typeof turnRequests !== "undefined" ? turnRequests : ((prev as any)?.turn_requests || [])),
             } as any;
           }
           setSelectedSession((prev) => {
@@ -5359,6 +5363,7 @@ export function App({ onGoHome }: AppProps) {
               setDrawerSessionForRoot(targetRoot, {
                 ...(drawer as any),
                 errors: merged,
+                    turn_requests: (typeof turnRequests !== "undefined" ? turnRequests : ((prev as any)?.turn_requests || [])),
               } as Session);
             }
           }
@@ -9876,7 +9881,9 @@ export function App({ onGoHome }: AppProps) {
                 return { ...(prev as any), errors: nextErrors } as SessionItem;
               });
               bumpCacheVersion();
-              void sessionService.getSessionErrors(errRoot, errKey).then((serverErrors) => {
+              void sessionService.getSessionLogs(errRoot, errKey).then((logs) => {
+                const serverErrors = logs ? logs.errors : null;
+                const turnRequests = logs ? logs.turn_requests : [];
                 // Prefer server list; keep optimistic only while a turn may still
                 // be racing durable append. Empty server list is authoritative when
                 // no in-flight turn remains.
@@ -9889,6 +9896,7 @@ export function App({ onGoHome }: AppProps) {
                   sessionCacheRef.current[cacheKey] = {
                     ...(sessionCacheRef.current[cacheKey] as any),
                     errors: merged,
+                    turn_requests: (typeof turnRequests !== "undefined" ? turnRequests : ((prev as any)?.turn_requests || [])),
                   } as any;
                 }
                 const drawer = drawerSessionByRootRef.current[errRoot];

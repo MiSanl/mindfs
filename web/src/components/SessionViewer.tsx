@@ -1095,12 +1095,106 @@ function SessionViewerInner({
   const sessionErrors = Array.isArray((session as any)?.errors)
     ? ((session as any).errors as Array<Record<string, any>>)
     : [];
-  const [errorsExpanded, setErrorsExpanded] = useState(sessionErrors.length > 0);
-  useEffect(() => {
-    if (sessionErrors.length > 0) {
-      setErrorsExpanded(true);
+
+  const sessionTurnRequests = Array.isArray((session as any)?.turn_requests)
+    ? ((session as any).turn_requests as Array<Record<string, any>>)
+    : [];
+  const errorsByAfterSeq = React.useMemo(() => {
+    const map = new Map<number, Array<Record<string, any>>>();
+    for (const item of sessionErrors) {
+      if (String((item as any)?.kind || "") === "turn_request") continue;
+      const seq = Number((item as any)?.after_seq || 0);
+      if (!seq) continue;
+      const list = map.get(seq) || [];
+      list.push(item);
+      map.set(seq, list);
     }
-  }, [sessionErrors.length, (session as any)?.key || (session as any)?.session_key]);
+    return map;
+  }, [sessionErrors]);
+  const turnRequestByAfterSeq = React.useMemo(() => {
+    const map = new Map<number, Record<string, any>>();
+    for (const item of sessionTurnRequests) {
+      const seq = Number((item as any)?.after_seq || 0);
+      if (!seq) continue;
+      map.set(seq, item);
+    }
+    return map;
+  }, [sessionTurnRequests]);
+
+  const renderInlineSessionErrorPanel = (items: Array<Record<string, any>>, keyPrefix: string) => {
+    if (!items.length) return null;
+    return (
+      <div
+        key={keyPrefix}
+        style={{
+          marginTop: "8px",
+          border: "1px solid color-mix(in srgb, var(--danger-color, #d14343) 45%, var(--border-color))",
+          background: "color-mix(in srgb, var(--danger-color, #d14343) 8%, var(--panel-bg, var(--bg-color)))",
+          borderRadius: "10px",
+          padding: "10px 12px",
+          width: "100%",
+          boxSizing: "border-box",
+        }}
+      >
+        {items.map((item, index) => {
+          const key = String(item.id || item.request_id || `${keyPrefix}-${index}`);
+          const ts = item.timestamp ? String(item.timestamp) : "";
+          return (
+            <div
+              key={key}
+              style={{
+                borderTop: index === 0 ? "none" : "1px solid var(--border-color)",
+                paddingTop: index === 0 ? 0 : 8,
+                fontSize: "12px",
+                color: "var(--text-primary)",
+                whiteSpace: "pre-wrap",
+                wordBreak: "break-word",
+              }}
+            >
+              <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", marginBottom: 4, color: "var(--text-secondary)" }}>
+                <span>{t("session.errorPanelTitle")}</span>
+                {item.agent ? <span>{String(item.agent)}</span> : null}
+                {(item as any).provider_name || (item as any).provider_id ? (
+                  <span>{String((item as any).provider_name || (item as any).provider_id)}</span>
+                ) : null}
+                {item.model ? <span>{String(item.model)}</span> : null}
+                {item.recoverable ? <span>{t("session.errorRecoverable")}</span> : null}
+                {ts ? <span>{ts}</span> : null}
+              </div>
+              <div>{String(item.message || "")}</div>
+              {item.request_id ? (
+                <div style={{ marginTop: 4, color: "var(--text-secondary)" }}>
+                  request: {String(item.request_id)}
+                </div>
+              ) : null}
+            </div>
+          );
+        })}
+      </div>
+    );
+  };
+
+  const renderTurnRequestChip = (item: Record<string, any> | undefined) => {
+    if (!item) return null;
+    const provider = String(item.provider_name || item.provider_id || "system_global");
+    const model = String(item.model || "");
+    return (
+      <div
+        style={{
+          marginTop: "6px",
+          fontSize: "11px",
+          color: "var(--text-secondary)",
+          display: "flex",
+          gap: "6px",
+          flexWrap: "wrap",
+        }}
+      >
+        <span style={{ fontWeight: 600 }}>{t("session.turnRequest")}</span>
+        <span>{provider}</span>
+        {model ? <span>· {model}</span> : null}
+      </div>
+    );
+  };
   const { timeline, isStreaming, streamVersion, streamStatusText } = useSessionStream(
     sessionKey,
     exchanges,
@@ -2506,95 +2600,28 @@ if (useInnerScrollContainer && !container) {
                 ))}
               </div>
             ) : null}
-            {timeline.map((item, idx) =>
-              renderTimelineItem(
-                item,
-                idx,
-                timelineItemSpacing(idx > 0 ? timeline[idx - 1] : null, item),
-              ),
-            )}
+            {timeline.map((item, idx) => {
+              const spacing = timelineItemSpacing(idx > 0 ? timeline[idx - 1] : null, item);
+              const node = renderTimelineItem(item, idx, spacing);
+              if (item.type !== "user_text") {
+                return node;
+              }
+              const seq = Number((item as any).seq || 0);
+              const inlineErrors = seq > 0 ? (errorsByAfterSeq.get(seq) || []) : [];
+              const turnReq = seq > 0 ? turnRequestByAfterSeq.get(seq) : undefined;
+              if (!inlineErrors.length && !turnReq) {
+                return node;
+              }
+              return (
+                <div key={`wrap-${item.id || idx}`}>
+                  {node}
+                  {renderTurnRequestChip(turnReq)}
+                  {renderInlineSessionErrorPanel(inlineErrors, `err-${seq || idx}`)}
+                </div>
+              );
+            })}
             {renderSlashCommandResult()}
-            {sessionErrors.length > 0 && (
-              <div
-                style={{
-                  marginTop: "16px",
-                  border: "1px solid color-mix(in srgb, var(--danger-color, #d14343) 45%, var(--border-color))",
-                  background: "color-mix(in srgb, var(--danger-color, #d14343) 8%, var(--panel-bg, var(--bg-color)))",
-                  borderRadius: "10px",
-                  padding: "10px 12px",
-                  width: "100%",
-                  boxSizing: "border-box",
-                }}
-              >
-                <button
-                  type="button"
-                  onClick={() => setErrorsExpanded((v) => !v)}
-                  style={{
-                    all: "unset",
-                    cursor: "pointer",
-                    display: "flex",
-                    width: "100%",
-                    justifyContent: "space-between",
-                    alignItems: "center",
-                    color: "var(--danger-color, #d14343)",
-                    fontSize: "12px",
-                    fontWeight: 600,
-                  }}
-                >
-                  <span>
-                    {errorsExpanded
-                      ? t("session.errorHide")
-                      : t("session.errorShow", { count: sessionErrors.length })}
-                  </span>
-                  <span>{errorsExpanded ? "▾" : "▸"}</span>
-                </button>
-                {errorsExpanded ? (
-                  <div style={{ marginTop: "10px", display: "grid", gap: "8px" }}>
-                    <div style={{ fontSize: "12px", color: "var(--text-secondary)" }}>
-                      {t("session.errorsTitle")}
-                    </div>
-                    {sessionErrors.map((item, index) => {
-                      const key = String(item.id || item.request_id || index);
-                      const afterSeq = Number(item.after_seq || 0);
-                      const ts = item.timestamp ? String(item.timestamp) : "";
-                      return (
-                        <div
-                          key={key}
-                          style={{
-                            borderTop: index === 0 ? "none" : "1px solid var(--border-color)",
-                            paddingTop: index === 0 ? 0 : 8,
-                            fontSize: "12px",
-                            color: "var(--text-primary)",
-                            whiteSpace: "pre-wrap",
-                            wordBreak: "break-word",
-                          }}
-                        >
-                          <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", marginBottom: 4, color: "var(--text-secondary)" }}>
-                            {afterSeq > 0 ? <span>{t("session.errorAfterSeq", { seq: afterSeq })}</span> : null}
-                            {item.agent ? <span>{String(item.agent)}</span> : null}
-                            {(item as any).provider_name || (item as any).provider_id ? (
-                              <span>{String((item as any).provider_name || (item as any).provider_id || "system_global")}</span>
-                            ) : (item as any).kind === "turn_request" ? (
-                              <span>system_global</span>
-                            ) : null}
-                            {item.model ? <span>{String(item.model)}</span> : null}
-                            {(item as any).kind === "turn_request" ? <span>{t("session.turnRequest")}</span> : null}
-                            {item.recoverable ? <span>{t("session.errorRecoverable")}</span> : null}
-                            {ts ? <span>{ts}</span> : null}
-                          </div>
-                          <div>{String(item.message || "")}</div>
-                          {item.request_id ? (
-                            <div style={{ marginTop: 4, color: "var(--text-secondary)" }}>
-                              request: {String(item.request_id)}
-                            </div>
-                          ) : null}
-                        </div>
-                      );
-                    })}
-                  </div>
-                ) : null}
-              </div>
-            )}
+            
             {(isAwaiting || isStreaming) && (
               <div
                 style={{

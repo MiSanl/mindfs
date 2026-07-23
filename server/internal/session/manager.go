@@ -31,11 +31,14 @@ const (
 	sessionDBLinkExt = ".link"
 	exchangeFileTpl  = "sessions/%s.jsonl"
 	auxFileTpl       = "sessions/%s.aux.jsonl"
-	errorFileTpl     = "sessions/errors/%s.jsonl"
-	pendingFileTpl   = "sessions/pending/%s.json"
+	errorFileTpl       = "sessions/session-logs/%s.errors.jsonl"
+	legacyErrorFileTpl = "sessions/errors/%s.jsonl"
+	turnRequestFileTpl = "sessions/session-logs/%s.turn-requests.jsonl"
+	pendingFileTpl     = "sessions/pending/%s.json"
 	// maxSessionErrorsKept caps durable per-session error logs returned to the UI
 	// and rewritten on disk after append, so GET session stays bounded.
 	maxSessionErrorsKept = 100
+	maxTurnRequestsKept  = 200
 	selectSessionSQL = `
 	SELECT key, type, parent_session_key, parent_tool_call_id, source, task_id, model, shell, plan_mode, name, related_files_json, related_worktree_json, created_at, updated_at, closed_at
 	FROM sessions`
@@ -371,22 +374,18 @@ func (m *Manager) PeekPendingTurn(_ context.Context, sessionKey string) (*Pendin
 	return m.readPendingTurnUnsafe(sessionKey)
 }
 
-// AppendSessionError appends a durable error record under sessions/errors/<key>.jsonl.
-// The on-disk log is trimmed to the newest maxSessionErrorsKept entries.
-func (m *Manager) AppendSessionError(_ context.Context, sessionKey string, entry SessionError) error {
+// AppendSessionError appends a durable failure under sessions/session-logs/<key>.errors.jsonl.
+// Kind "turn_request" is routed to the separate turn-requests log instead.
+func (m *Manager) AppendSessionError(ctx context.Context, sessionKey string, entry SessionError) error {
+	if strings.EqualFold(strings.TrimSpace(entry.Kind), "turn_request") {
+		return m.AppendTurnRequest(ctx, sessionKey, entry)
+	}
 	sessionKey = strings.TrimSpace(sessionKey)
 	if sessionKey == "" {
 		return errors.New("session key required")
 	}
-	if strings.TrimSpace(entry.Message) == "" && strings.TrimSpace(entry.Kind) != "turn_request" {
-		return errors.New("error message required")
-	}
 	if strings.TrimSpace(entry.Message) == "" {
-		// Diagnostic markers (e.g. kind=turn_request) may omit free-form text.
-		entry.Message = strings.TrimSpace(entry.Kind)
-		if entry.Message == "" {
-			entry.Message = "diagnostic"
-		}
+		return errors.New("error message required")
 	}
 	if strings.TrimSpace(entry.ID) == "" {
 		entry.ID = "err-" + randomHex(8)
@@ -403,18 +402,87 @@ func (m *Manager) AppendSessionError(_ context.Context, sessionKey string, entry
 	if err != nil {
 		return err
 	}
-	existing, err := m.readSessionErrorsUnsafe(path)
+	existing, err := m.readSessionLogEntriesUnsafe(path)
 	if err != nil {
 		return err
+	}
+	if len(existing) == 0 {
+		if legacy, lerr := m.legacyErrorPath(sessionKey); lerr == nil {
+			if oldItems, oerr := m.readSessionLogEntriesUnsafe(legacy); oerr == nil && len(oldItems) > 0 {
+				// Drop any historical turn_request rows mixed into legacy errors.
+				filtered := make([]SessionError, 0, len(oldItems))
+				for _, it := range oldItems {
+					if strings.EqualFold(strings.TrimSpace(it.Kind), "turn_request") {
+						continue
+					}
+					filtered = append(filtered, it)
+				}
+				existing = filtered
+			}
+		}
 	}
 	items := append(existing, entry)
 	if len(items) > maxSessionErrorsKept {
 		items = items[len(items)-maxSessionErrorsKept:]
 	}
-	return m.writeSessionErrorsUnsafe(path, items)
+	if err := m.writeSessionLogEntriesUnsafe(path, items); err != nil {
+		return err
+	}
+	if legacy, lerr := m.legacyErrorPath(sessionKey); lerr == nil {
+		if metaDir, merr := m.root.EnsureMetaDir(); merr == nil {
+			_ = os.Remove(filepath.Join(metaDir, filepath.FromSlash(legacy)))
+		}
+	}
+	return nil
+}
+
+// AppendTurnRequest records the actual provider/model used for a user turn.
+// Stored under sessions/session-logs/<key>.turn-requests.jsonl (not errors).
+func (m *Manager) AppendTurnRequest(_ context.Context, sessionKey string, entry SessionError) error {
+	sessionKey = strings.TrimSpace(sessionKey)
+	if sessionKey == "" {
+		return errors.New("session key required")
+	}
+	entry.Kind = "turn_request"
+	if strings.TrimSpace(entry.Code) == "" {
+		entry.Code = "session.turn_request"
+	}
+	if strings.TrimSpace(entry.Message) == "" {
+		providerLabel := strings.TrimSpace(entry.ProviderName)
+		if providerLabel == "" {
+			providerLabel = "system_global"
+		}
+		modelLabel := strings.TrimSpace(entry.Model)
+		entry.Message = "request provider=" + providerLabel + " model=" + modelLabel
+	}
+	if strings.TrimSpace(entry.ID) == "" {
+		entry.ID = "turn-" + randomHex(8)
+	}
+	entry.SessionKey = sessionKey
+	if entry.Timestamp.IsZero() {
+		entry.Timestamp = m.now().UTC()
+	} else {
+		entry.Timestamp = entry.Timestamp.UTC()
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	path, err := m.turnRequestPath(sessionKey)
+	if err != nil {
+		return err
+	}
+	existing, err := m.readSessionLogEntriesUnsafe(path)
+	if err != nil {
+		return err
+	}
+	items := append(existing, entry)
+	if len(items) > maxTurnRequestsKept {
+		items = items[len(items)-maxTurnRequestsKept:]
+	}
+	return m.writeSessionLogEntriesUnsafe(path, items)
 }
 
 // ListSessionErrors returns durable session errors for UI replay (newest-capped).
+// Does not include turn_request diagnostics (see ListTurnRequests).
 func (m *Manager) ListSessionErrors(_ context.Context, sessionKey string) ([]SessionError, error) {
 	sessionKey = strings.TrimSpace(sessionKey)
 	if sessionKey == "" {
@@ -426,9 +494,32 @@ func (m *Manager) ListSessionErrors(_ context.Context, sessionKey string) ([]Ses
 	if err != nil {
 		return nil, err
 	}
-	items, err := m.readSessionErrorsUnsafe(path)
+	items, err := m.readSessionLogEntriesUnsafe(path)
 	if err != nil {
 		return nil, err
+	}
+	if len(items) == 0 {
+		if legacy, lerr := m.legacyErrorPath(sessionKey); lerr == nil {
+			if oldItems, oerr := m.readSessionLogEntriesUnsafe(legacy); oerr == nil {
+				filtered := make([]SessionError, 0, len(oldItems))
+				for _, it := range oldItems {
+					if strings.EqualFold(strings.TrimSpace(it.Kind), "turn_request") {
+						continue
+					}
+					filtered = append(filtered, it)
+				}
+				items = filtered
+			}
+		}
+	} else {
+		filtered := make([]SessionError, 0, len(items))
+		for _, it := range items {
+			if strings.EqualFold(strings.TrimSpace(it.Kind), "turn_request") {
+				continue
+			}
+			filtered = append(filtered, it)
+		}
+		items = filtered
 	}
 	if items == nil {
 		return []SessionError{}, nil
@@ -439,7 +530,32 @@ func (m *Manager) ListSessionErrors(_ context.Context, sessionKey string) ([]Ses
 	return items, nil
 }
 
-func (m *Manager) readSessionErrorsUnsafe(path string) ([]SessionError, error) {
+// ListTurnRequests returns durable per-turn request diagnostics (provider/model).
+func (m *Manager) ListTurnRequests(_ context.Context, sessionKey string) ([]SessionError, error) {
+	sessionKey = strings.TrimSpace(sessionKey)
+	if sessionKey == "" {
+		return nil, errors.New("session key required")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	path, err := m.turnRequestPath(sessionKey)
+	if err != nil {
+		return nil, err
+	}
+	items, err := m.readSessionLogEntriesUnsafe(path)
+	if err != nil {
+		return nil, err
+	}
+	if items == nil {
+		return []SessionError{}, nil
+	}
+	if len(items) > maxTurnRequestsKept {
+		items = items[len(items)-maxTurnRequestsKept:]
+	}
+	return items, nil
+}
+
+func (m *Manager) readSessionLogEntriesUnsafe(path string) ([]SessionError, error) {
 	payload, err := m.root.ReadMetaFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -469,7 +585,7 @@ func (m *Manager) readSessionErrorsUnsafe(path string) ([]SessionError, error) {
 	return items, nil
 }
 
-func (m *Manager) writeSessionErrorsUnsafe(path string, items []SessionError) error {
+func (m *Manager) writeSessionLogEntriesUnsafe(path string, items []SessionError) error {
 	if len(items) == 0 {
 		metaDir, err := m.root.EnsureMetaDir()
 		if err != nil {
@@ -492,6 +608,7 @@ func (m *Manager) writeSessionErrorsUnsafe(path string, items []SessionError) er
 	}
 	return m.root.WriteMetaFile(path, []byte(b.String()))
 }
+
 
 func (m *Manager) GetExchangeAux(_ context.Context, key string, afterSeq int) (map[int][]ExchangeAux, error) {
 	m.mu.Lock()
@@ -1373,9 +1490,11 @@ func (m *Manager) deleteSessionUnsafe(key string) error {
 	if err := os.Remove(filepath.Join(metaDir, filepath.FromSlash(auxPath))); err != nil && !os.IsNotExist(err) {
 		return err
 	}
-	if errorPath, err := m.errorPath(key); err == nil {
-		if err := os.Remove(filepath.Join(metaDir, filepath.FromSlash(errorPath))); err != nil && !os.IsNotExist(err) {
-			return err
+	for _, pathFn := range []func(string) (string, error){m.errorPath, m.legacyErrorPath, m.turnRequestPath} {
+		if p, err := pathFn(key); err == nil {
+			if err := os.Remove(filepath.Join(metaDir, filepath.FromSlash(p))); err != nil && !os.IsNotExist(err) {
+				return err
+			}
 		}
 	}
 	if pendingPath, err := m.pendingPath(key); err == nil {
@@ -2074,17 +2193,29 @@ func (m *Manager) auxPath(key string) (string, error) {
 }
 
 func (m *Manager) errorPath(key string) (string, error) {
-	if strings.TrimSpace(m.root.MetaDir()) == "" {
-		return "", errors.New("managed dir required")
-	}
+	key = strings.TrimSpace(key)
 	if key == "" {
 		return "", errors.New("session key required")
 	}
-	if strings.Contains(key, "..") || strings.ContainsRune(key, filepath.Separator) || strings.Contains(key, "/") {
-		return "", fmt.Errorf("invalid session key: %s", key)
-	}
 	return filepath.ToSlash(fmt.Sprintf(errorFileTpl, key)), nil
 }
+
+func (m *Manager) legacyErrorPath(key string) (string, error) {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return "", errors.New("session key required")
+	}
+	return filepath.ToSlash(fmt.Sprintf(legacyErrorFileTpl, key)), nil
+}
+
+func (m *Manager) turnRequestPath(key string) (string, error) {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return "", errors.New("session key required")
+	}
+	return filepath.ToSlash(fmt.Sprintf(turnRequestFileTpl, key)), nil
+}
+
 
 func (m *Manager) ensureSessionMetaDBUnsafe() (*sql.DB, error) {
 	if m.db != nil {

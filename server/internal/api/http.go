@@ -313,6 +313,8 @@ func (h *HTTPHandler) Routes() http.Handler {
 	r.Post("/api/sessions/{key}/sync", h.protectedEndpoint(h.handleSessionSync))
 	r.Get("/api/sessions/{key}", h.protectedEndpoint(h.handleSessionGet))
 	r.Get("/api/sessions/{key}/errors", h.protectedEndpoint(h.handleSessionErrorsGet))
+		r.Get("/api/sessions/{key}/turn-requests", h.protectedEndpoint(h.handleSessionTurnRequestsGet))
+		r.Get("/api/sessions/{key}/logs", h.protectedEndpoint(h.handleSessionLogsGet))
 	r.Get("/api/sessions/{key}/related-files", h.protectedEndpoint(h.handleSessionRelatedFilesGet))
 	r.Post("/api/sessions/{key}/rename", h.protectedEndpoint(h.handleSessionRename))
 	r.Delete("/api/sessions/{key}/related-files", h.protectedEndpoint(h.handleSessionRelatedFilesDelete))
@@ -784,6 +786,84 @@ func (h *HTTPHandler) handleSessionErrorsGet(w http.ResponseWriter, r *http.Requ
 		"errors":      errorsList,
 	})
 }
+
+func (h *HTTPHandler) handleSessionTurnRequestsGet(w http.ResponseWriter, r *http.Request) {
+	rootID := r.URL.Query().Get("root")
+	key := chi.URLParam(r, "key")
+	if strings.TrimSpace(key) == "" {
+		respondError(w, http.StatusBadRequest, errInvalidRequest("session key required"))
+		return
+	}
+	if h.AppContext == nil {
+		respondError(w, http.StatusServiceUnavailable, errors.New("app context unavailable"))
+		return
+	}
+	manager, err := h.AppContext.GetSessionManager(rootID)
+	if err != nil {
+		respondError(w, http.StatusNotFound, err)
+		return
+	}
+	if _, err := manager.Get(r.Context(), key, 0); err != nil {
+		respondError(w, http.StatusNotFound, err)
+		return
+	}
+	items, err := manager.ListTurnRequests(r.Context(), key)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if items == nil {
+		items = []session.SessionError{}
+	}
+	respondJSON(w, http.StatusOK, map[string]any{
+		"session_key":   key,
+		"turn_requests": items,
+	})
+}
+
+func (h *HTTPHandler) handleSessionLogsGet(w http.ResponseWriter, r *http.Request) {
+	rootID := r.URL.Query().Get("root")
+	key := chi.URLParam(r, "key")
+	if strings.TrimSpace(key) == "" {
+		respondError(w, http.StatusBadRequest, errInvalidRequest("session key required"))
+		return
+	}
+	if h.AppContext == nil {
+		respondError(w, http.StatusServiceUnavailable, errors.New("app context unavailable"))
+		return
+	}
+	manager, err := h.AppContext.GetSessionManager(rootID)
+	if err != nil {
+		respondError(w, http.StatusNotFound, err)
+		return
+	}
+	if _, err := manager.Get(r.Context(), key, 0); err != nil {
+		respondError(w, http.StatusNotFound, err)
+		return
+	}
+	errorsList, err := manager.ListSessionErrors(r.Context(), key)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, err)
+		return
+	}
+	turns, err := manager.ListTurnRequests(r.Context(), key)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if errorsList == nil {
+		errorsList = []session.SessionError{}
+	}
+	if turns == nil {
+		turns = []session.SessionError{}
+	}
+	respondJSON(w, http.StatusOK, map[string]any{
+		"session_key":   key,
+		"errors":        errorsList,
+		"turn_requests": turns,
+	})
+}
+
 
 func (h *HTTPHandler) handleSessionGet(w http.ResponseWriter, r *http.Request) {
 	rootID := r.URL.Query().Get("root")

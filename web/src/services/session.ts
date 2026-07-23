@@ -91,6 +91,10 @@ export type ExchangeAux = {
 };
 
 export type SessionErrorRecord = {
+  provider_id?: string;
+  provider_name?: string;
+  kind?: string;
+
   id: string;
   session_key?: string;
   request_id?: string;
@@ -1198,6 +1202,26 @@ class SessionService {
     } catch (err) {
       console.error("[Session] Failed to get session errors:", err);
       // null = request failed; callers must not treat this as an empty log.
+      return null;
+    }
+  }
+
+  async getSessionLogs(
+    rootId: string,
+    sessionKey: string,
+  ): Promise<{ errors: SessionErrorRecord[]; turn_requests: SessionErrorRecord[] } | null> {
+    try {
+      const params = new URLSearchParams({ root: rootId });
+      const data = await protectedJSON<{
+        errors?: SessionErrorRecord[];
+        turn_requests?: SessionErrorRecord[];
+      }>(appURL(`/api/sessions/${encodeURIComponent(sessionKey)}/logs`, params));
+      return {
+        errors: Array.isArray(data?.errors) ? data.errors : [],
+        turn_requests: Array.isArray(data?.turn_requests) ? data.turn_requests : [],
+      };
+    } catch (err) {
+      console.error("[Session] Failed to get session logs:", err);
       return null;
     }
   }

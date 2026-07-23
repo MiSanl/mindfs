@@ -48,7 +48,7 @@ func TestAppendAndListSessionErrors(t *testing.T) {
 	if items[0].ID == "" {
 		t.Fatal("expected generated id")
 	}
-	metaPath := filepath.ToSlash(filepath.Join("sessions", "errors", created.Key+".jsonl"))
+	metaPath := filepath.ToSlash(filepath.Join("sessions", "session-logs", created.Key+".errors.jsonl"))
 	if _, err := manager.Root().ReadMetaFile(metaPath); err != nil {
 		t.Fatalf("read error file via meta: %v", err)
 	}
@@ -88,7 +88,7 @@ func TestSessionErrorCapAndDeleteCleanup(t *testing.T) {
 	if err := manager.Delete(context.Background(), created.Key); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
-	metaPath := filepath.ToSlash(filepath.Join("sessions", "errors", created.Key+".jsonl"))
+	metaPath := filepath.ToSlash(filepath.Join("sessions", "session-logs", created.Key+".errors.jsonl"))
 	if _, err := manager.Root().ReadMetaFile(metaPath); err == nil {
 		t.Fatal("expected error log removed after delete")
 	}
@@ -115,11 +115,19 @@ func TestAppendTurnRequestDiagnostic(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	items, err := manager.ListSessionErrors(context.Background(), created.Key)
+	items, err := manager.ListTurnRequests(context.Background(), created.Key)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(items) != 1 || items[0].Kind != "turn_request" || items[0].ProviderName != "Grok Relay" {
 		t.Fatalf("%#v", items)
+	}
+	// turn requests must not appear in errors list
+	errs, err := manager.ListSessionErrors(context.Background(), created.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(errs) != 0 {
+		t.Fatalf("errors should not include turn_request: %#v", errs)
 	}
 }
