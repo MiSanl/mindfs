@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -276,5 +277,67 @@ base_url = "https://other.example/v1"
 	}
 	if !strings.Contains(detail, "model_provider=other") {
 		t.Fatalf("detail=%q", detail)
+	}
+}
+
+func TestOpenCodeConsistencyUsesNamedProviderBaseURL(t *testing.T) {
+	dir := t.TempDir()
+	// Windows UserHomeDir follows USERPROFILE.
+	t.Setenv("USERPROFILE", dir)
+	t.Setenv("HOME", dir)
+	cfgDir := filepath.Join(dir, ".config", "opencode")
+	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Multi-provider layout: no top-level baseURL; selected provider nested.
+	cfg := map[string]any{
+		"model": "sub2.bond.plus/gpt-5.5",
+		"provider": map[string]any{
+			"ilfy": map[string]any{
+				"name": "ilfy",
+				"options": map[string]any{
+					"baseURL": "https://one.iflytek.com/api/llm/console/chat/v1",
+					"apiKey":  "sk-ilfy",
+				},
+			},
+			"sub2.bond.plus": map[string]any{
+				"name": "sub2.bond.plus",
+				"options": map[string]any{
+					"baseURL": "https://sub2.freevinc.bond/v1",
+					"apiKey":  "sk-sub2",
+				},
+			},
+		},
+	}
+	raw, _ := json.MarshalIndent(cfg, "", "  ")
+	if err := os.WriteFile(filepath.Join(cfgDir, "opencode.json"), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ok, detail := selectedProviderMatchesEffective("opencode", agentAPIProvider{
+		ID:      "api-sub2-bond-plus",
+		Name:    "sub2.bond.plus",
+		BaseURL: "https://sub2.freevinc.bond",
+	}, nil)
+	if !ok {
+		t.Fatalf("expected match for nested provider baseURL, detail=%q", detail)
+	}
+
+	// Wrong nested base should mismatch.
+	cfg["provider"].(map[string]any)["sub2.bond.plus"].(map[string]any)["options"].(map[string]any)["baseURL"] = "https://other.example/v1"
+	raw, _ = json.MarshalIndent(cfg, "", "  ")
+	if err := os.WriteFile(filepath.Join(cfgDir, "opencode.json"), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ok, detail = selectedProviderMatchesEffective("opencode", agentAPIProvider{
+		ID:      "api-sub2-bond-plus",
+		Name:    "sub2.bond.plus",
+		BaseURL: "https://sub2.freevinc.bond",
+	}, nil)
+	if ok {
+		t.Fatal("expected mismatch when nested baseURL differs")
+	}
+	if !strings.Contains(detail, "sub2.bond.plus") {
+		t.Fatalf("detail should mention provider name, got %q", detail)
 	}
 }

@@ -796,14 +796,17 @@ func selectedProviderMatchesEffective(agentName string, provider agentAPIProvide
 		}
 		return true, ""
 	case "opencode":
-		got, err := readOpenCodeBaseURL()
+		// OpenCode multi-provider layout stores endpoint under
+		// provider.<name>.options.baseURL (not a single top-level baseURL).
+		wantName := agentAPIProviderConfigName(provider)
+		got, err := readOpenCodeProviderBaseURL(wantName)
 		if err != nil || strings.TrimSpace(got) == "" {
-			return false, "missing baseURL in ~/.config/opencode/opencode.json"
+			return false, "missing provider." + wantName + ".options.baseURL in ~/.config/opencode/opencode.json"
 		}
 		if normalizeURLForCompare(got) != normalizeURLForCompare(wantRaw) &&
 			normalizeURLForCompare(got) != normalizeURLForCompare(wantOpenAI) &&
 			normalizeURLForCompare(got) != normalizeURLForCompare(wantClaude) {
-			return false, "opencode.json baseURL=" + got
+			return false, "opencode.json provider." + wantName + ".baseURL=" + got + " (selected=" + wantOpenAI + ")"
 		}
 		return true, ""
 	default:
@@ -833,6 +836,8 @@ func readSimpleEnvValue(path, key string) (string, error) {
 }
 
 func readOpenCodeBaseURL() (string, error) {
+	// Legacy helper: prefer top-level baseURL, else first nested provider options.
+	// Prefer readOpenCodeProviderBaseURL(name) for consistency checks.
 	path, err := homePath(".config", "opencode", "opencode.json")
 	if err != nil {
 		return "", err
@@ -856,8 +861,79 @@ func readOpenCodeBaseURL() (string, error) {
 				return strings.TrimSpace(v), nil
 			}
 		}
+		// Multi-provider map: provider.<name>.options.baseURL
+		for _, raw := range prov {
+			entry, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			if opts, ok := entry["options"].(map[string]any); ok {
+				for _, key := range []string{"baseURL", "baseUrl"} {
+					if v, ok := opts[key].(string); ok && strings.TrimSpace(v) != "" {
+						return strings.TrimSpace(v), nil
+					}
+				}
+			}
+		}
 	}
 	return "", fmt.Errorf("baseURL missing")
+}
+
+// readOpenCodeProviderBaseURL returns the baseURL applied for a named OpenCode
+// provider entry (provider.<name>.options.baseURL).
+func readOpenCodeProviderBaseURL(providerName string) (string, error) {
+	providerName = strings.TrimSpace(providerName)
+	if providerName == "" {
+		return "", fmt.Errorf("provider name required")
+	}
+	path, err := homePath(".config", "opencode", "opencode.json")
+	if err != nil {
+		return "", err
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(b, &obj); err != nil {
+		return "", err
+	}
+	prov, ok := obj["provider"].(map[string]any)
+	if !ok || prov == nil {
+		return "", fmt.Errorf("provider map missing")
+	}
+	raw, ok := prov[providerName]
+	if !ok {
+		// Case-insensitive fallback for dotted names.
+		for k, v := range prov {
+			if strings.EqualFold(strings.TrimSpace(k), providerName) {
+				raw = v
+				ok = true
+				break
+			}
+		}
+	}
+	if !ok {
+		return "", fmt.Errorf("provider %q missing", providerName)
+	}
+	entry, ok := raw.(map[string]any)
+	if !ok {
+		return "", fmt.Errorf("provider %q invalid", providerName)
+	}
+	if opts, ok := entry["options"].(map[string]any); ok {
+		for _, key := range []string{"baseURL", "baseUrl"} {
+			if v, ok := opts[key].(string); ok && strings.TrimSpace(v) != "" {
+				return strings.TrimSpace(v), nil
+			}
+		}
+	}
+	// Some layouts put baseURL on the provider entry itself.
+	for _, key := range []string{"baseURL", "baseUrl"} {
+		if v, ok := entry[key].(string); ok && strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v), nil
+		}
+	}
+	return "", fmt.Errorf("baseURL missing for provider %q", providerName)
 }
 
 // codexHomeDir is the directory that both MindFS apply/check and the codex
