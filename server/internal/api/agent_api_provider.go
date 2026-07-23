@@ -696,20 +696,8 @@ func switchAgentAPIProvider(req agentAPIProviderSwitchRequest, app *AppContext) 
 	if app != nil && app.GetAgentPool() != nil {
 		app.GetAgentPool().KillAgentProcess(agentName, 0)
 	}
-	// Drop resumed agent_session_ids so next send opens a fresh runtime against the
-	// newly applied config (resume can keep the old provider base_url).
-	if app != nil {
-		for _, mgr := range app.LoadedSessionManagers() {
-			if mgr == nil {
-				continue
-			}
-			if n, err := mgr.ClearAgentSessionIDsForAgent(context.Background(), agentName); err != nil {
-				log.Printf("[provider/switch] clear_agent_sessions.error agent=%s err=%v", agentName, err)
-			} else if n > 0 {
-				log.Printf("[provider/switch] clear_agent_sessions.done agent=%s cleared=%d", agentName, n)
-			}
-		}
-	}
+	// Resume keeps agent_session_id: codex reloads current config.toml base_url on
+	// resume (verified with temp CODEX_HOME A→B mock). Do not clear session ids.
 	triggerAgentConfigSwitchProbe(app, agentName)
 	return provider, nil
 }

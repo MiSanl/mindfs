@@ -1104,28 +1104,6 @@ func (m *Manager) UpsertAgentBinding(_ context.Context, binding AgentBinding) er
 	return m.updateAgentRuntimeStateUnsafe(binding)
 }
 
-// ClearAgentSessionIDsForAgent drops native agent_session_id for all MindFS sessions
-// of this agent so the next turn cannot resume a thread that still points at an old
-// provider endpoint after a global provider switch.
-func (m *Manager) ClearAgentSessionIDsForAgent(_ context.Context, agent string) (int, error) {
-	agent = strings.TrimSpace(agent)
-	if agent == "" {
-		return 0, errors.New("agent required")
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	db, err := m.ensureSessionMetaDBUnsafe()
-	if err != nil {
-		return 0, err
-	}
-	res, err := db.Exec(`UPDATE session_agent_bindings SET agent_session_id = '', agent_ctx_seq = 0 WHERE agent = ? AND agent_session_id != ''`, agent)
-	if err != nil {
-		return 0, err
-	}
-	n, _ := res.RowsAffected()
-	return int(n), nil
-}
-
 // BindProviderIfUnbound stores a provider identity before a native runtime is opened.
 // Runtime state updates deliberately cannot overwrite this provider metadata.
 func (m *Manager) BindProviderIfUnbound(_ context.Context, binding AgentBinding) (*AgentBinding, error) {
