@@ -2367,3 +2367,18 @@ func TestIsContextOverflowAgentError(t *testing.T) {
 		t.Fatal("opencode should support compact retry")
 	}
 }
+
+
+func TestContextOverflowRetryPrecedence(t *testing.T) {
+	err := errors.New("prompt is too long for the model context window")
+	if !isContextOverflowAgentError(err) {
+		t.Fatal("overflow classifier failed")
+	}
+	if !supportsPromptCompactRetry("opencode") {
+		t.Fatal("opencode should compact-retry")
+	}
+	// Compact path must be considered before giving up as non-recoverable terminal.
+	if !isNonRecoverableAgentError(err) {
+		t.Fatal("overflow remains terminal after failed compact")
+	}
+}
