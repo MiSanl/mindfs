@@ -2613,7 +2613,16 @@ if (useInnerScrollContainer && !container) {
                 return node;
               }
               return (
-                <div key={`wrap-${item.id || idx}`}>
+                <div
+                  key={`wrap-${item.id || idx}`}
+                  style={{
+                    width: "100%",
+                    minWidth: 0,
+                    display: "flex",
+                    flexDirection: "column",
+                    alignItems: "stretch",
+                  }}
+                >
                   {node}
                   {renderTurnRequestChip(turnReq)}
                   {renderInlineSessionErrorPanel(inlineErrors, `err-${seq || idx}`)}
