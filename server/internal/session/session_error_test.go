@@ -93,3 +93,33 @@ func TestSessionErrorCapAndDeleteCleanup(t *testing.T) {
 		t.Fatal("expected error log removed after delete")
 	}
 }
+
+
+func TestAppendTurnRequestDiagnostic(t *testing.T) {
+	dir := t.TempDir()
+	root := rootfs.NewRootInfo("turn-diag", "turn-diag", dir)
+	manager := newTestManager(t, root)
+	created, err := manager.Create(context.Background(), CreateInput{Type: TypeChat, Name: "diag", Agent: "claude"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.AppendSessionError(context.Background(), created.Key, SessionError{
+		Kind:         "turn_request",
+		Code:         "session.turn_request",
+		Agent:        "claude",
+		ProviderName: "Grok Relay",
+		ProviderID:   "api-grok",
+		Model:        "grok-4.5",
+		Message:      "request provider=Grok Relay model=grok-4.5",
+		AfterSeq:     1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	items, err := manager.ListSessionErrors(context.Background(), created.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].Kind != "turn_request" || items[0].ProviderName != "Grok Relay" {
+		t.Fatalf("%#v", items)
+	}
+}

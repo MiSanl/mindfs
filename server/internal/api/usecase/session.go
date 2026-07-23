@@ -2141,6 +2141,28 @@ func sessionProviderIsolationAgent(agentName string) bool {
 	return false
 }
 
+// resolveActiveAPIProviderLabel returns the agent's last_config api_provider when set.
+// Empty values mean system-global / native agent configuration is in effect.
+func (s *Service) resolveActiveAPIProviderLabel(agentName string) (providerID, providerName string) {
+	agentName = strings.TrimSpace(agentName)
+	if agentName == "" || s == nil || s.Registry == nil {
+		return "", ""
+	}
+	prefs := s.Registry.GetPreferences()
+	if prefs == nil {
+		return "", ""
+	}
+	sel := prefs.AgentLastConfigSelection(agentName)
+	if sel == nil {
+		return "", ""
+	}
+	if !strings.EqualFold(strings.TrimSpace(sel.Type), "api_provider") {
+		return "", ""
+	}
+	return strings.TrimSpace(sel.ID), strings.TrimSpace(sel.Name)
+}
+
+
 func cloneProviderRuntimeEnv(env map[string]string) map[string]string {
 	if len(env) == 0 {
 		return nil
@@ -2417,12 +2439,39 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 	resolvedEffort := resolveRuntimeEffort(in.Agent, current, in.Effort)
 	resolvedFastService := resolveRuntimeFastService(in.Agent, current, in.FastService)
 	modelDisplayName := s.resolveExchangeModelDisplayName(in.Agent, resolvedModel)
+	providerID, providerName := s.resolveActiveAPIProviderLabel(in.Agent)
 	turnStartedAt := time.Now().UTC()
+	userSeq := len(current.Exchanges) + 1
+	agentSeq := len(current.Exchanges) + 2
 	if err := manager.StartPendingTurn(ctx, current,
-		session.Exchange{Seq: len(current.Exchanges) + 1, Role: "user", Agent: in.Agent, Model: resolvedModel, ModelDisplayName: modelDisplayName, Mode: resolvedMode, Effort: resolvedEffort, FastService: resolvedFastService, Content: in.Content, Timestamp: turnStartedAt},
-		session.Exchange{Seq: len(current.Exchanges) + 2, Role: "agent", Agent: in.Agent, Model: resolvedModel, ModelDisplayName: modelDisplayName, Mode: resolvedMode, Effort: resolvedEffort, FastService: resolvedFastService, Timestamp: turnStartedAt},
+		session.Exchange{Seq: userSeq, Role: "user", Agent: in.Agent, ProviderID: providerID, ProviderName: providerName, Model: resolvedModel, ModelDisplayName: modelDisplayName, Mode: resolvedMode, Effort: resolvedEffort, FastService: resolvedFastService, Content: in.Content, Timestamp: turnStartedAt},
+		session.Exchange{Seq: agentSeq, Role: "agent", Agent: in.Agent, ProviderID: providerID, ProviderName: providerName, Model: resolvedModel, ModelDisplayName: modelDisplayName, Mode: resolvedMode, Effort: resolvedEffort, FastService: resolvedFastService, Timestamp: turnStartedAt},
 	); err != nil {
 		return err
+	}
+	// Durable diagnostic for UI (survives refresh): real request provider + model.
+	providerLabel := providerName
+	if providerLabel == "" {
+		providerLabel = "system_global"
+	}
+	modelLabel := strings.TrimSpace(modelDisplayName)
+	if modelLabel == "" {
+		modelLabel = strings.TrimSpace(resolvedModel)
+	}
+	diagMsg := fmt.Sprintf("request provider=%s model=%s", providerLabel, modelLabel)
+	if err := manager.AppendSessionError(ctx, current.Key, session.SessionError{
+		AfterSeq:     userSeq,
+		Agent:        strings.TrimSpace(in.Agent),
+		ProviderID:   providerID,
+		ProviderName: providerName,
+		Model:        resolvedModel,
+		Code:         "session.turn_request",
+		Kind:         "turn_request",
+		Message:      diagMsg,
+		Recoverable:  false,
+		Timestamp:    turnStartedAt,
+	}); err != nil {
+		log.Printf("[session/turn] diagnostic.persist.error root=%s session=%s err=%v", in.RootID, current.Key, err)
 	}
 	var responseText string
 	sawAssistantChunk := false

@@ -15,6 +15,8 @@ type ExchangeLike = {
   agent?: string;
   model?: string;
   model_display_name?: string;
+  provider_id?: string;
+  provider_name?: string;
   effort?: string;
   fast_service?: string;
   content?: string;
@@ -42,6 +44,8 @@ export type TimelineItem =
       agent?: string;
       model?: string;
       modelDisplayName?: string;
+      providerId?: string;
+      providerName?: string;
       effort?: string;
       fastService?: string;
       pendingAck?: boolean;
@@ -159,6 +163,8 @@ function assistantSegmentItem(
     agent: ex.agent,
     model: ex.model,
     modelDisplayName: ex.model_display_name,
+    providerId: ex.provider_id,
+    providerName: ex.provider_name,
     effort: ex.effort,
     fastService: ex.fast_service,
     seq: ex.seq,

@@ -34,6 +34,8 @@ type SessionItem = {
     agent?: string;
     model?: string;
     model_display_name?: string;
+    provider_id?: string;
+    provider_name?: string;
     effort?: string;
     fast_service?: string;
     content?: string;
@@ -281,7 +283,11 @@ function formatAssistantExchangeMeta(
   if (item.type !== "assistant_text") {
     return "";
   }
+  const provider =
+    `${item.providerName || (item as any).provider_name || ""}`.trim() ||
+    "system_global";
   const parts = [
+    provider,
     `${item.modelDisplayName || ""}`.trim() ||
       modelDisplayName(agents, item.agent, item.model),
     item.effort,
@@ -2558,7 +2564,13 @@ if (useInnerScrollContainer && !container) {
                           <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", marginBottom: 4, color: "var(--text-secondary)" }}>
                             {afterSeq > 0 ? <span>{t("session.errorAfterSeq", { seq: afterSeq })}</span> : null}
                             {item.agent ? <span>{String(item.agent)}</span> : null}
+                            {(item as any).provider_name || (item as any).provider_id ? (
+                              <span>{String((item as any).provider_name || (item as any).provider_id || "system_global")}</span>
+                            ) : (item as any).kind === "turn_request" ? (
+                              <span>system_global</span>
+                            ) : null}
                             {item.model ? <span>{String(item.model)}</span> : null}
+                            {(item as any).kind === "turn_request" ? <span>{t("session.turnRequest")}</span> : null}
                             {item.recoverable ? <span>{t("session.errorRecoverable")}</span> : null}
                             {ts ? <span>{ts}</span> : null}
                           </div>

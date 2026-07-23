@@ -37,6 +37,10 @@ type Exchange struct {
 	Seq              int       `json:"seq"`
 	Role             string    `json:"role"`
 	Agent            string    `json:"agent,omitempty"`
+	// ProviderID/Name are the API provider actually used for this turn when known.
+	// Empty means system-global / native agent config (no api_provider selection).
+	ProviderID       string    `json:"provider_id,omitempty"`
+	ProviderName     string    `json:"provider_name,omitempty"`
 	Model            string    `json:"model,omitempty"`
 	ModelDisplayName string    `json:"model_display_name,omitempty"`
 	Mode             string    `json:"mode,omitempty"`
@@ -66,6 +70,8 @@ type SessionError struct {
 	AfterMessageID string    `json:"after_message_id,omitempty"`
 	AfterSeq       int       `json:"after_seq,omitempty"`
 	Agent          string    `json:"agent,omitempty"`
+	ProviderID     string    `json:"provider_id,omitempty"`
+	ProviderName   string    `json:"provider_name,omitempty"`
 	Model          string    `json:"model,omitempty"`
 	Code           string    `json:"code,omitempty"`
 	Kind           string    `json:"kind,omitempty"`

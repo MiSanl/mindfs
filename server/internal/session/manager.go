@@ -378,8 +378,15 @@ func (m *Manager) AppendSessionError(_ context.Context, sessionKey string, entry
 	if sessionKey == "" {
 		return errors.New("session key required")
 	}
-	if strings.TrimSpace(entry.Message) == "" {
+	if strings.TrimSpace(entry.Message) == "" && strings.TrimSpace(entry.Kind) != "turn_request" {
 		return errors.New("error message required")
+	}
+	if strings.TrimSpace(entry.Message) == "" {
+		// Diagnostic markers (e.g. kind=turn_request) may omit free-form text.
+		entry.Message = strings.TrimSpace(entry.Kind)
+		if entry.Message == "" {
+			entry.Message = "diagnostic"
+		}
 	}
 	if strings.TrimSpace(entry.ID) == "" {
 		entry.ID = "err-" + randomHex(8)
