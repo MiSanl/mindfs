@@ -1094,11 +1094,9 @@ function SessionViewerInner({
     ? ((session as any).errors as Array<Record<string, any>>)
     : [];
 
-  // Error panels: historical default collapsed; newly arrived errors during this
-  // mounted session view default expanded. Refresh/remount resets to collapsed.
+  // Error panels: always default collapsed (historical and newly arrived).
+  // User expands manually; state is per mount / sessionKey only.
   const [errorPanelExpanded, setErrorPanelExpanded] = React.useState<Record<string, boolean>>({});
-  const seenErrorPanelIdsRef = React.useRef<Set<string>>(new Set());
-  const seededErrorsRef = React.useRef(false);
 
   const [showTurnRequest, setShowTurnRequestState] = React.useState(() => getShowTurnRequest());
   React.useEffect(() => {
@@ -1277,58 +1275,8 @@ function SessionViewerInner({
   };
 
   React.useEffect(() => {
-    seededErrorsRef.current = false;
-    seenErrorPanelIdsRef.current = new Set();
     setErrorPanelExpanded({});
   }, [sessionKey]);
-
-  React.useEffect(() => {
-    const panelIds: Array<{ panelKey: string; identity: string }> = [];
-    errorsByAfterSeq.forEach((items, seq) => {
-      const itemKeys = items.map((item, index) =>
-        String(item.id || item.request_id || `err-${seq}-${index}`),
-      );
-      panelIds.push({
-        panelKey: `err-${seq}`,
-        identity: itemKeys.join("|") || `err-${seq}`,
-      });
-    });
-    if (!panelIds.length) return;
-
-    if (!seededErrorsRef.current) {
-      for (const panel of panelIds) {
-        seenErrorPanelIdsRef.current.add(panel.identity);
-      }
-      seededErrorsRef.current = true;
-      setErrorPanelExpanded((prev) => {
-        const next = { ...prev };
-        let changed = false;
-        for (const panel of panelIds) {
-          if (next[panel.panelKey] === undefined) {
-            next[panel.panelKey] = false;
-            changed = true;
-          }
-        }
-        return changed ? next : prev;
-      });
-      return;
-    }
-
-    const newcomers = panelIds.filter(
-      (panel) => !seenErrorPanelIdsRef.current.has(panel.identity),
-    );
-    if (!newcomers.length) return;
-    for (const panel of newcomers) {
-      seenErrorPanelIdsRef.current.add(panel.identity);
-    }
-    setErrorPanelExpanded((prev) => {
-      const next = { ...prev };
-      for (const panel of newcomers) {
-        next[panel.panelKey] = true;
-      }
-      return next;
-    });
-  }, [errorsByAfterSeq, sessionKey]);
 
   const { timeline, isStreaming, streamVersion, streamStatusText } = useSessionStream(
     sessionKey,
