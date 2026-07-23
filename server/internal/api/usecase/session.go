@@ -2079,23 +2079,20 @@ func (s *Service) ensureAgentSession(
 	var ctxSeqOverride *int
 	if err != nil {
 		if openInput.AgentSessionID != "" {
-			// Isolation-off: never hard-fail resume solely because a legacy
-			// ProviderID binding exists; fall back to a new runtime session.
-			if binding != nil && strings.TrimSpace(binding.ProviderID) != "" && sessionProviderIsolationAgent(agentName) {
-				log.Printf("[session/provider] resume.error session=%s agent=%s provider_id=%s model=%q action=fail_without_fallback err=%v", current.Key, agentName, binding.ProviderID, nextModel, err)
+			// Always fall back to a new runtime session on resume failure.
+			// Session provider isolation is off; never hard-fail solely due to
+			// a legacy ProviderID binding.
+			if binding != nil && strings.TrimSpace(binding.ProviderID) != "" {
+				log.Printf("[session/provider] resume.error session=%s agent=%s provider_id=%s model=%q action=fallback_open_new_runtime_session err=%v", current.Key, agentName, binding.ProviderID, nextModel, err)
 			} else {
-				if binding != nil && strings.TrimSpace(binding.ProviderID) != "" {
-					log.Printf("[session/provider] resume.error session=%s agent=%s provider_id=%s model=%q action=fallback_open_new_runtime_session err=%v", current.Key, agentName, binding.ProviderID, nextModel, err)
-				} else {
-					log.Printf("[session/model] resume.error session=%s agent=%s model=%q mode=%q effort=%q fast_service=%q pool_session=%s agent_session_id=%s err=%v fallback=open_new_runtime_session", current.Key, agentName, nextModel, nextMode, nextEffort, nextFastService, poolSessionKey, openInput.AgentSessionID, err)
-				}
-				openInput.AgentSessionID = ""
-				openInput.AgentCtxSeq = 0
-				sess, err = pool.GetOrCreate(openCtx, openInput)
-				if err == nil {
-					zero := 0
-					ctxSeqOverride = &zero
-				}
+				log.Printf("[session/model] resume.error session=%s agent=%s model=%q mode=%q effort=%q fast_service=%q pool_session=%s agent_session_id=%s err=%v fallback=open_new_runtime_session", current.Key, agentName, nextModel, nextMode, nextEffort, nextFastService, poolSessionKey, openInput.AgentSessionID, err)
+			}
+			openInput.AgentSessionID = ""
+			openInput.AgentCtxSeq = 0
+			sess, err = pool.GetOrCreate(openCtx, openInput)
+			if err == nil {
+				zero := 0
+				ctxSeqOverride = &zero
 			}
 		}
 	}
@@ -2135,18 +2132,11 @@ func (s *Service) resolveSessionProvider(ctx context.Context, manager *session.M
 }
 
 // SessionProviderIsolationAgent reports whether agent uses session-scoped providers.
-// Disabled: all agents use the global agent provider/settings path only.
+// HARD OFF on this delivery line: all agents use the global agent provider path.
 // Session-bound RuntimeEnv / per-session provider binding is not applied.
+// Do not re-enable without restoring full session-scoped RuntimeEnv injection.
 func SessionProviderIsolationAgent(agentName string) bool {
-	return sessionProviderIsolationAgent(agentName)
-}
-
-func sessionProviderIsolationAgent(agentName string) bool {
 	_ = agentName
-	// HARD OFF for this delivery line. Remaining call sites are tripwires only:
-	// resume fail-without-fallback, UseGlobalAgentConfig mismatch, login gates,
-	// ProviderSelectionValidator, and WS allowProviderBind. Do not re-enable
-	// without restoring full session-scoped RuntimeEnv injection.
 	return false
 }
 
@@ -2381,23 +2371,13 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 		return s.sendCommandMessage(turnCtx, in, manager, current)
 	}
 	// Isolation-off: provider_id on the wire is ignored for runtime env injection.
-	// Do not hard-fail SendMessage when the client still echoes a legacy bound
-	// provider (or a deleted provider id) after isolation was disabled.
-	if sessionProviderIsolationAgent(in.Agent) && strings.TrimSpace(in.ProviderID) != "" && ProviderSelectionValidator != nil {
-		if err := ProviderSelectionValidator(in.Agent, in.Model, in.ProviderID); err != nil {
-			return err
-		}
-	}
+	// resolveSessionProvider is a no-op; legacy ProviderID rows never block sends.
 	var binding *session.AgentBinding
 	var providerConfig *SessionProviderConfig
 	if in.UseGlobalAgentConfig {
 		binding, err = manager.FindAgentBinding(ctx, current.Key, in.Agent)
 		if err != nil {
 			return err
-		}
-		// Isolation-off: legacy ProviderID rows must not block kanban/goal.
-		if binding != nil && strings.TrimSpace(binding.ProviderID) != "" && sessionProviderIsolationAgent(in.Agent) {
-			return errors.New("session_provider_mismatch: session is provider-bound and cannot run with the global agent configuration; use a session that has system global provider or create a new kanban-bound session")
 		}
 	} else {
 		binding, providerConfig, err = s.resolveSessionProvider(ctx, manager, current, in.Agent, in.ProviderID, in.AllowProviderBind)
@@ -2877,30 +2857,14 @@ func (s *Service) RunTransientSlashCommand(ctx context.Context, in RunTransientS
 	var binding *session.AgentBinding
 	var providerConfig *SessionProviderConfig
 	if command == "login" {
-		// Isolation-off: wire provider_id is ignored (global config path).
-		if sessionProviderIsolationAgent(agentName) && strings.TrimSpace(in.ProviderID) != "" {
-			return errors.New("codex login is only available with the global agent configuration")
-		}
+		// Isolation-off: always use global agent configuration for login.
 		binding, err = manager.FindAgentBinding(ctx, current.Key, agentName)
 		if err != nil {
 			return err
 		}
-		if binding != nil && strings.TrimSpace(binding.ProviderID) != "" && sessionProviderIsolationAgent(agentName) {
-			return errors.New("codex login is unavailable for an API-provider-bound session")
-		}
 	} else {
-		// Transient /status may run against a pre-created empty session or a pure
-		// transient key. Allow the first bind from the UI-selected provider so the
-		// diagnostic hits the same endpoint as normal session turns.
-		allowBind := false
-		if strings.TrimSpace(in.ProviderID) != "" {
-			if strings.HasPrefix(current.Key, "transient-") || len(current.Exchanges) == 0 {
-				allowBind = true
-			} else if binding, bindErr := manager.FindAgentBinding(ctx, current.Key, agentName); bindErr == nil {
-				allowBind = binding == nil || strings.TrimSpace(binding.ProviderID) == ""
-			}
-		}
-		binding, providerConfig, err = s.resolveSessionProvider(ctx, manager, current, agentName, in.ProviderID, allowBind)
+		// Isolation-off: resolveSessionProvider is a no-op (no session RuntimeEnv).
+		binding, providerConfig, err = s.resolveSessionProvider(ctx, manager, current, agentName, in.ProviderID, false)
 		if err != nil {
 			return err
 		}

@@ -9891,12 +9891,37 @@ export function App({ onGoHome }: AppProps) {
                   : /peer disconnected|stream disconnected|504|timeout|connection/i.test(
                       errorMessage,
                     );
+              // Prefer server after_seq; else attach under the optimistic/latest user
+              // exchange so pre-pending failures (consistency check) do not pin to the
+              // previous message while after_seq is still 0.
+              const payloadAfterSeq = Number((payload as any)?.after_seq || 0);
+              const cachedForSeq =
+                sessionCacheRef.current[cacheKey] ||
+                (selectedSessionRef.current &&
+                ((selectedSessionRef.current as any).key === errKey ||
+                  (selectedSessionRef.current as any).session_key === errKey)
+                  ? (selectedSessionRef.current as any)
+                  : null);
+              const exchangeSeqs = Array.isArray(cachedForSeq?.exchanges)
+                ? (cachedForSeq.exchanges as any[])
+                    .filter((ex) => String(ex?.role || "").toLowerCase() === "user")
+                    .map((ex) => Number(ex?.seq || 0) || 0)
+                : [];
+              const latestUserSeq = exchangeSeqs.length
+                ? Math.max(0, ...exchangeSeqs)
+                : 0;
+              const afterSeq =
+                payloadAfterSeq > 0
+                  ? payloadAfterSeq
+                  : latestUserSeq > 0
+                    ? latestUserSeq
+                    : 0;
               const optimistic = {
                 id: requestId || `err-${Date.now()}`,
                 session_key: errKey,
                 request_id: requestId || "",
                 after_message_id: requestId || "",
-                after_seq: 0,
+                after_seq: afterSeq,
                 message: errorMessage,
                 code: "session.message_failed",
                 kind: "turn",

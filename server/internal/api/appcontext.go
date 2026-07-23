@@ -840,7 +840,7 @@ func (s *AppContext) BroadcastSessionErrorWithRequest(rootID, sessionKey, reques
 	normalized := normalizeAgentErrorMessage(errors.New(trimmed))
 	s.UpdateTaskSessionErrorForSession(rootID, sessionKey, normalized)
 	recoverable := isRecoverableTransportErrorText(normalized)
-	s.persistSessionError(rootID, sessionKey, requestID, "session.message_failed", "turn", normalized, recoverable)
+	afterSeq := s.persistSessionError(rootID, sessionKey, requestID, "session.message_failed", "turn", normalized, recoverable)
 	hub := s.GetSessionStreamHub()
 	// Still append to reply event log so reconnect/replay can surface the failure.
 	hub.AppendReplyEvent(rootID, sessionKey, StreamEvent{
@@ -862,6 +862,10 @@ func (s *AppContext) BroadcastSessionErrorWithRequest(rootID, sessionKey, reques
 	}
 	if strings.TrimSpace(requestID) != "" {
 		payload["request_id"] = strings.TrimSpace(requestID)
+	}
+	// after_seq pins the error panel under the user message for this send attempt.
+	if afterSeq > 0 {
+		payload["after_seq"] = afterSeq
 	}
 	resp := WSResponse{
 		ID:      strings.TrimSpace(requestID),
@@ -907,43 +911,83 @@ func isRecoverableTransportErrorText(message string) bool {
 	return false
 }
 
-func (s *AppContext) persistSessionError(rootID, sessionKey, requestID, code, kind, message string, recoverable bool) {
+// persistSessionError writes a durable session error and returns the after_seq used
+// for UI attachment under the corresponding user message.
+//
+// Attachment rules (must match optimistic FE nextUserSeq / StartPendingTurn):
+//  1. Live pending turn → pending user seq (error after StartPendingTurn).
+//  2. request_id present (send/resume path) → next user seq = len(exchanges)+1
+//     so pre-pending failures (e.g. provider consistency) pin under the just-sent
+//     optimistic user bubble, not the previous one.
+//  3. Otherwise → last committed user seq (background / non-send failures).
+func (s *AppContext) persistSessionError(rootID, sessionKey, requestID, code, kind, message string, recoverable bool) int {
 	if s == nil {
-		return
+		return 0
 	}
 	rootID = strings.TrimSpace(rootID)
 	sessionKey = strings.TrimSpace(sessionKey)
 	if rootID == "" || sessionKey == "" || strings.TrimSpace(message) == "" {
-		return
+		return 0
 	}
 	manager, err := s.GetSessionManager(rootID)
 	if err != nil || manager == nil {
 		log.Printf("[session/error] persist.skip root=%s session=%s err=%v", rootID, sessionKey, err)
-		return
+		return 0
 	}
 	afterSeq := 0
 	agentName := ""
 	model := ""
-	if current, getErr := manager.Get(context.Background(), sessionKey, 0); getErr == nil && current != nil {
-		afterSeq = len(current.Exchanges)
-		for i := len(current.Exchanges) - 1; i >= 0; i-- {
-			ex := current.Exchanges[i]
-			if strings.EqualFold(strings.TrimSpace(ex.Role), "user") && ex.Seq > 0 {
-				afterSeq = ex.Seq
-				break
-			}
+
+	// Prefer the in-flight pending user turn when present. Get() intentionally does
+	// not merge active pending into Exchanges, so last-user-from-history is stale.
+	if pending, pErr := manager.PeekPendingTurn(context.Background(), sessionKey); pErr == nil && pending != nil {
+		if pending.User.Seq > 0 {
+			afterSeq = pending.User.Seq
 		}
-		agentName = session.InferAgentFromSession(current)
-		model = strings.TrimSpace(current.Model)
-		if model == "" && len(current.Exchanges) > 0 {
-			for i := len(current.Exchanges) - 1; i >= 0; i-- {
-				if m := strings.TrimSpace(current.Exchanges[i].Model); m != "" {
-					model = m
-					break
+		if a := strings.TrimSpace(pending.User.Agent); a != "" {
+			agentName = a
+		}
+		if m := strings.TrimSpace(pending.User.Model); m != "" {
+			model = m
+		}
+	}
+
+	if current, getErr := manager.Get(context.Background(), sessionKey, 0); getErr == nil && current != nil {
+		if agentName == "" {
+			agentName = session.InferAgentFromSession(current)
+		}
+		if model == "" {
+			model = strings.TrimSpace(current.Model)
+			if model == "" && len(current.Exchanges) > 0 {
+				for i := len(current.Exchanges) - 1; i >= 0; i-- {
+					if m := strings.TrimSpace(current.Exchanges[i].Model); m != "" {
+						model = m
+						break
+					}
 				}
 			}
 		}
+		if afterSeq <= 0 {
+			lastUserSeq := 0
+			for i := len(current.Exchanges) - 1; i >= 0; i-- {
+				ex := current.Exchanges[i]
+				if strings.EqualFold(strings.TrimSpace(ex.Role), "user") && ex.Seq > 0 {
+					lastUserSeq = ex.Seq
+					break
+				}
+			}
+			if strings.TrimSpace(requestID) != "" {
+				// Send-path failure before StartPendingTurn: attach to the outbound
+				// user message seq (same formula StartPendingTurn uses).
+				afterSeq = len(current.Exchanges) + 1
+			} else if lastUserSeq > 0 {
+				afterSeq = lastUserSeq
+			} else {
+				afterSeq = len(current.Exchanges)
+			}
+		}
 	}
+
 	afterMessageID := strings.TrimSpace(requestID)
 	if afterMessageID == "" && afterSeq > 0 {
 		afterMessageID = fmt.Sprintf("seq-%d", afterSeq)
@@ -962,6 +1006,7 @@ func (s *AppContext) persistSessionError(rootID, sessionKey, requestID, code, ki
 	if err := manager.AppendSessionError(context.Background(), sessionKey, entry); err != nil {
 		log.Printf("[session/error] persist.error root=%s session=%s err=%v", rootID, sessionKey, err)
 	}
+	return afterSeq
 }
 
 func (s *AppContext) ClearTaskAuxFlagsForSession(rootID, sessionKey string) {

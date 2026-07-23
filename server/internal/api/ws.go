@@ -651,22 +651,9 @@ func (h *WSHandler) handleSessionMessage(ctx context.Context, conn *websocket.Co
 		streamHub.BindSessionClient(rootID, key, clientID)
 	}
 	clientCtx := parseClientContext(req.Payload, rootID)
+	// Isolation-off: session-scoped provider bind is never applied.
+	// Keep AllowProviderBind only for freshly created sessions (harmless no-op).
 	allowProviderBind := createdSession
-	if !allowProviderBind && strings.TrimSpace(providerID) != "" && usecase.SessionProviderIsolationAgent(agentName) {
-		// Pre-created empty sessions should still acquire the first provider binding
-		// from the UI-selected provider on the first send.
-		if current, err := uc.GetSession(ctx, usecase.GetSessionInput{RootID: rootID, Key: key}); err == nil && current != nil {
-			if len(current.Exchanges) == 0 && h.AppContext != nil {
-				if manager, managerErr := h.AppContext.GetSessionManager(rootID); managerErr == nil && manager != nil {
-					if binding, bindErr := manager.FindAgentBinding(ctx, key, agentName); bindErr == nil {
-						if binding == nil || strings.TrimSpace(binding.ProviderID) == "" {
-							allowProviderBind = true
-						}
-					}
-				}
-			}
-		}
-	}
 	userMessage := PendingUserMessage{
 		Agent:             agentName,
 		Model:             model,

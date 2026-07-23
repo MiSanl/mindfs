@@ -484,16 +484,8 @@ func (s *Service) runTask(ctx context.Context, task Task, force bool) error {
 		}
 	}
 	sessionName := current.Name
+	// Isolation-off: session-scoped provider bind is never applied.
 	allowProviderBind := createdSession
-	if !allowProviderBind && strings.TrimSpace(current.ProviderID) != "" {
-		if existing, getErr := manager.Get(ctx, sessionKey, 0); getErr == nil && existing != nil && len(existing.Exchanges) == 0 {
-			if binding, bindErr := manager.FindAgentBinding(ctx, sessionKey, current.Agent); bindErr == nil {
-				if binding == nil || strings.TrimSpace(binding.ProviderID) == "" {
-					allowProviderBind = true
-				}
-			}
-		}
-	}
 	err = s.usecase.SendMessage(ctx, usecase.SendMessageInput{
 		RootID:            current.RootID,
 		Key:               sessionKey,
