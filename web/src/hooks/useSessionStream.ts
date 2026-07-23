@@ -343,6 +343,12 @@ function buildBaseTimeline(
         content,
         timestamp: ex.timestamp,
         agent: ex.agent,
+        model: ex.model,
+        modelDisplayName: ex.model_display_name,
+        providerId: ex.provider_id,
+        providerName: ex.provider_name,
+        effort: ex.effort,
+        fastService: ex.fast_service,
         pendingAck: ex.pending_ack === true,
         seq,
       });

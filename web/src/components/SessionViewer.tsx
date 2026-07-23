@@ -284,13 +284,13 @@ function formatAssistantExchangeMeta(
   if (item.type !== "assistant_text") {
     return "";
   }
-  const provider =
-    `${item.providerName || (item as any).provider_name || ""}`.trim() ||
-    "system_global";
-  const parts = [
-    provider,
+  const provider = `${item.providerName || (item as any).provider_name || item.providerId || (item as any).provider_id || ""}`.trim();
+  const modelLabel =
     `${item.modelDisplayName || ""}`.trim() ||
-      modelDisplayName(agents, item.agent, item.model),
+    modelDisplayName(agents, item.agent, item.model);
+  const parts = [
+    provider || null,
+    modelLabel || null,
     item.effort,
   ]
     .map((value) => `${value || ""}`.trim())
@@ -1258,8 +1258,9 @@ function SessionViewerInner({
 
   const renderTurnRequestChip = (item: Record<string, any> | undefined) => {
     if (!item) return null;
-    const provider = String(item.provider_name || item.provider_id || "system_global");
-    const model = String(item.model || "");
+    const providerRaw = String(item.provider_name || item.provider_id || "").trim();
+    const provider = providerRaw || "system_global";
+    const model = String(item.model || item.model_display_name || "").trim();
     return (
       <div
         style={{
@@ -2746,7 +2747,16 @@ if (useInnerScrollContainer && !container) {
               const seq = Number((item as any).seq || 0);
               const inlineErrors = seq > 0 ? (errorsByAfterSeq.get(seq) || []) : [];
               const turnReq = seq > 0 ? turnRequestByAfterSeq.get(seq) : undefined;
-              if (!inlineErrors.length && !turnReq) {
+              const exchangeFallback =
+                !turnReq && (item.providerName || item.providerId || item.model)
+                  ? {
+                      provider_name: item.providerName || "",
+                      provider_id: item.providerId || "",
+                      model: item.model || item.modelDisplayName || "",
+                    }
+                  : undefined;
+              const requestInfo = turnReq || exchangeFallback;
+              if (!inlineErrors.length && !requestInfo) {
                 return node;
               }
               return (
@@ -2761,7 +2771,7 @@ if (useInnerScrollContainer && !container) {
                   }}
                 >
                   {node}
-                  {showTurnRequest ? renderTurnRequestChip(turnReq) : null}
+                  {showTurnRequest ? renderTurnRequestChip(requestInfo) : null}
                   {renderInlineSessionErrorPanel(inlineErrors, `err-${seq || idx}`)}
                 </div>
               );
