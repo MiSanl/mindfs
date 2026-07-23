@@ -864,16 +864,20 @@ func (h *HTTPHandler) handleSessionGet(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	resp := h.sessionResponseWithBindings(r.Context(), rootID, key, out, pendingUser, contextWindow, exchangeAux)
+	// Always emit a boolean so clients can clear sticky local generating state.
+	// Omitting the field made serverPending === undefined on the web client.
+	pending := false
 	if h.AppContext != nil {
 		if manager, mErr := h.AppContext.GetSessionManager(rootID); mErr == nil && manager != nil {
-			if pending, pErr := manager.PeekPendingTurn(r.Context(), key); pErr == nil && pending != nil {
-				resp["pending"] = true
-			}
-			if h.AppContext.GetSessionStreamHub().IsSessionReplying(rootID, key) {
-				resp["pending"] = true
+			if diskPending, pErr := manager.PeekPendingTurn(r.Context(), key); pErr == nil && diskPending != nil {
+				pending = true
 			}
 		}
+		if h.AppContext.GetSessionStreamHub().IsSessionReplying(rootID, key) {
+			pending = true
+		}
 	}
+	resp["pending"] = pending
 	respondJSON(w, http.StatusOK, resp)
 }
 

@@ -367,6 +367,7 @@ export const zhCN = {
   "session.runtime.switched": "已切换到 {agent}",
   "session.runtime.willUse": "下一条消息将使用 {agent}",
   "session.runtime.reconnectHint": "点击重连 Agent",
+  "session.runtime.reconnectConfirm": "将重启整个 {agent} 进程（影响该 Agent 的所有会话）。确定继续？",
   "session.runtime.label": "Agent 连接",
   "error.agent.connectFailed": "Agent 连接失败",
   "error.agent.switchFailed": "切换 Agent 失败",

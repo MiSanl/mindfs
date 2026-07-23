@@ -200,9 +200,10 @@ function sessionErrorCode(message: string): ErrorCode {
     normalized.includes("prompt too long") ||
     normalized.includes("too many tokens") ||
     normalized.includes("token limit") ||
-    normalized.includes("max_tokens") ||
-    normalized.includes("remote compaction failed")
+    normalized.includes("remote compaction failed") ||
+    normalized.includes("context overflow")
   ) {
+    // Bare "max_tokens" is often a completion limit, not a process crash.
     return "agent.crashed";
   }
   if (
@@ -5286,10 +5287,39 @@ export function App({ onGoHome }: AppProps) {
           // null means fetch failed — keep existing optimistic/local errors.
           if (serverErrors == null || !Array.isArray(serverErrors)) return;
           const existing = sessionCacheRef.current[cacheKey];
+          const prevErrors = Array.isArray((existing as any)?.errors)
+            ? ([...((existing as any).errors as any[])] as any[])
+            : Array.isArray((selectedSessionRef.current as any)?.errors) &&
+                ((selectedSessionRef.current as any)?.key === key ||
+                  (selectedSessionRef.current as any)?.session_key === key)
+              ? ([...((selectedSessionRef.current as any).errors as any[])] as any[])
+              : [];
+          // Merge like the WS error path: prefer server, keep optimistic rows not yet persisted.
+          let merged = [...serverErrors];
+          if (merged.length === 0) {
+            merged = prevErrors;
+          } else {
+            for (const opt of prevErrors) {
+              const optId = String(opt?.id || "");
+              const optReq = String(opt?.request_id || "");
+              const exists = merged.some((e) => {
+                const id = String(e?.id || "");
+                const req = String(e?.request_id || "");
+                return (
+                  (optId && id && optId === id) ||
+                  (optReq && req && optReq === req) ||
+                  (String(e?.message || "") === String(opt?.message || "") &&
+                    String(e?.timestamp || "") === String(opt?.timestamp || ""))
+                );
+              });
+              if (!exists) merged.push(opt);
+            }
+            merged = merged.slice(-100);
+          }
           if (existing && typeof existing === "object") {
             sessionCacheRef.current[cacheKey] = {
               ...(existing as any),
-              errors: serverErrors,
+              errors: merged,
             } as any;
           }
           setSelectedSession((prev) => {
@@ -5297,14 +5327,14 @@ export function App({ onGoHome }: AppProps) {
             const prevRoot =
               (prev?.root_id as string | undefined) || currentRootIdRef.current;
             if (!prev || prevKey !== key || prevRoot !== targetRoot) return prev;
-            return { ...(prev as any), errors: serverErrors } as SessionItem;
+            return { ...(prev as any), errors: merged } as SessionItem;
           });
           if ((boundSessionByRootRef.current[targetRoot] || null) === key) {
             const drawer = drawerSessionByRootRef.current[targetRoot];
             if (drawer && (drawer.key === key || (drawer as any).session_key === key)) {
               setDrawerSessionForRoot(targetRoot, {
                 ...(drawer as any),
-                errors: serverErrors,
+                errors: merged,
               } as Session);
             }
           }
@@ -14309,15 +14339,18 @@ export function App({ onGoHome }: AppProps) {
                   console.warn("[runtime/reconnect] restart failed", err);
                 }
                 setAgentsVersion((v) => v + 1);
+                // Process restart does not open a session runtime. Mark idle so the
+                // pill does not stick on "opening" until the next user send.
                 if (root && key) {
-                  const cacheKey = rootSessionKey(root, key);
-                  delete pendingBySessionRef.current[cacheKey];
                   setSelectedSession((prev) =>
                     prev && (prev.key === key || prev.session_key === key)
                       ? ({
                           ...(prev as any),
-                          pending: false,
-                          runtime: { agent: targetAgent, state: "opening" },
+                          runtime: {
+                            agent: targetAgent,
+                            state: "disconnected",
+                            message: "agent process restarted; next message will reconnect",
+                          },
                         } as SessionItem)
                       : prev,
                   );
@@ -14325,8 +14358,11 @@ export function App({ onGoHome }: AppProps) {
                   if (drawer && (drawer.key === key || (drawer as any).session_key === key)) {
                     setDrawerSessionForRoot(root, {
                       ...(drawer as any),
-                      pending: false,
-                      runtime: { agent: targetAgent, state: "opening" },
+                      runtime: {
+                        agent: targetAgent,
+                        state: "disconnected",
+                        message: "agent process restarted; next message will reconnect",
+                      },
                     } as any);
                   }
                 }

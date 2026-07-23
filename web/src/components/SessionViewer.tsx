@@ -225,8 +225,17 @@ function formatContextWindowPercent(contextWindow?: {
     0,
     Number(contextWindow?.modelContextWindow || 0),
   );
-  if (!usedTokens || !modelContextWindow) {
+  if (!usedTokens) {
     return null;
+  }
+  // Some agents report usage without a model window (modelContextWindow=0).
+  // Still surface absolute usage; only compute percent when window is known.
+  if (!modelContextWindow) {
+    return {
+      usedTokens,
+      usedRatio: 0,
+      percent: null as number | null,
+    };
   }
   const usedRatio = Math.max(0, Math.min(1, usedTokens / modelContextWindow));
   return {
@@ -294,15 +303,23 @@ function ContextWindowBadge({
   if (!metrics) {
     return null;
   }
-  const hue =
-    metrics.percent >= 90
+  const hasPercent = typeof metrics.percent === "number";
+  const hue = !hasPercent
+    ? "#64748b"
+    : metrics.percent! >= 90
       ? "#dc2626"
-      : metrics.percent >= 75
+      : metrics.percent! >= 75
         ? "#ea580c"
         : "#0f766e";
+  const windowLabel = formatCompactTokenCount(contextWindow?.modelContextWindow || 0);
+  const usedLabel = formatCompactTokenCount(metrics.usedTokens);
   return (
     <span
-      title={`Context Window ${metrics.percent}% used (${metrics.usedTokens}/${contextWindow?.modelContextWindow} used)`}
+      title={
+        hasPercent
+          ? `Context Window ${metrics.percent}% used (${metrics.usedTokens}/${contextWindow?.modelContextWindow} used)`
+          : `Context usage ${metrics.usedTokens} tokens (model window unknown)`
+      }
       style={{
         display: "inline-flex",
         alignItems: "center",
@@ -316,12 +333,12 @@ function ContextWindowBadge({
         fontVariantNumeric: "tabular-nums",
       }}
     >
-      <span>{metrics.percent}%</span>
-      <span>&middot;used</span>
+      {hasPercent ? <span>{metrics.percent}%</span> : <span>used</span>}
+      {hasPercent ? <span>&middot;used</span> : null}
       <span>
-        {`(${formatCompactTokenCount(metrics.usedTokens)}/${formatCompactTokenCount(
-          contextWindow?.modelContextWindow || 0,
-        )})`}
+        {hasPercent
+          ? `(${usedLabel}/${windowLabel})`
+          : `(${usedLabel})`}
       </span>
     </span>
   );

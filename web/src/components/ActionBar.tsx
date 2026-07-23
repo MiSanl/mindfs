@@ -1573,13 +1573,20 @@ export function ActionBar({
                   type="button"
                   title={
                     runtimeMeta.state === "connected"
-                      ? runtimeMeta.label
+                      ? `${runtimeMeta.label} · ${t("session.runtime.reconnectHint")}`
                       : `${runtimeMeta.label} · ${t("session.runtime.reconnectHint")}`
                   }
                   aria-label={`${t("session.runtime.label")}: ${runtimeMeta.label}`}
                   onClick={async () => {
                     const target = String(runtimeMeta.agent || agent || "").trim();
                     if (!target || runtimeMeta.state === "opening") return;
+                    // Connected runtimes: require confirm — restart kills the whole agent process.
+                    if (runtimeMeta.state === "connected") {
+                      const ok = window.confirm(
+                        t("session.runtime.reconnectConfirm", { agent: target }),
+                      );
+                      if (!ok) return;
+                    }
                     try {
                       if (onRuntimeReconnect) {
                         await onRuntimeReconnect(target);
@@ -1903,6 +1910,33 @@ export function ActionBar({
                       setAgentMode("");
                       setEffort(getModelDefaultEffort(selectedAgent, nextModel));
                       setFastService(defaults.fastService);
+                    }}
+                    onAgentModelChange={(nextAgent, nextModel) => {
+                      const prevAgent = agent;
+                      const nextStatus = agents.find((item) => item.name === nextAgent) || null;
+                      const defaults = getAgentDefaults(nextStatus);
+                      const modelID = nextModel || defaults.model;
+                      setAgent(nextAgent);
+                      setModel(modelID);
+                      setAgentMode("");
+                      setEffort(getModelDefaultEffort(nextStatus, modelID));
+                      setFastService(defaults.fastService);
+                      if (nextAgent && nextAgent !== prevAgent) {
+                        reportError(
+                          "agent.switched",
+                          t("session.runtime.willUse", { agent: nextAgent }),
+                          {
+                            severity: "info",
+                            recoverable: false,
+                            details: { from: prevAgent, to: nextAgent },
+                          },
+                        );
+                        if (nextStatus && nextStatus.available === false) {
+                          reportError("agent.unavailable", undefined, {
+                            details: { agent: nextAgent },
+                          });
+                        }
+                      }
                     }}
                     onAgentRestart={async (targetAgent) => {
                       await restartAgent(targetAgent);

@@ -1682,11 +1682,13 @@ func isContextOverflowAgentError(err error) bool {
 }
 
 func supportsPromptCompactRetry(agentName string) bool {
+	// Only agents known to accept a prompt compact (/compact or equivalent).
+	// Unknown names must not get a blind compact+retry loop.
 	switch strings.ToLower(strings.TrimSpace(agentName)) {
 	case "opencode", "claude", "codex", "qwen", "gemini", "goose", "crush", "kilocode", "iflow", "pi", "hermes", "openclaw", "omp":
 		return true
 	default:
-		return strings.TrimSpace(agentName) != ""
+		return false
 	}
 }
 

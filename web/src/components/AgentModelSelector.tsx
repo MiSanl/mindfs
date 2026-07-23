@@ -8,6 +8,8 @@ type AgentModelSelectorProps = {
   model?: string;
   onAgentChange: (agent: string) => void;
   onModelChange: (model: string) => void;
+  /** Preferred: commit agent+model together so effort/fast defaults use the new agent. */
+  onAgentModelChange?: (agent: string, model: string) => void;
   onAgentRestart?: (agent: string) => void | Promise<void>;
   compact?: boolean;
   warnUnavailable?: boolean;
@@ -69,6 +71,7 @@ export function AgentModelSelector({
   model = "",
   onAgentChange,
   onModelChange,
+  onAgentModelChange,
   onAgentRestart,
   compact = false,
   warnUnavailable = false,
@@ -124,26 +127,29 @@ export function AgentModelSelector({
 
   const handleAgentSelect = useCallback(
     (nextAgent: string) => {
-      if (nextAgent !== agent) {
-        onAgentChange(nextAgent);
-      }
+      // Preview only — commit when the user picks a model (or re-picks same agent model).
       setHoverAgent(nextAgent);
       setErrorAgent(null);
     },
-    [agent, onAgentChange],
+    [],
   );
 
   const handleModelSelect = useCallback(
     (nextModel: string) => {
-      if (hoverAgent && hoverAgent !== agent) {
-        onAgentChange(hoverAgent);
+      const targetAgent = hoverAgent || agent;
+      if (onAgentModelChange) {
+        onAgentModelChange(targetAgent, nextModel);
+      } else {
+        if (targetAgent && targetAgent !== agent) {
+          onAgentChange(targetAgent);
+        }
+        onModelChange(nextModel);
       }
-      onModelChange(nextModel);
       setIsOpen(false);
       setErrorAgent(null);
       setHoverAgent("");
     },
-    [agent, hoverAgent, onAgentChange, onModelChange],
+    [agent, hoverAgent, onAgentChange, onAgentModelChange, onModelChange],
   );
 
   const handleAgentRestart = useCallback(
