@@ -240,8 +240,11 @@ func (c *mindfsClient) SessionUpdate(ctx context.Context, params acp.SessionNoti
 	}
 	if params.Update.UsageUpdate != nil {
 		current := session.getContextWindow()
-		current.ModelContextWindow = params.Update.UsageUpdate.Size
-		if current.TotalTokens == 0 {
+		// Size can be 0 on some agents/providers; never clobber a known window.
+		if params.Update.UsageUpdate.Size > 0 {
+			current.ModelContextWindow = params.Update.UsageUpdate.Size
+		}
+		if params.Update.UsageUpdate.Used > 0 {
 			current.TotalTokens = params.Update.UsageUpdate.Used
 		}
 		session.setContextWindow(current)
@@ -567,7 +570,7 @@ func (p *Process) SendMessage(ctx context.Context, sessionKey, content string) e
 	sess := p.getSessionByKey(sessionKey)
 
 	if sess == nil {
-		return nil
+		return errors.New("acp session not found")
 	}
 	log.Printf("[agent/acp] send.begin agent=%s session_key=%s content=%q", p.agentLabel(), sessionKey, content)
 
@@ -590,7 +593,11 @@ func (p *Process) SendMessage(ctx context.Context, sessionKey, content string) e
 	}
 	if resp.Usage != nil {
 		current := sess.getContextWindow()
-		current.TotalTokens = resp.Usage.TotalTokens
+		if resp.Usage.TotalTokens > 0 {
+			current.TotalTokens = resp.Usage.TotalTokens
+		}
+		// Keep ModelContextWindow from prior UsageUpdate; prompt usage often
+		// only reports total tokens without a size field.
 		sess.setContextWindow(current)
 	}
 

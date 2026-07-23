@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import { useI18n } from "../i18n";
 
 type AppShellProps = {
@@ -18,6 +18,24 @@ type AppShellProps = {
 
 const MOBILE_BREAKPOINT = 768;
 const TABLET_BREAKPOINT = 1024;
+const LEFT_SIDEBAR_WIDTH_KEY = "mindfs-left-sidebar-width";
+const RIGHT_SIDEBAR_WIDTH_KEY = "mindfs-right-sidebar-width";
+const MIN_LEFT_SIDEBAR_WIDTH = 180;
+const MAX_LEFT_SIDEBAR_WIDTH = 480;
+const MIN_RIGHT_SIDEBAR_WIDTH = 220;
+const MAX_RIGHT_SIDEBAR_WIDTH = 520;
+
+function readSidebarWidth(key: string, fallback: number, min: number, max: number): number {
+  if (typeof window === "undefined") {
+    return fallback;
+  }
+  try {
+    const saved = Number(window.localStorage.getItem(key));
+    return Number.isFinite(saved) ? Math.min(max, Math.max(min, saved)) : fallback;
+  } catch {
+    return fallback;
+  }
+}
 
 function useResponsive() {
   const [isMobile, setIsMobile] = useState(false);
@@ -44,6 +62,8 @@ const sidebarStyle: React.CSSProperties = {
   flexDirection: "column",
   position: "relative",
   zIndex: 10,
+  contain: "layout paint",
+  minWidth: 0,
 };
 
 const mainStyle: React.CSSProperties = {
@@ -56,7 +76,8 @@ const mainStyle: React.CSSProperties = {
   minHeight: 0,
   position: "relative",
   zIndex: 1,
-  contain: "paint",
+  contain: "layout paint",
+  minWidth: 0,
 };
 
 const rightStyle: React.CSSProperties = {
@@ -68,6 +89,8 @@ const rightStyle: React.CSSProperties = {
   flexDirection: "column",
   position: "relative",
   zIndex: 10,
+  contain: "layout paint",
+  minWidth: 0,
 };
 
 const footerStyle: React.CSSProperties = {
@@ -98,14 +121,36 @@ export function AppShell({
 }: AppShellProps) {
   const { t } = useI18n();
   const { isMobile, isTablet } = useResponsive();
+  const [sidebarWidth, setSidebarWidth] = useState(() =>
+    readSidebarWidth(LEFT_SIDEBAR_WIDTH_KEY, 260, MIN_LEFT_SIDEBAR_WIDTH, MAX_LEFT_SIDEBAR_WIDTH),
+  );
+  const [rightWidth, setRightWidth] = useState(() =>
+    readSidebarWidth(RIGHT_SIDEBAR_WIDTH_KEY, 280, MIN_RIGHT_SIDEBAR_WIDTH, MAX_RIGHT_SIDEBAR_WIDTH),
+  );
+  const draggedRef = useRef(false);
+  const shellRef = useRef<HTMLDivElement>(null);
+  const resizeGuideRef = useRef<HTMLDivElement>(null);
+  const resizeShadeRef = useRef<HTMLDivElement>(null);
 
-  const sidebarWidth = isMobile ? "0px" : (isTablet ? "200px" : "260px");
-  const rightWidth = isMobile ? "0px" : (rightSidebar ? (isTablet ? "240px" : "280px") : "0px");
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(LEFT_SIDEBAR_WIDTH_KEY, String(sidebarWidth));
+    } catch {}
+  }, [sidebarWidth]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(RIGHT_SIDEBAR_WIDTH_KEY, String(rightWidth));
+    } catch {}
+  }, [rightWidth]);
+
+  const logicalLeftWidth = isMobile ? 0 : (isTablet ? Math.min(sidebarWidth, 240) : sidebarWidth);
+  const logicalRightWidth = isMobile || !rightSidebar ? 0 : (isTablet ? Math.min(rightWidth, 300) : rightWidth);
   const mobileHeight = "var(--mindfs-viewport-height, 100dvh)";
   const physicalLeftOpen = sidebarsSwapped ? rightOpen : leftOpen;
   const physicalRightOpen = sidebarsSwapped ? leftOpen : rightOpen;
-  const physicalLeftWidth = sidebarsSwapped ? rightWidth : sidebarWidth;
-  const physicalRightWidth = sidebarsSwapped ? sidebarWidth : rightWidth;
+  const physicalLeftWidth = sidebarsSwapped ? logicalRightWidth : logicalLeftWidth;
+  const physicalRightWidth = sidebarsSwapped ? logicalLeftWidth : logicalRightWidth;
   const physicalLeftContent = sidebarsSwapped ? rightSidebar : sidebar;
   const physicalRightContent = sidebarsSwapped ? sidebar : rightSidebar;
   const physicalLeftClose = sidebarsSwapped ? onCloseRight : onCloseLeft;
@@ -115,12 +160,87 @@ export function AppShell({
   const physicalLeftLabel = sidebarsSwapped ? t("sidebar.session") : t("sidebar.file");
   const physicalRightLabel = sidebarsSwapped ? t("sidebar.file") : t("sidebar.session");
 
+  const startResize = (side: "left" | "right", event: React.PointerEvent<HTMLButtonElement>) => {
+    if (isMobile || (side === "left" ? !physicalLeftOpen : !physicalRightOpen)) {
+      return;
+    }
+    event.preventDefault();
+    draggedRef.current = false;
+    const rail = event.currentTarget;
+    rail.classList.add("is-preview");
+    const startX = event.clientX;
+    const startWidth = side === "left" ? physicalLeftWidth : physicalRightWidth;
+    const isSidebar = sidebarsSwapped ? side === "right" : side === "left";
+    const minWidth = isSidebar ? MIN_LEFT_SIDEBAR_WIDTH : MIN_RIGHT_SIDEBAR_WIDTH;
+    const maxWidth = isSidebar
+      ? (isTablet ? Math.min(MAX_LEFT_SIDEBAR_WIDTH, 240) : MAX_LEFT_SIDEBAR_WIDTH)
+      : (isTablet ? Math.min(MAX_RIGHT_SIDEBAR_WIDTH, 300) : MAX_RIGHT_SIDEBAR_WIDTH);
+    let nextWidth = startWidth;
+    let animationFrame = 0;
+    const showPreview = () => {
+      const guide = resizeGuideRef.current;
+      const shade = resizeShadeRef.current;
+      if (!guide || !shade) {
+        return;
+      }
+      const previewStart = Math.min(startWidth, nextWidth);
+      const previewWidth = Math.abs(nextWidth - startWidth);
+      guide.style.setProperty(side, `${nextWidth}px`);
+      guide.style.removeProperty(side === "left" ? "right" : "left");
+      guide.style.setProperty("opacity", "1");
+      shade.style.setProperty(side, `${previewStart}px`);
+      shade.style.removeProperty(side === "left" ? "right" : "left");
+      shade.style.setProperty("width", `${previewWidth}px`);
+      shade.style.setProperty("opacity", previewWidth > 0 ? "1" : "0");
+    };
+    const updateWidth = (width: number) => {
+      nextWidth = Math.min(maxWidth, Math.max(minWidth, width));
+      if (!animationFrame) {
+        animationFrame = window.requestAnimationFrame(() => {
+          showPreview();
+          animationFrame = 0;
+        });
+      }
+    };
+    const onPointerMove = (moveEvent: PointerEvent) => {
+      const delta = side === "left" ? moveEvent.clientX - startX : startX - moveEvent.clientX;
+      if (Math.abs(delta) > 3) {
+        draggedRef.current = true;
+      }
+      updateWidth(startWidth + delta);
+    };
+    const onPointerUp = () => {
+      if (animationFrame) {
+        window.cancelAnimationFrame(animationFrame);
+        animationFrame = 0;
+      }
+      shellRef.current?.style.setProperty("transition", "none");
+      if (isSidebar) {
+        setSidebarWidth(nextWidth);
+      } else {
+        setRightWidth(nextWidth);
+      }
+      window.requestAnimationFrame(() => {
+        rail.classList.remove("is-preview");
+        resizeGuideRef.current?.style.setProperty("opacity", "0");
+        resizeShadeRef.current?.style.setProperty("opacity", "0");
+        shellRef.current?.style.removeProperty("transition");
+      });
+      window.removeEventListener("pointermove", onPointerMove);
+      window.removeEventListener("pointerup", onPointerUp);
+      window.removeEventListener("pointercancel", onPointerUp);
+    };
+    window.addEventListener("pointermove", onPointerMove);
+    window.addEventListener("pointerup", onPointerUp, { once: true });
+    window.addEventListener("pointercancel", onPointerUp, { once: true });
+  };
+
   const shellStyle: React.CSSProperties & {
     "--mindfs-actionbar-bottom-padding"?: string;
   } = {
     display: isMobile ? "flex" : "grid",
     flexDirection: isMobile ? "column" : undefined,
-    gridTemplateColumns: isMobile ? undefined : `${physicalLeftOpen ? physicalLeftWidth : "0px"} 1fr ${physicalRightOpen ? physicalRightWidth : "0px"}`,
+    gridTemplateColumns: isMobile ? undefined : `${physicalLeftOpen ? `${physicalLeftWidth}px` : "0px"} 1fr ${physicalRightOpen ? `${physicalRightWidth}px` : "0px"}`,
     gridTemplateRows: isMobile ? undefined : "1fr auto",
     gridTemplateAreas: isMobile ? undefined : `"sidebar main right" "sidebar footer right"`,
     minHeight: isMobile ? mobileHeight : "100vh",
@@ -181,7 +301,7 @@ export function AppShell({
   };
 
   return (
-    <div style={shellStyle}>
+    <div ref={shellRef} className="mindfs-app-shell" style={shellStyle}>
       {isMobile && <div style={overlayStyle} onClick={() => { onCloseLeft?.(); onCloseRight?.(); }} />}
 
       {(!isMobile || physicalLeftOpen) && physicalLeftContent ? (
@@ -235,14 +355,23 @@ export function AppShell({
 
       {!isMobile ? (
         <>
+          <div ref={resizeShadeRef} className="mindfs-sidebar-resize-shade" aria-hidden="true" />
+          <div ref={resizeGuideRef} className="mindfs-sidebar-resize-guide" aria-hidden="true" />
           <button
             type="button"
             className={`mindfs-sidebar-resize-rail mindfs-sidebar-resize-rail--left${physicalLeftOpen ? " is-open" : " is-closed"}`}
-            onClick={physicalLeftOpen ? physicalLeftClose : physicalLeftOpenHandler}
+            onPointerDown={(event) => startResize("left", event)}
+            onClick={() => {
+              if (draggedRef.current) {
+                draggedRef.current = false;
+                return;
+              }
+              (physicalLeftOpen ? physicalLeftClose : physicalLeftOpenHandler)?.();
+            }}
             aria-label={physicalLeftOpen ? t("sidebar.collapse", { label: physicalLeftLabel }) : t("sidebar.expand", { label: physicalLeftLabel })}
             title={physicalLeftOpen ? t("sidebar.collapse", { label: physicalLeftLabel }) : t("sidebar.expand", { label: physicalLeftLabel })}
             style={{
-              left: physicalLeftOpen ? `calc(${physicalLeftWidth} - 6px)` : 0,
+              left: physicalLeftOpen ? `${physicalLeftWidth - 6}px` : 0,
               cursor: physicalLeftOpen ? "w-resize" : "e-resize",
             }}
           />
@@ -250,11 +379,18 @@ export function AppShell({
             <button
               type="button"
               className={`mindfs-sidebar-resize-rail mindfs-sidebar-resize-rail--right${physicalRightOpen ? " is-open" : " is-closed"}`}
-              onClick={physicalRightOpen ? physicalRightClose : physicalRightOpenHandler}
+              onPointerDown={(event) => startResize("right", event)}
+              onClick={() => {
+                if (draggedRef.current) {
+                  draggedRef.current = false;
+                  return;
+                }
+                (physicalRightOpen ? physicalRightClose : physicalRightOpenHandler)?.();
+              }}
               aria-label={physicalRightOpen ? t("sidebar.collapse", { label: physicalRightLabel }) : t("sidebar.expand", { label: physicalRightLabel })}
               title={physicalRightOpen ? t("sidebar.collapse", { label: physicalRightLabel }) : t("sidebar.expand", { label: physicalRightLabel })}
               style={{
-                right: physicalRightOpen ? `calc(${physicalRightWidth} - 6px)` : 0,
+                right: physicalRightOpen ? `${physicalRightWidth - 6}px` : 0,
                 cursor: physicalRightOpen ? "e-resize" : "w-resize",
               }}
             />

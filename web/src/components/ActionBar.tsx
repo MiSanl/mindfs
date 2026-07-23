@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { type SessionMode } from "./ModeSelector";
 import { ModeSelector } from "./ModeSelector";
-import { AgentSelector } from "./AgentSelector";
+import { AgentModelSelector } from "./AgentModelSelector";
 import { fetchAgents, fetchShells, restartAgent, type AgentStatus, type ShellStatus } from "../services/agents";
 import { fetchCandidates, type CandidateItem } from "../services/candidates";
 import { reportError } from "../services/error";
@@ -17,6 +17,7 @@ import TokenEditor, {
 import { renderToolIcon } from "./stream/ToolCallCard";
 import { useI18n, type MessageKey } from "../i18n";
 import { CompactUploadProgress } from "./CompactUploadProgress";
+import { copyText } from "../services/clipboard";
 
 type SessionInfo = {
   key: string;
@@ -32,6 +33,19 @@ type SessionInfo = {
   fast_service?: string;
   plan_mode?: boolean;
   pending?: boolean;
+	agent_bindings?: Array<{ agent?: string; agent_session_id?: string }>;
+  runtime?: {
+    agent?: string;
+    state?: string;
+    agent_session_id?: string;
+    message?: string;
+  } | null;
+  runtimes?: Array<{
+    agent?: string;
+    state?: string;
+    agent_session_id?: string;
+    message?: string;
+  }>;
 };
 
 type PendingAttachment = {
@@ -68,6 +82,7 @@ function getSelectionPreview(text?: string): string {
 type ActionBarProps = {
   status?: WSStatus;
   agentsVersion?: number;
+  onRuntimeReconnect?: (agent: string) => void | Promise<void>;
   currentRootId?: string | null;
   currentSession?: SessionInfo | null;
   pendingPlanMode?: boolean;
@@ -144,6 +159,85 @@ function wsStatusMeta(status: WSStatus, t: (key: MessageKey) => string): {
   }
 }
 
+
+function runtimeStatusMeta(
+  runtime: SessionInfo["runtime"] | null | undefined,
+  selectedAgent: string,
+  agents: AgentStatus[],
+  t: (key: MessageKey, params?: Record<string, string | number>) => string,
+): {
+  color: string;
+  label: string;
+  agent: string;
+  state: string;
+} {
+  const agentStatus = agents.find((item) => item.name === selectedAgent);
+  const runtimeAgent = String(runtime?.agent || "").trim();
+  const state = String(runtime?.state || "").trim().toLowerCase();
+  const connectedHere =
+    state === "connected" &&
+    (!selectedAgent || !runtimeAgent || runtimeAgent.toLowerCase() === selectedAgent.toLowerCase());
+  if (connectedHere) {
+    return {
+      color: "#22c55e",
+      label: t("session.runtime.connected", { agent: runtimeAgent || selectedAgent || "?" }),
+      agent: runtimeAgent || selectedAgent,
+      state: "connected",
+    };
+  }
+  if (state === "opening" && (!selectedAgent || !runtimeAgent || runtimeAgent.toLowerCase() === selectedAgent.toLowerCase())) {
+    return {
+      color: "#f59e0b",
+      label: t("session.runtime.opening", { agent: runtimeAgent || selectedAgent || "?" }),
+      agent: runtimeAgent || selectedAgent,
+      state: "opening",
+    };
+  }
+  if (state === "error" && (!selectedAgent || !runtimeAgent || runtimeAgent.toLowerCase() === selectedAgent.toLowerCase())) {
+    return {
+      color: "#ef4444",
+      label: t("session.runtime.error", { agent: runtimeAgent || selectedAgent || "?" }),
+      agent: runtimeAgent || selectedAgent,
+      state: "error",
+    };
+  }
+  if (
+    state === "disconnected" &&
+    (!selectedAgent || !runtimeAgent || runtimeAgent.toLowerCase() === selectedAgent.toLowerCase())
+  ) {
+    return {
+      color: "#94a3b8",
+      label:
+        String(runtime?.message || "").trim() ||
+        t("session.runtime.disconnected", { agent: runtimeAgent || selectedAgent || "?" }),
+      agent: runtimeAgent || selectedAgent,
+      state: "disconnected",
+    };
+  }
+  if (agentStatus && agentStatus.available === false) {
+    return {
+      color: "#ef4444",
+      label: t("error.agent.unavailable"),
+      agent: selectedAgent,
+      state: "unavailable",
+    };
+  }
+  if (selectedAgent) {
+    return {
+      color: "#94a3b8",
+      label: t("session.runtime.willUse", { agent: selectedAgent }),
+      agent: selectedAgent,
+      state: "idle",
+    };
+  }
+  return {
+    color: "#94a3b8",
+    label: t("session.runtime.idle"),
+    agent: "",
+    state: "idle",
+  };
+}
+
 const modePlaceholderKeys: Record<SessionMode, MessageKey> = {
   chat: "action.placeholder.chat",
   plugin: "action.placeholder.plugin",
@@ -165,6 +259,46 @@ function getAgentDefaults(agent?: AgentStatus | null) {
     effort: agent?.default_effort || "",
     fastService: (agent?.default_fast_service || "") as "" | "on" | "off",
   } as const;
+}
+
+function getModelDefaultEffort(agent: AgentStatus | null | undefined, modelID: string): string {
+  const model = agent?.models?.find((item) => item.id === modelID);
+  if (model && !model.supportEffort) return "";
+  const modelEfforts = model?.efforts ?? [];
+  const availableEfforts = modelEfforts.length > 0 ? modelEfforts : agent?.efforts ?? [];
+  const candidates = [model?.default_effort || "", agent?.default_effort || ""];
+  return candidates.find((item) => item && availableEfforts.includes(item)) || availableEfforts[0] || "";
+}
+
+function matchAgentModelID(
+  models: Array<{ id?: string }> | undefined,
+  modelID: string,
+): string {
+  const id = String(modelID || "").trim();
+  if (!id || !Array.isArray(models) || models.length === 0) {
+    return "";
+  }
+  for (const model of models) {
+    const mid = String(model?.id || "").trim();
+    if (mid && mid === id) {
+      return mid;
+    }
+  }
+  for (const model of models) {
+    const mid = String(model?.id || "").trim();
+    if (!mid) {
+      continue;
+    }
+    if (mid.endsWith(`/${id}`) || id.endsWith(`/${mid}`)) {
+      return mid;
+    }
+    const bareMid = mid.includes("/") ? mid.slice(mid.lastIndexOf("/") + 1) : mid;
+    const bareID = id.includes("/") ? id.slice(id.lastIndexOf("/") + 1) : id;
+    if (bareMid && bareMid === bareID) {
+      return mid;
+    }
+  }
+  return "";
 }
 
 function buildPendingAttachment(file: File): PendingAttachment {
@@ -388,6 +522,7 @@ function stripPlanCommandPrefix(input: string): string {
 export function ActionBar({
   status = "disconnected",
   agentsVersion = 0,
+  onRuntimeReconnect,
   currentRootId,
   currentSession,
   pendingPlanMode = false,
@@ -457,6 +592,7 @@ export function ActionBar({
   const { isMobile } = useResponsive();
   const isConnected = status === "connected";
   const connectionMeta = wsStatusMeta(status, t);
+  const runtimeMeta = runtimeStatusMeta(currentSession?.runtime, agent, agents, t);
   const DRAG_THRESHOLD = -40;
   const boundRingColor = detachedBoundSession ? "#f59e0b" : "#2563eb";
   const boundRingShadow = detachedBoundSession
@@ -551,7 +687,7 @@ export function ActionBar({
     setAgent(preferred.name);
     setModel(defaults.model);
     setAgentMode("");
-    setEffort(defaults.effort);
+    setEffort(getModelDefaultEffort(preferred, defaults.model));
     setFastService(defaults.fastService);
   }, [agent, agents, currentSession]);
 
@@ -563,9 +699,27 @@ export function ActionBar({
     if (!selectedAgent) {
       return;
     }
-    const hasModel = (selectedAgent.models ?? []).some((item) => item.id === model);
-    if (!hasModel) {
-      setModel("");
+    const catalog = selectedAgent.models ?? [];
+    if (catalog.some((item) => item.id === model)) {
+      return;
+    }
+    // During provider switch / delayed refresh the catalog can briefly be
+    // empty or native-only. Do not clobber a still-valid user selection then.
+    if (catalog.length === 0) {
+      return;
+    }
+    // Prefer suffix remap within the current catalog. Do not fall back to the
+    // agent-global current/default model while a session may still be bound to
+    // a different provider — that silently rewrote the user's model.
+    const remapped = matchAgentModelID(catalog, model) || "";
+    if (remapped && remapped !== model) {
+      setModel(remapped);
+      return;
+    }
+    // Catalog changed for real and no suffix match remains: pick first catalog
+    // entry only when the previous model is completely gone.
+    if (!remapped && catalog[0]?.id) {
+      setModel(catalog[0].id);
     }
   }, [agent, model, agents]);
 
@@ -575,7 +729,11 @@ export function ActionBar({
     || (selectedAgent?.models ?? []).find(
       (item) => item.id === (selectedAgent?.default_model_id || selectedAgent?.current_model_id),
     );
-  const availableEfforts = selectedModelInfo?.efforts ?? selectedAgent?.efforts ?? [];
+// Prefer the selected model's effort list so gpt-5.5 does not show ultra/max only offered by gpt-5.6.
+  const modelEfforts = selectedModelInfo?.efforts ?? [];
+  const availableEfforts = modelEfforts.length > 0
+    ? modelEfforts
+    : selectedAgent?.efforts ?? [];
   const isCodexEffortAgent = selectedAgent?.name === "codex";
   const supportsEffort =
     availableEfforts.length > 0 && !!selectedModelInfo?.supportEffort;
@@ -584,6 +742,11 @@ export function ActionBar({
   const planSessionKey = currentSession?.key || currentSession?.session_key || "";
   const planRootId = currentSession?.root_id || currentRootId || "";
   const sessionHistoryKey = currentSession?.key || currentSession?.session_key || "";
+  const mindfsSessionID = currentSession?.key || currentSession?.session_key || "";
+  const copySessionID = useCallback(() => {
+	if (!mindfsSessionID) return;
+	void copyText(mindfsSessionID).catch((error) => console.error("[session] copy id failed", error));
+	}, [mindfsSessionID]);
 
   useEffect(() => {
     if (!supportsEffort) {
@@ -593,9 +756,17 @@ export function ActionBar({
       return;
     }
     if (effort && !availableEfforts.includes(effort)) {
-      setEffort(getAgentDefaults(selectedAgent).effort);
+      const modelDefault = selectedModelInfo?.default_effort || "";
+      const agentDefault = getAgentDefaults(selectedAgent).effort;
+      setEffort(
+        availableEfforts.includes(modelDefault)
+          ? modelDefault
+          : availableEfforts.includes(agentDefault)
+            ? agentDefault
+            : availableEfforts[0] || "",
+      );
     }
-  }, [supportsEffort, effort, availableEfforts, selectedAgent, isCodexEffortAgent]);
+  }, [supportsEffort, effort, availableEfforts, selectedAgent, selectedModelInfo, isCodexEffortAgent]);
 
   useEffect(() => {
     if (!supportsServiceTier) {
@@ -1072,7 +1243,7 @@ export function ActionBar({
     setAgent(nextAgent.name);
     setModel(defaults.model);
     setAgentMode("");
-    setEffort(defaults.effort);
+    setEffort(getModelDefaultEffort(nextAgent, defaults.model));
     setFastService(defaults.fastService);
     syncedSessionSignatureRef.current = "";
   }, [agent, agents]);
@@ -1138,7 +1309,12 @@ export function ActionBar({
     : mode === "chat" && !isFocused
       ? t(blurPlaceholderKey)
       : t(modePlaceholderKeys[mode]);
-  const editorRightInset = isMultiLine ? 14 : mode === "command" ? (isMobile ? 92 : 116) : isMobile ? 124 : 148;
+  // Agent/model/mode/effort/fast 合并为单控件后，右侧工具栏最紧凑；runtime 已移出输入框。
+  const editorRightInset = isMultiLine
+    ? 14
+    : mode === "command"
+      ? isMobile ? 92 : 116
+      : isMobile ? 118 : 148;
   const editorBottomInset = isMultiLine ? 44 : 12;
   const editorMinHeight = 44;
   const mobileFileSidebarButton = isMobile ? (
@@ -1341,54 +1517,131 @@ export function ActionBar({
               display: "flex",
               flexDirection: "column",
               alignItems: "flex-start",
-              gap: planModeActive ? "4px" : 0,
+              gap: mode !== "command" ? "4px" : 0,
               minWidth: 0,
             }}
           >
-            {planModeActive ? (
+            {mode !== "command" ? (
               <div
                 style={{
-                  display: "inline-flex",
+                  display: "flex",
                   alignItems: "center",
-                  gap: "5px",
-                  height: "20px",
-                  padding: "0 5px 0 8px",
-                  borderRadius: "999px",
-                  border: "1px solid rgba(37, 99, 235, 0.22)",
-                  background: "rgba(37, 99, 235, 0.10)",
-                  color: "#2563eb",
-                  fontSize: "11px",
-                  fontWeight: 700,
-                  lineHeight: 1,
+                  gap: "6px",
+                  minHeight: "20px",
+                  width: "100%",
+                  minWidth: 0,
                 }}
               >
-                <span>Plan</span>
+                {planModeActive ? (
+                  <div
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: "5px",
+                      height: "20px",
+                      padding: "0 5px 0 8px",
+                      borderRadius: "999px",
+                      border: "1px solid rgba(37, 99, 235, 0.22)",
+                      background: "rgba(37, 99, 235, 0.10)",
+                      color: "#2563eb",
+                      fontSize: "11px",
+                      fontWeight: 700,
+                      lineHeight: 1,
+                    }}
+                  >
+                    <span>Plan</span>
+                    <button
+                      type="button"
+                      aria-label={t("action.closePlanMode")}
+                      title={t("action.closePlanMode")}
+                      onMouseDown={(event) => event.preventDefault()}
+                      onClick={() => void onSetPlanMode?.(false, planSessionKey, planRootId)}
+                      style={{
+                        width: "14px",
+                        height: "14px",
+                        border: "none",
+                        borderRadius: "999px",
+                        background: "transparent",
+                        color: "currentColor",
+                        display: "inline-flex",
+                        alignItems: "center",
+                        justifyContent: "center",
+                        cursor: "pointer",
+                        fontSize: "14px",
+                        lineHeight: 1,
+                        padding: 0,
+                      }}
+                    >
+                      <svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24" aria-hidden="true">
+                        <path d="M0 0h24v24H0z" fill="none" />
+                        <path fill="currentColor" fillRule="evenodd" d="M21 12a9 9 0 1 1-18 0a9 9 0 0 1 18 0M7.293 16.707a1 1 0 0 1 0-1.414L10.586 12L7.293 8.707a1 1 0 0 1 1.414-1.414L12 10.586l3.293-3.293a1 1 0 1 1 1.414 1.414L13.414 12l3.293 3.293a1 1 0 0 1-1.414 1.414L12 13.414l-3.293 3.293a1 1 0 0 1-1.414 0" clipRule="evenodd" />
+                      </svg>
+                    </button>
+                  </div>
+                ) : null}
                 <button
                   type="button"
-                  aria-label={t("action.closePlanMode")}
-                  title={t("action.closePlanMode")}
-                  onMouseDown={(event) => event.preventDefault()}
-                  onClick={() => void onSetPlanMode?.(false, planSessionKey, planRootId)}
+                  title={
+                    runtimeMeta.state === "connected"
+                      ? `${runtimeMeta.label} · ${t("session.runtime.reconnectHint")}`
+                      : `${runtimeMeta.label} · ${t("session.runtime.reconnectHint")}`
+                  }
+                  aria-label={`${t("session.runtime.label")}: ${runtimeMeta.label}`}
+                  onClick={async () => {
+                    const target = String(runtimeMeta.agent || agent || "").trim();
+                    if (!target || runtimeMeta.state === "opening") return;
+                    // Connected runtimes: require confirm — restart kills the whole agent process.
+                    if (runtimeMeta.state === "connected") {
+                      const ok = window.confirm(
+                        t("session.runtime.reconnectConfirm", { agent: target }),
+                      );
+                      if (!ok) return;
+                    }
+                    try {
+                      if (onRuntimeReconnect) {
+                        await onRuntimeReconnect(target);
+                      } else {
+                        await restartAgent(target);
+                        const items = await fetchAgents(true);
+                        setAgents(items);
+                      }
+                    } catch (err) {
+                      console.warn("[runtime/reconnect] failed", err);
+                    }
+                  }}
                   style={{
-                    width: "14px",
-                    height: "14px",
-                    border: "none",
-                    borderRadius: "999px",
-                    background: "transparent",
-                    color: "currentColor",
                     display: "inline-flex",
                     alignItems: "center",
-                    justifyContent: "center",
-                    cursor: "pointer",
-                    fontSize: "14px",
-                    lineHeight: 1,
-                    padding: 0,
+                    gap: "5px",
+                    maxWidth: isMobile ? "min(52vw, 180px)" : "220px",
+                    height: "20px",
+                    padding: "0 8px",
+                    borderRadius: "999px",
+                    border: "1px solid color-mix(in srgb, var(--border-color) 80%, transparent)",
+                    background: "color-mix(in srgb, var(--panel-bg) 88%, transparent)",
+                    color: "var(--text-secondary)",
+                    fontSize: "11px",
+                    fontWeight: 600,
+                    whiteSpace: "nowrap",
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    flexShrink: 1,
+                    cursor: runtimeMeta.state === "opening" ? "default" : "pointer",
+                    marginLeft: planModeActive ? 0 : "2px",
                   }}
                 >
-                  <svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24" aria-hidden="true">
-                    <path d="M0 0h24v24H0z" fill="none" />
-                    <path fill="currentColor" fillRule="evenodd" d="M21 12a9 9 0 1 1-18 0a9 9 0 0 1 18 0M7.293 16.707a1 1 0 0 1 0-1.414L10.586 12L7.293 8.707a1 1 0 0 1 1.414-1.414L12 10.586l3.293-3.293a1 1 0 1 1 1.414 1.414L13.414 12l3.293 3.293a1 1 0 0 1-1.414 1.414L12 13.414l-3.293 3.293a1 1 0 0 1-1.414 0" clipRule="evenodd" />
-                  </svg>
+                  <span
+                    style={{
+                      width: "7px",
+                      height: "7px",
+                      borderRadius: "50%",
+                      background: runtimeMeta.color,
+                      flexShrink: 0,
+                    }}
+                  />
+                  <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>
+                    {runtimeMeta.label}
+                  </span>
                 </button>
               </div>
             ) : null}
@@ -1627,34 +1880,97 @@ export function ActionBar({
 
               <ModeSelector mode={mode} onModeChange={setMode} compact={true} disabled={isModeLocked} />
               {mode !== "command" ? (
-                <div>
-                  <AgentSelector
+                <div style={{ display: "flex", alignItems: "center", minWidth: 0 }}>
+                  <AgentModelSelector
                     agent={agent}
+                    agents={agents}
                     model={model}
                     mode={agentMode}
                     effort={effort}
-                    agents={agents}
-                    onAgentChange={(nextAgent, nextModel) => {
+                    fastService={fastService}
+                    compact={true}
+                    warnUnavailable={isSelectedAgentUnavailable}
+                    maxButtonWidth={isMobile ? "min(42vw, 168px)" : "210px"}
+                    onAgentChange={(nextAgent) => {
+                      const prevAgent = agent;
                       const nextStatus = agents.find((item) => item.name === nextAgent);
                       const defaults = getAgentDefaults(nextStatus);
                       setAgent(nextAgent);
-                      setModel(nextModel || defaults.model);
+                      setModel(defaults.model);
                       setAgentMode("");
-                      setEffort(defaults.effort);
+                      setEffort(getModelDefaultEffort(nextStatus, defaults.model));
                       setFastService(defaults.fastService);
+                      if (nextAgent && nextAgent !== prevAgent) {
+                        reportError(
+                          "agent.switched",
+                          t("session.runtime.willUse", { agent: nextAgent }),
+                          {
+                            severity: "info",
+                            recoverable: false,
+                            details: { from: prevAgent, to: nextAgent },
+                          },
+                        );
+                        if (nextStatus && nextStatus.available === false) {
+                          reportError("agent.unavailable", undefined, {
+                            details: { agent: nextAgent },
+                          });
+                        }
+                      }
+                    }}
+                    onModelChange={(nextModel) => {
+                      const defaults = getAgentDefaults(selectedAgent);
+                      setModel(nextModel);
+                      setAgentMode("");
+                      setEffort(getModelDefaultEffort(selectedAgent, nextModel));
+                      setFastService(defaults.fastService);
+                    }}
+                    onAgentModelChange={(nextAgent, nextModel) => {
+                      const prevAgent = agent;
+                      const nextStatus = agents.find((item) => item.name === nextAgent) || null;
+                      const defaults = getAgentDefaults(nextStatus);
+                      const modelID = nextModel || defaults.model;
+                      setAgent(nextAgent);
+                      setModel(modelID);
+                      setAgentMode("");
+                      setEffort(getModelDefaultEffort(nextStatus, modelID));
+                      setFastService(defaults.fastService);
+                      if (nextAgent && nextAgent !== prevAgent) {
+                        reportError(
+                          "agent.switched",
+                          t("session.runtime.willUse", { agent: nextAgent }),
+                          {
+                            severity: "info",
+                            recoverable: false,
+                            details: { from: prevAgent, to: nextAgent },
+                          },
+                        );
+                        if (nextStatus && nextStatus.available === false) {
+                          reportError("agent.unavailable", undefined, {
+                            details: { agent: nextAgent },
+                          });
+                        }
+                      }
                     }}
                     onModeChange={(nextAgentMode) => setAgentMode(nextAgentMode || "")}
                     onEffortChange={(nextEffort) => setEffort(nextEffort || "")}
-                    fastService={fastService}
                     onFastServiceChange={(nextFastService) => setFastService(nextFastService || "")}
                     onAgentRestart={async (targetAgent) => {
                       await restartAgent(targetAgent);
                       const items = await fetchAgents(true);
                       setAgents(items);
                     }}
-                    compact={true}
-                    warnUnavailable={isSelectedAgentUnavailable}
                   />
+                  {mindfsSessionID ? (
+                    <button
+                      type="button"
+                      onClick={copySessionID}
+                      title="Copy MindFS session ID"
+                      aria-label="Copy MindFS session ID"
+                      style={{ width: "28px", height: "28px", borderRadius: "8px", border: "none", background: "transparent", color: "var(--text-secondary)", display: "inline-flex", alignItems: "center", justifyContent: "center", cursor: "pointer" }}
+                    >
+                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="9" y="9" width="11" height="11" rx="2" /><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" /></svg>
+                    </button>
+                  ) : null}
                 </div>
               ) : (
                 <ShellSelector

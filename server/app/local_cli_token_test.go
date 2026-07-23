@@ -3,6 +3,7 @@ package app
 import (
 	"encoding/json"
 	"os"
+	"runtime"
 	"testing"
 )
 
@@ -52,7 +53,7 @@ func TestLocalCLITokenStoreWritesSinglePrivateFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stat token store: %v", err)
 	}
-	if info.Mode().Perm() != 0o600 {
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
 		t.Fatalf("token store mode = %o, want 0600", info.Mode().Perm())
 	}
 	raw, err := os.ReadFile(path)
@@ -73,4 +74,6 @@ func setTestConfigHome(t *testing.T, dir string) {
 	t.Setenv("XDG_CONFIG_HOME", dir)
 	t.Setenv("HOME", dir)
 	t.Setenv("AppData", dir)
+	t.Setenv("APPDATA", dir)
+	t.Setenv("USERPROFILE", dir)
 }

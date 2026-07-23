@@ -45,6 +45,7 @@ export type AgentModelInfo = {
   hidden?: boolean;
   supportEffort?: boolean;
   efforts?: string[];
+  default_effort?: string;
 };
 
 export type AgentModeInfo = {
@@ -69,7 +70,6 @@ export type ShellStatus = {
   default?: boolean;
 };
 
-const VALID_EFFORTS = ["low", "medium", "high", "xhigh", "max", "ultra"] as const;
 function normalizeEfforts(input: unknown): string[] | undefined {
   if (!Array.isArray(input)) {
     return undefined;
@@ -77,8 +77,12 @@ function normalizeEfforts(input: unknown): string[] | undefined {
   const seen = new Set<string>();
   const efforts: string[] = [];
   for (const item of input) {
-    const value = String(item || "").trim().toLowerCase();
-    if (!VALID_EFFORTS.includes(value as (typeof VALID_EFFORTS)[number])) {
+    if (typeof item !== "string") {
+      continue;
+    }
+    const value = item.trim().toLowerCase();
+    // 思考等级由 Agent 的模型目录定义，不能用前端白名单丢弃 ultra 等新增能力。
+    if (!value) {
       continue;
     }
     if (seen.has(value)) {
@@ -95,16 +99,19 @@ function normalizeAgentStatus(input: unknown): AgentStatus | null {
     return null;
   }
   const agent = input as AgentStatus;
-  const models = Array.isArray(agent.models)
-    ? agent.models.map((model) => ({
-        ...model,
-        efforts: normalizeEfforts(model.efforts),
-      }))
-    : agent.models;
   return {
     ...agent,
     efforts: normalizeEfforts(agent.efforts),
-    models,
+    models: Array.isArray(agent.models)
+      ? agent.models.map((model) => ({
+          ...model,
+          efforts: normalizeEfforts(model.efforts),
+          default_effort:
+            typeof model.default_effort === "string"
+              ? model.default_effort.trim().toLowerCase()
+              : "",
+        }))
+      : agent.models,
     default_fast_service:
       typeof agent.default_fast_service === "string"
         ? agent.default_fast_service
@@ -154,52 +161,91 @@ async function fetchAgentRuntime(force = false, includeAll = false): Promise<{ a
     }
     return { agents: cachedAgents, shells: cachedShells };
   }
-  if (inFlight) {
+  // Non-force callers may share one in-flight request. Force must not join a
+  // stale in-flight (provider switch delayed refresh needs a fresh sample).
+  if (inFlight && !force) {
     return inFlight;
   }
   if (!protectedAPIReady()) {
     return { agents: agentCache, shells: cachedShells };
   }
 
-  const request = (async () => {
-    const data = await protectedJSON<any>(appPath(includeAll ? "/api/agents?all=1" : "/api/agents"));
-    const agentItems: unknown[] = Array.isArray(data) ? data : Array.isArray(data?.agents) ? data.agents : [];
-    const shellItems: unknown[] = Array.isArray(data?.shells) ? data.shells : [];
-    const nextAgents = agentItems
-      ? agentItems.map(normalizeAgentStatus).filter((item): item is AgentStatus => item !== null)
-      : [];
+  const startRequest = () => {
+    const request = (async () => {
+      const data = await protectedJSON<any>(appPath(includeAll ? "/api/agents?all=1" : "/api/agents"));
+      const agentItems: unknown[] = Array.isArray(data) ? data : Array.isArray(data?.agents) ? data.agents : [];
+      const shellItems: unknown[] = Array.isArray(data?.shells) ? data.shells : [];
+      const nextAgents = agentItems
+        ? agentItems.map(normalizeAgentStatus).filter((item): item is AgentStatus => item !== null)
+        : [];
+      if (includeAll) {
+        cachedAgentCatalog = nextAgents;
+        lastCatalogFetch = Date.now();
+      } else {
+        cachedAgents = nextAgents;
+        lastFetch = Date.now();
+      }
+      cachedShells = shellItems.map(normalizeShellStatus).filter((item): item is ShellStatus => item !== null);
+      return { agents: nextAgents, shells: cachedShells };
+    })();
     if (includeAll) {
-      cachedAgentCatalog = nextAgents;
-      lastCatalogFetch = now;
+      inFlightCatalog = request;
     } else {
-      cachedAgents = nextAgents;
-      lastFetch = now;
+      inFlightAgents = request;
     }
-    cachedShells = shellItems.map(normalizeShellStatus).filter((item): item is ShellStatus => item !== null);
-    return { agents: nextAgents, shells: cachedShells };
-  })();
-  if (includeAll) {
-    inFlightCatalog = request;
-  } else {
-    inFlightAgents = request;
-  }
+    return request.finally(() => {
+      if (includeAll) {
+        if (inFlightCatalog === request) {
+          inFlightCatalog = null;
+        }
+      } else if (inFlightAgents === request) {
+        inFlightAgents = null;
+      }
+    });
+  };
+
   try {
-    return await request;
+    if (inFlight && force) {
+      // Wait out the in-flight sample, then issue a fresh forced fetch so delayed
+      // refresh timers observe post-probe catalogs instead of the first promise.
+      try {
+        await inFlight;
+      } catch {
+        // ignore; still force a new request below
+      }
+      // Another force may have started while we waited; re-check.
+      const latestInFlight = includeAll ? inFlightCatalog : inFlightAgents;
+      if (latestInFlight) {
+        return latestInFlight;
+      }
+    }
+    return await startRequest();
   } catch (err) {
     console.error("Failed to fetch agents:", err);
     return { agents: agentCache, shells: cachedShells };
-  } finally {
-    if (includeAll) {
-      inFlightCatalog = null;
-    } else {
-      inFlightAgents = null;
-    }
   }
 }
 
 export async function fetchAgents(force = false): Promise<AgentStatus[]> {
   const data = await fetchAgentRuntime(force);
   return data.agents;
+}
+
+// After provider switch for claude/codex/opencode, probe catalogs can land late.
+// Callers may use this to force several cache-busting fetches without killing sessions.
+export function scheduleAgentsRefresh(
+  callback?: (agents: AgentStatus[]) => void,
+  delaysMs: number[] = [0, 1500, 4500],
+): void {
+  for (const delay of delaysMs) {
+    window.setTimeout(() => {
+      void fetchAgents(true)
+        .then((items) => {
+          callback?.(items);
+        })
+        .catch(() => {});
+    }, Math.max(0, delay));
+  }
 }
 
 export async function fetchAgentCatalog(force = false): Promise<AgentStatus[]> {

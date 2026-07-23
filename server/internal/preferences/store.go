@@ -140,6 +140,43 @@ func (s *Store) UpdateAgentLastConfigSelection(agentName string, selection LastC
 	return s.saveLocked()
 }
 
+func (s *Store) ClearAgentLastConfigSelection(agentName string) error {
+	if s == nil {
+		return nil
+	}
+	agentName = strings.TrimSpace(agentName)
+	if agentName == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.data.Agents == nil {
+		return nil
+	}
+	next, ok := s.data.Agents[agentName]
+	if !ok || next.LastConfigSelection == nil {
+		return nil
+	}
+	next.LastConfigSelection = nil
+	s.data.Agents[agentName] = next
+	return s.saveLocked()
+}
+
+func (s *Store) AgentLastConfigSelection(agentName string) *LastConfigSelection {
+	if s == nil {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	selection := s.data.Agents[strings.TrimSpace(agentName)].LastConfigSelection
+	if selection == nil {
+		return nil
+	}
+	copy := *selection
+	return &copy
+}
+
 func (s *Store) ApplyAgentDefaults(statuses []agent.Status) []agent.Status {
 	if s == nil || len(statuses) == 0 {
 		return statuses

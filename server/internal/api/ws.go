@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"net/url"
@@ -35,6 +36,8 @@ const (
 )
 
 var upgrader = websocket.Upgrader{}
+
+const sessionQueueFreezeTimeout = 30 * time.Second
 
 // WSHandler manages JSON-RPC over WebSocket.
 type WSHandler struct {
@@ -547,6 +550,7 @@ func (h *WSHandler) handleSessionMessage(ctx context.Context, conn *websocket.Co
 	rootID := getString(req.Payload, "root_id")
 	key := getString(req.Payload, "session_key")
 	requestID := strings.TrimSpace(req.ID)
+	createdSession := false
 	content := getString(req.Payload, "content")
 	planRequested, strippedContent := parsePlanMessage(content)
 	if planRequested {
@@ -556,6 +560,7 @@ func (h *WSHandler) handleSessionMessage(ctx context.Context, conn *websocket.Co
 	sessionType := getString(req.Payload, "type")
 	agentName := getString(req.Payload, "agent")
 	model := getString(req.Payload, "model")
+	providerID := getString(req.Payload, "provider_id")
 	agentMode := getString(req.Payload, "agent_mode")
 	effort := getString(req.Payload, "effort")
 	fastService := normalizeFastServiceValue(getString(req.Payload, "fast_service"))
@@ -593,6 +598,7 @@ func (h *WSHandler) handleSessionMessage(ctx context.Context, conn *websocket.Co
 			return
 		}
 		key = created.Key
+		createdSession = true
 		h.broadcastSessionMetaUpdated(rootID, created)
 		if sessionType != session.TypeCommand {
 			go func(rootID, sessionKey, agentName, firstMessage string) {
@@ -625,7 +631,7 @@ func (h *WSHandler) handleSessionMessage(ctx context.Context, conn *websocket.Co
 					h.sendWSError(conn, clientID, req.ID, "session.plan_mode_failed", updateErr.Error())
 					return
 				}
-				h.switchSessionRuntimePlanMode(ctx, key, current, true)
+				h.switchSessionRuntimePlanMode(ctx, rootID, key, current, true)
 				updated, getErr := manager.Get(ctx, key, 0)
 				if getErr == nil && updated != nil {
 					current = updated
@@ -642,18 +648,36 @@ func (h *WSHandler) handleSessionMessage(ctx context.Context, conn *websocket.Co
 		h.sendWSAccepted(conn, clientID, requestID, rootID, key)
 	}
 	if h.AppContext != nil {
-		streamHub.BindSessionClient(key, clientID)
+		streamHub.BindSessionClient(rootID, key, clientID)
 	}
 	clientCtx := parseClientContext(req.Payload, rootID)
+	allowProviderBind := createdSession
+	if !allowProviderBind && strings.TrimSpace(providerID) != "" && usecase.SessionProviderIsolationAgent(agentName) {
+		// Pre-created empty sessions should still acquire the first provider binding
+		// from the UI-selected provider on the first send.
+		if current, err := uc.GetSession(ctx, usecase.GetSessionInput{RootID: rootID, Key: key}); err == nil && current != nil {
+			if len(current.Exchanges) == 0 && h.AppContext != nil {
+				if manager, managerErr := h.AppContext.GetSessionManager(rootID); managerErr == nil && manager != nil {
+					if binding, bindErr := manager.FindAgentBinding(ctx, key, agentName); bindErr == nil {
+						if binding == nil || strings.TrimSpace(binding.ProviderID) == "" {
+							allowProviderBind = true
+						}
+					}
+				}
+			}
+		}
+	}
 	userMessage := PendingUserMessage{
-		Agent:       agentName,
-		Model:       model,
-		Mode:        agentMode,
-		Effort:      effort,
-		FastService: fastService,
-		PlanMode:    planMode,
-		Content:     content,
-		Timestamp:   time.Now().UTC(),
+		Agent:             agentName,
+		Model:             model,
+		ProviderID:        providerID,
+		AllowProviderBind: allowProviderBind,
+		Mode:              agentMode,
+		Effort:            effort,
+		FastService:       fastService,
+		PlanMode:          planMode,
+		Content:           content,
+		Timestamp:         time.Now().UTC(),
 	}
 	job := sessionMessageJob{
 		RootID:          rootID,
@@ -667,17 +691,22 @@ func (h *WSHandler) handleSessionMessage(ctx context.Context, conn *websocket.Co
 		ClientCtx:       clientCtx,
 		ExcludeClientID: clientID,
 	}
-	if streamHub.IsSessionReplying(key) && sessionType != session.TypeCommand {
+	if sessionType != session.TypeCommand && (streamHub.IsSessionReplying(rootID, key) || streamHub.HasQueuedSessionMessages(rootID, key)) {
 		queue := streamHub.EnqueueSessionMessage(rootID, key, sessionName, QueuedUserMessage{
 			ID:                 requestID,
 			PendingUserMessage: userMessage,
 			ClientCtx:          clientCtx,
 		})
 		streamHub.BroadcastSessionQueueUpdated(rootID, key, queue)
-		log.Printf("[ws] session.queue.enqueue root=%s session=%s request=%s queue=%d", rootID, key, requestID, len(queue))
+		log.Printf("[ws] session.queue.enqueue root=%s session=%s request=%s queue=%d replying=%v", rootID, key, requestID, len(queue), streamHub.IsSessionReplying(rootID, key))
+		// If nothing is actively replying, drain the queue immediately so
+		// leftover items from kanban/scheduled paths cannot be skipped forever.
+		if !streamHub.IsSessionReplying(rootID, key) {
+			h.startNextQueuedSessionMessage(rootID, key)
+		}
 		return
 	}
-	if queue, changed := streamHub.UnfreezeQueuedSessionMessages(key); changed {
+	if queue, changed := streamHub.UnfreezeQueuedSessionMessages(rootID, key); changed {
 		streamHub.BroadcastSessionQueueUpdated(rootID, key, queue)
 	}
 	h.runSessionMessage(job)
@@ -689,6 +718,7 @@ func (h *WSHandler) handleSessionSlashCommandRun(ctx context.Context, conn *webs
 	requestID := strings.TrimSpace(req.ID)
 	agentName := getString(req.Payload, "agent")
 	model := getString(req.Payload, "model")
+	providerID := getString(req.Payload, "provider_id")
 	agentMode := getString(req.Payload, "agent_mode")
 	effort := getString(req.Payload, "effort")
 	fastService := normalizeFastServiceValue(getString(req.Payload, "fast_service"))
@@ -717,7 +747,7 @@ func (h *WSHandler) handleSessionSlashCommandRun(ctx context.Context, conn *webs
 		h.sendWSAccepted(conn, clientID, requestID, rootID, key)
 	}
 	if h.AppContext != nil {
-		h.AppContext.GetSessionStreamHub().BindSessionClient(key, clientID)
+		h.AppContext.GetSessionStreamHub().BindSessionClient(rootID, key, clientID)
 	}
 
 	uc := &usecase.Service{Registry: h.AppContext}
@@ -729,6 +759,7 @@ func (h *WSHandler) handleSessionSlashCommandRun(ctx context.Context, conn *webs
 		Key:         key,
 		Agent:       agentName,
 		Model:       model,
+		ProviderID:  providerID,
 		Mode:        agentMode,
 		Effort:      effort,
 		FastService: fastService,
@@ -782,7 +813,7 @@ func (h *WSHandler) handleSessionPlanModeSet(ctx context.Context, conn *websocke
 		return
 	}
 	if previous != enabled {
-		h.switchSessionRuntimePlanMode(ctx, key, current, enabled)
+		h.switchSessionRuntimePlanMode(ctx, rootID, key, current, enabled)
 	}
 	updated, err := manager.Get(ctx, key, 0)
 	if err != nil {
@@ -794,10 +825,13 @@ func (h *WSHandler) handleSessionPlanModeSet(ctx context.Context, conn *websocke
 	_ = h.writeWSJSON(clientID, conn, buildSessionDoneResponse(rootID, key, requestID, false))
 }
 
-func wsAgentPoolSessionKey(sessionKey, agentName string) string {
+func wsAgentPoolSessionKey(rootID, sessionKey, agentName string) string {
 	sessionKey = strings.TrimSpace(sessionKey)
 	if sessionKey == "" {
 		return ""
+	}
+	if root := strings.TrimSpace(rootID); root != "" {
+		sessionKey = root + "::" + sessionKey
 	}
 	agentName = strings.TrimSpace(agentName)
 	if agentName == "" {
@@ -806,7 +840,7 @@ func wsAgentPoolSessionKey(sessionKey, agentName string) string {
 	return strings.ToLower(agentName) + "-" + sessionKey
 }
 
-func (h *WSHandler) switchSessionRuntimePlanMode(ctx context.Context, key string, current *session.Session, enabled bool) {
+func (h *WSHandler) switchSessionRuntimePlanMode(ctx context.Context, rootID, key string, current *session.Session, enabled bool) {
 	if h == nil || h.AppContext == nil || current == nil {
 		return
 	}
@@ -815,9 +849,9 @@ func (h *WSHandler) switchSessionRuntimePlanMode(ctx context.Context, key string
 		return
 	}
 	agentName := session.InferAgentFromSession(current)
-	if runtime, ok := pool.Get(wsAgentPoolSessionKey(key, agentName)); ok {
+	if runtime, ok := pool.Get(wsAgentPoolSessionKey(rootID, key, agentName)); ok {
 		if err := runtime.SetPlanMode(ctx, enabled); err != nil {
-			log.Printf("[session/plan] runtime.switch.error session=%s agent=%s plan_mode=%t err=%v", key, agentName, enabled, err)
+			log.Printf("[session/plan] runtime.switch.error root=%s session=%s agent=%s plan_mode=%t err=%v", rootID, key, agentName, enabled, err)
 		}
 	}
 }
@@ -845,18 +879,20 @@ func (h *WSHandler) runSessionMessage(job sessionMessageJob) {
 	}
 
 	err := uc.SendMessage(msgCtx, usecase.SendMessageInput{
-		RootID:       rootID,
-		Key:          key,
-		Agent:        job.User.Agent,
-		Model:        job.User.Model,
-		Mode:         job.User.Mode,
-		Effort:       job.User.Effort,
-		FastService:  job.User.FastService,
-		PlanMode:     &job.User.PlanMode,
-		Shell:        job.Shell,
-		TerminalCols: job.TerminalCols,
-		Content:      job.User.Content,
-		ClientCtx:    job.ClientCtx,
+		RootID:            rootID,
+		Key:               key,
+		Agent:             job.User.Agent,
+		Model:             job.User.Model,
+		ProviderID:        job.User.ProviderID,
+		AllowProviderBind: job.User.AllowProviderBind,
+		Mode:              job.User.Mode,
+		Effort:            job.User.Effort,
+		FastService:       job.User.FastService,
+		PlanMode:          &job.User.PlanMode,
+		Shell:             job.Shell,
+		TerminalCols:      job.TerminalCols,
+		Content:           job.User.Content,
+		ClientCtx:         job.ClientCtx,
 		OnStart: func() {
 			h.AppContext.ClearTaskAuxFlagsForSession(rootID, key)
 			streamHub.BroadcastSessionUserMessage(rootID, key, job.SessionType, job.SessionName, job.User.Agent, job.User.Model, job.User.Mode, job.User.Effort, job.User.FastService, job.User.PlanMode, job.User.Content, job.ExcludeClientID, job.Queued)
@@ -897,16 +933,43 @@ func (h *WSHandler) runSessionMessage(job sessionMessageJob) {
 			tracker.End()
 		},
 	})
-	if err != nil {
+	if err != nil && !isCanceledSessionTurnError(err) {
 		log.Printf("[ws] session.message.error root=%s session=%s request=%s err=%v", rootID, key, requestID, err)
-		h.AppContext.BroadcastSessionError(rootID, key, err.Error())
+		// Include request_id so the optimistic "sending" bubble can clear.
+		h.AppContext.BroadcastSessionErrorWithRequest(rootID, key, requestID, err.Error())
 	}
 	if ok := updateTracker.WaitIdle(msgCtx, sessionDoneSettleWindow, sessionDoneMaxWait); !ok {
 		log.Printf("[ws] session.done.wait_timeout root=%s session=%s request=%s", rootID, key, requestID)
 	}
 	log.Printf("[ws] session.done root=%s session=%s request=%s", rootID, key, requestID)
+	// Always clear replying state (via BroadcastSessionDone -> ClearSessionPending)
+	// so a failed/empty turn does not leave the session permanently "generating"
+	// and force subsequent messages into the queue.
+	h.finishSessionMessage(rootID, key, requestID)
+}
+
+func isCanceledSessionTurnError(err error) bool {
+	if err == nil {
+		return false
+	}
+	value := strings.ToLower(strings.TrimSpace(err.Error()))
+	return errors.Is(err, context.Canceled) ||
+		strings.Contains(value, "context canceled") ||
+		strings.Contains(value, "context cancelled") ||
+		strings.Contains(value, "turn canceled") ||
+		strings.Contains(value, "turn cancelled")
+}
+
+func (h *WSHandler) finishSessionMessage(rootID, key, requestID string) {
+	if h == nil || h.AppContext == nil {
+		return
+	}
+	streamHub := h.AppContext.GetSessionStreamHub()
+	if queue, changed := streamHub.UnfreezeQueuedSessionMessages(rootID, key); changed {
+		log.Printf("[ws] session.queue.unfreeze root=%s session=%s reason=turn_done", rootID, key)
+		streamHub.BroadcastSessionQueueUpdated(rootID, key, queue)
+	}
 	h.AppContext.BroadcastSessionDone(rootID, key, requestID)
-	h.startNextQueuedSessionMessage(rootID, key)
 }
 
 func (h *WSHandler) startNextQueuedSessionMessage(rootID, key string) {
@@ -914,7 +977,10 @@ func (h *WSHandler) startNextQueuedSessionMessage(rootID, key string) {
 		return
 	}
 	streamHub := h.AppContext.GetSessionStreamHub()
-	item, queue, ok := streamHub.PopQueuedSessionMessage(key, "")
+	if streamHub.IsSessionReplying(rootID, key) {
+		return
+	}
+	item, queue, ok := streamHub.PopQueuedSessionMessage(rootID, key, "")
 	if !ok {
 		return
 	}
@@ -931,6 +997,7 @@ func (h *WSHandler) startNextQueuedSessionMessage(rootID, key string) {
 	go h.runSessionMessage(sessionMessageJob{
 		RootID:      rootID,
 		Key:         key,
+		RequestID:   item.ID,
 		SessionType: sessionType,
 		SessionName: sessionName,
 		Shell:       shell,
@@ -950,7 +1017,7 @@ func (h *WSHandler) handleSessionReady(clientID string, req WSRequest) {
 		return
 	}
 	streamHub := h.AppContext.GetSessionStreamHub()
-	streamHub.BindSessionClient(key, clientID)
+	streamHub.BindSessionClient(rootID, key, clientID)
 	streamHub.ReplayPending(rootID, clientID, key)
 }
 
@@ -974,9 +1041,14 @@ func (h *WSHandler) handleSessionCancel(ctx context.Context, conn *websocket.Con
 	log.Printf("[ws] session.cancel root=%s session=%s request=%s", rootID, key, req.ID)
 
 	streamHub := h.AppContext.GetSessionStreamHub()
-	if queue, ok := streamHub.FreezeQueuedSessionMessages(key); ok {
-		log.Printf("[ws] session.queue.freeze root=%s session=%s request=%s", rootID, key, req.ID)
-		streamHub.BroadcastSessionQueueUpdated(rootID, key, queue)
+	if generation, active := usecase.ActiveSessionTurnGeneration(rootID, key); active {
+		freezeID := uint64(0)
+		if queue, frozenID, ok := streamHub.FreezeQueuedSessionMessages(rootID, key); ok {
+			log.Printf("[ws] session.queue.freeze root=%s session=%s request=%s", rootID, key, req.ID)
+			streamHub.BroadcastSessionQueueUpdated(rootID, key, queue)
+			freezeID = frozenID
+		}
+		h.scheduleSessionCancelRecovery(rootID, key, req.ID, generation, freezeID)
 	}
 
 	uc := &usecase.Service{Registry: h.AppContext}
@@ -984,13 +1056,49 @@ func (h *WSHandler) handleSessionCancel(ctx context.Context, conn *websocket.Con
 		RootID: rootID,
 		Key:    key,
 	}); err != nil {
-		if queue, changed := streamHub.UnfreezeQueuedSessionMessages(key); changed {
+		if queue, changed := streamHub.UnfreezeQueuedSessionMessages(rootID, key); changed {
 			streamHub.BroadcastSessionQueueUpdated(rootID, key, queue)
 		}
 		log.Printf("[ws] session.cancel.error root=%s session=%s request=%s err=%v", rootID, key, req.ID, err)
 		h.sendWSError(conn, clientID, req.ID, "session.cancel_failed", err.Error())
 		return
 	}
+}
+
+func (h *WSHandler) scheduleSessionCancelRecovery(rootID, key, requestID string, generation, freezeID uint64) {
+	if h == nil || h.AppContext == nil {
+		return
+	}
+	time.AfterFunc(sessionQueueFreezeTimeout, func() {
+		if h == nil || h.AppContext == nil {
+			return
+		}
+		if !usecase.IsActiveSessionTurnGeneration(rootID, key, generation) {
+			return
+		}
+		streamHub := h.AppContext.GetSessionStreamHub()
+		if freezeID != 0 && !streamHub.IsQueueFreezeCurrent(rootID, key, freezeID) {
+			return
+		}
+		log.Printf("[ws] session.cancel.timeout root=%s session=%s request=%s", rootID, key, requestID)
+		uc := &usecase.Service{Registry: h.AppContext}
+		if !uc.ForceCancelSessionTurnIfCurrent(context.Background(), usecase.CancelSessionTurnInput{RootID: rootID, Key: key}, generation) {
+			return
+		}
+		if queue, changed := streamHub.UnfreezeQueuedSessionMessagesIfCurrent(rootID, key, freezeID); changed {
+			log.Printf("[ws] session.queue.unfreeze root=%s session=%s reason=cancel_timeout", rootID, key)
+			streamHub.BroadcastSessionQueueUpdated(rootID, key, queue)
+		}
+		// If the turn is already gone, runSessionMessage will finish and drain the
+		// queue. Only clear a stuck replying flag here; do not startNext to avoid
+		// double-pop races with the normal finish path.
+		if usecase.IsActiveSessionTurnGeneration(rootID, key, generation) {
+			return
+		}
+		if streamHub.IsSessionReplying(rootID, key) {
+			h.AppContext.BroadcastSessionDone(rootID, key, requestID)
+		}
+	})
 }
 
 func (h *WSHandler) handleSessionQueueRemove(_ context.Context, conn *websocket.Conn, clientID string, req WSRequest) {
@@ -1002,7 +1110,7 @@ func (h *WSHandler) handleSessionQueueRemove(_ context.Context, conn *websocket.
 		return
 	}
 	streamHub := h.AppContext.GetSessionStreamHub()
-	queue := streamHub.RemoveQueuedSessionMessage(key, queueID)
+	queue := streamHub.RemoveQueuedSessionMessage(rootID, key, queueID)
 	streamHub.BroadcastSessionQueueUpdated(rootID, key, queue)
 	if req.ID != "" {
 		h.sendWSAccepted(conn, clientID, req.ID, rootID, key)
@@ -1019,7 +1127,7 @@ func (h *WSHandler) handleSessionQueueUpdate(_ context.Context, conn *websocket.
 		return
 	}
 	streamHub := h.AppContext.GetSessionStreamHub()
-	queue := streamHub.UpdateQueuedSessionMessage(key, queueID, content)
+	queue := streamHub.UpdateQueuedSessionMessage(rootID, key, queueID, content)
 	streamHub.BroadcastSessionQueueUpdated(rootID, key, queue)
 	if req.ID != "" {
 		h.sendWSAccepted(conn, clientID, req.ID, rootID, key)
@@ -1035,8 +1143,8 @@ func (h *WSHandler) handleSessionQueueSendNow(ctx context.Context, conn *websock
 		return
 	}
 	streamHub := h.AppContext.GetSessionStreamHub()
-	streamHub.BindSessionClient(key, clientID)
-	queue, ok := streamHub.PromoteQueuedSessionMessage(key, queueID)
+	streamHub.BindSessionClient(rootID, key, clientID)
+	queue, ok := streamHub.PromoteQueuedSessionMessage(rootID, key, queueID)
 	if !ok {
 		h.sendWSError(conn, clientID, req.ID, "not_found", "queued message not found")
 		return
@@ -1045,12 +1153,25 @@ func (h *WSHandler) handleSessionQueueSendNow(ctx context.Context, conn *websock
 	if req.ID != "" {
 		h.sendWSAccepted(conn, clientID, req.ID, rootID, key)
 	}
-	if !streamHub.IsSessionReplying(key) {
+	if !streamHub.IsSessionReplying(rootID, key) {
 		h.startNextQueuedSessionMessage(rootID, key)
 		return
 	}
+	// Match session.cancel: freeze + generation watchdog so a stuck cancel cannot
+	// leave replying permanently and block the promoted queue item forever.
+	if generation, active := usecase.ActiveSessionTurnGeneration(rootID, key); active {
+		freezeID := uint64(0)
+		if queue, frozenID, ok := streamHub.FreezeQueuedSessionMessages(rootID, key); ok {
+			streamHub.BroadcastSessionQueueUpdated(rootID, key, queue)
+			freezeID = frozenID
+		}
+		h.scheduleSessionCancelRecovery(rootID, key, req.ID, generation, freezeID)
+	}
 	uc := &usecase.Service{Registry: h.AppContext}
 	if err := uc.CancelSessionTurn(ctx, usecase.CancelSessionTurnInput{RootID: rootID, Key: key}); err != nil {
+		if queue, changed := streamHub.UnfreezeQueuedSessionMessages(rootID, key); changed {
+			streamHub.BroadcastSessionQueueUpdated(rootID, key, queue)
+		}
 		log.Printf("[ws] session.queue.send_now.cancel.error root=%s session=%s request=%s err=%v", rootID, key, req.ID, err)
 	}
 }
@@ -1323,4 +1444,20 @@ func parseClientContext(payload map[string]any, rootID string) usecase.ClientCon
 		ctx.CurrentRoot = rootID
 	}
 	return ctx
+}
+
+
+// WireSessionQueueDrainer lets non-WS completion paths (kanban/scheduled) drain
+// leftover user message queues through the same runner as WebSocket turns.
+func WireSessionQueueDrainer(app *AppContext) {
+	if app == nil {
+		return
+	}
+	app.QueueDrainer = func(rootID, sessionKey string) {
+		if app == nil || strings.TrimSpace(rootID) == "" || strings.TrimSpace(sessionKey) == "" {
+			return
+		}
+		h := &WSHandler{AppContext: app}
+		h.startNextQueuedSessionMessage(rootID, sessionKey)
+	}
 }

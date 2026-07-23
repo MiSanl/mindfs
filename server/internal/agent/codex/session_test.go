@@ -1,7 +1,9 @@
 package codex
 
 import (
+	"context"
 	"encoding/json"
+	"reflect"
 	"testing"
 
 	agenttypes "mindfs/server/internal/agent/types"
@@ -17,6 +19,155 @@ func TestCodexListModelsParamsIncludesHiddenModels(t *testing.T) {
 	}
 	if !*params.IncludeHidden {
 		t.Fatal("IncludeHidden = false, want true")
+	}
+}
+
+func TestRuntimeClientKeyIncludesProviderRevision(t *testing.T) {
+	runtime := NewRuntime()
+	first := OpenOptions{AgentName: "codex", RuntimeKey: "codex:api-one:rev-1"}
+	second := OpenOptions{AgentName: "codex", RuntimeKey: "codex:api-two:rev-1"}
+	changed := OpenOptions{AgentName: "codex", RuntimeKey: "codex:api-one:rev-2"}
+	if runtime.clientKey(first) != first.RuntimeKey {
+		t.Fatalf("client key = %q", runtime.clientKey(first))
+	}
+	if runtime.clientKey(first) == runtime.clientKey(second) {
+		t.Fatal("different providers must not share a client key")
+	}
+	if runtime.clientKey(first) == runtime.clientKey(changed) {
+		t.Fatal("provider revision change must not share a client key")
+	}
+	if got := runtime.clientKey(OpenOptions{AgentName: "codex"}); got != "codex" {
+		t.Fatalf("legacy client key = %q, want codex", got)
+	}
+}
+
+func TestRuntimeCloseMatchesRevisionScopedAgentKeys(t *testing.T) {
+	runtime := NewRuntime()
+	runtime.clients = map[string]*codexsdk.Codex{
+		"codex:api-one:rev-1":  nil,
+		"codex:api-two:rev-2":  nil,
+		"claude:api-one:rev-1": nil,
+	}
+	if err := runtime.Close("codex"); err != nil {
+		t.Fatalf("close codex: %v", err)
+	}
+	if _, ok := runtime.clients["codex:api-one:rev-1"]; ok {
+		t.Fatal("first codex provider client was retained")
+	}
+	if _, ok := runtime.clients["codex:api-two:rev-2"]; ok {
+		t.Fatal("second codex provider client was retained")
+	}
+	if _, ok := runtime.clients["claude:api-one:rev-1"]; !ok {
+		t.Fatal("other agent client was removed")
+	}
+}
+
+type modelListExecStub struct {
+	params   codextypes.ModelListParams
+	response *codextypes.ModelListResponse
+}
+
+func (e *modelListExecStub) Run(codexsdk.CodexExecArgs) <-chan codexsdk.ExecResult {
+	output := make(chan codexsdk.ExecResult)
+	close(output)
+	return output
+}
+
+func (e *modelListExecStub) ListModels(_ context.Context, params codextypes.ModelListParams) (*codextypes.ModelListResponse, error) {
+	e.params = params
+	return e.response, nil
+}
+
+func (e *modelListExecStub) RPCCall(_ context.Context, _ string, _ interface{}) (json.RawMessage, error) {
+	return json.RawMessage(`{"config":{}}`), nil
+}
+
+func TestListModelsPreservesPerModelReasoningEfforts(t *testing.T) {
+	effortOptions := []codextypes.ReasoningEffortOption{
+		{ReasoningEffort: codextypes.ReasoningEffort("low")},
+		{ReasoningEffort: codextypes.ReasoningEffort("medium")},
+		{ReasoningEffort: codextypes.ReasoningEffort("high")},
+		{ReasoningEffort: codextypes.ReasoningEffort("xhigh")},
+		{ReasoningEffort: codextypes.ReasoningEffort("max")},
+		{ReasoningEffort: codextypes.ReasoningEffort("ultra")},
+	}
+	exec := &modelListExecStub{response: &codextypes.ModelListResponse{
+		Data: []codextypes.Model{{
+			Model:                     "gpt-5.6-sol",
+			DisplayName:               "GPT-5.6-Sol",
+			SupportedReasoningEfforts: effortOptions,
+			DefaultReasoningEffort:    codextypes.ReasoningEffort("low"),
+			IsDefault:                 true,
+		}},
+	}}
+	s := &session{client: codexsdk.NewCodexWithExec(exec, codextypes.CodexOptions{})}
+
+	models, err := s.ListModels(context.Background())
+	if err != nil {
+		t.Fatalf("ListModels() error = %v", err)
+	}
+	if exec.params.IncludeHidden == nil || !*exec.params.IncludeHidden {
+		t.Fatal("ListModels() did not request hidden models")
+	}
+	if len(models.Models) != 1 {
+		t.Fatalf("models count = %d, want 1", len(models.Models))
+	}
+	got := models.Models[0]
+	wantEfforts := []string{"low", "medium", "high", "xhigh", "max", "ultra"}
+	if !reflect.DeepEqual(got.Efforts, wantEfforts) {
+		t.Fatalf("efforts = %#v, want %#v", got.Efforts, wantEfforts)
+	}
+	if !got.SupportEffort || got.DefaultEffort != "low" {
+		t.Fatalf("model effort metadata = %#v", got)
+	}
+}
+
+func TestMapCodexModelEmptyEffortsDisablesSupport(t *testing.T) {
+	// Explicit empty SupportedReasoningEfforts means model does not support effort.
+	empty := []codextypes.ReasoningEffortOption{}
+	got := mapCodexModel(codextypes.Model{
+		Model:                     "no-effort",
+		DisplayName:               "No Effort",
+		SupportedReasoningEfforts: empty,
+		DefaultReasoningEffort:    codextypes.ReasoningEffort("LOW"),
+	})
+	if got.SupportEffort {
+		t.Fatalf("SupportEffort = true for empty efforts: %#v", got)
+	}
+	if len(got.Efforts) != 0 {
+		t.Fatalf("efforts = %#v", got.Efforts)
+	}
+	if got.DefaultEffort != "low" {
+		t.Fatalf("DefaultEffort should be lowercased, got %q", got.DefaultEffort)
+	}
+}
+
+func TestMapCodexModelFiltersNoneEffort(t *testing.T) {
+	got := mapCodexModel(codextypes.Model{
+		Model:       "with-none",
+		DisplayName: "With None",
+		SupportedReasoningEfforts: []codextypes.ReasoningEffortOption{
+			{ReasoningEffort: codextypes.ReasoningEffort("none")},
+			{ReasoningEffort: codextypes.ReasoningEffort("MEDIUM")},
+			{ReasoningEffort: codextypes.ReasoningEffort("")},
+		},
+	})
+	if !reflect.DeepEqual(got.Efforts, []string{"medium"}) {
+		t.Fatalf("efforts = %#v, want [medium]", got.Efforts)
+	}
+	if !got.SupportEffort {
+		t.Fatal("SupportEffort should be true when non-empty efforts remain")
+	}
+}
+
+func TestMapCodexModelNilEffortsKeepsLegacySupport(t *testing.T) {
+	got := mapCodexModel(codextypes.Model{
+		Model:                     "legacy",
+		DisplayName:               "Legacy",
+		SupportedReasoningEfforts: nil,
+	})
+	if !got.SupportEffort {
+		t.Fatalf("nil SupportedReasoningEfforts should keep legacy SupportEffort: %#v", got)
 	}
 }
 

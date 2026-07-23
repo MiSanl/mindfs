@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -44,12 +45,12 @@ func TestParseClientContext(t *testing.T) {
 func TestAppendReplyEventPrefixesTruncatedSummary(t *testing.T) {
 	hub := NewStreamHub(nil)
 
-	hub.AppendReplyEvent("sess-1", StreamEvent{
+	hub.AppendReplyEvent("root", "sess-1", StreamEvent{
 		Type: "message_chunk",
 		Data: agenttypes.MessageChunk{Content: strings.Repeat("前", 601) + "后"},
 	})
 
-	snapshot := hub.PendingSessionSnapshot("sess-1")
+	snapshot := hub.PendingSessionSnapshot("", "sess-1")
 	if !strings.HasPrefix(snapshot.Summary, "...") {
 		t.Fatalf("summary should start with ellipsis when truncated, got %q", snapshot.Summary)
 	}
@@ -61,20 +62,20 @@ func TestAppendReplyEventPrefixesTruncatedSummary(t *testing.T) {
 func TestAppendReplyEventResetsSummaryAfterAuxiliaryEvent(t *testing.T) {
 	hub := NewStreamHub(nil)
 
-	hub.AppendReplyEvent("sess-1", StreamEvent{
+	hub.AppendReplyEvent("root", "sess-1", StreamEvent{
 		Type: string(agenttypes.EventTypeMessageChunk),
 		Data: agenttypes.MessageChunk{Content: "before aux"},
 	})
-	hub.AppendReplyEvent("sess-1", StreamEvent{
+	hub.AppendReplyEvent("root", "sess-1", StreamEvent{
 		Type: string(agenttypes.EventTypePlanUpdate),
 		Data: agenttypes.PlanUpdate{Content: "- inspect"},
 	})
-	hub.AppendReplyEvent("sess-1", StreamEvent{
+	hub.AppendReplyEvent("root", "sess-1", StreamEvent{
 		Type: string(agenttypes.EventTypeMessageChunk),
 		Data: agenttypes.MessageChunk{Content: "after aux"},
 	})
 
-	snapshot := hub.PendingSessionSnapshot("sess-1")
+	snapshot := hub.PendingSessionSnapshot("", "sess-1")
 	if snapshot.Summary != "after aux" {
 		t.Fatalf("summary = %q, want aux boundary to discard previous content", snapshot.Summary)
 	}
@@ -144,6 +145,21 @@ func TestTurnUpdateTrackerWaitIdleTimesOutWhenUpdateNeverEnds(t *testing.T) {
 	}
 }
 
+func TestIsCanceledSessionTurnError(t *testing.T) {
+	for _, err := range []error{
+		context.Canceled,
+		errors.New("turn canceled"),
+		errors.New("context cancelled by caller"),
+	} {
+		if !isCanceledSessionTurnError(err) {
+			t.Fatalf("expected canceled error: %v", err)
+		}
+	}
+	if isCanceledSessionTurnError(errors.New("peer disconnected")) {
+		t.Fatal("disconnect must be reported as a failure")
+	}
+}
+
 func TestStreamHubFrozenQueueBlocksAutomaticPopUntilUnfrozen(t *testing.T) {
 	hub := NewStreamHub(nil)
 	rootID := "root"
@@ -164,20 +180,20 @@ func TestStreamHubFrozenQueueBlocksAutomaticPopUntilUnfrozen(t *testing.T) {
 		},
 	})
 
-	frozenQueue, frozen := hub.FreezeQueuedSessionMessages(sessionKey)
+	frozenQueue, _, frozen := hub.FreezeQueuedSessionMessages("", sessionKey)
 	if !frozen {
 		t.Fatal("expected queue freeze to succeed")
 	}
 	if len(frozenQueue) != 2 {
 		t.Fatalf("expected frozen queue snapshot to contain 2 items, got %d", len(frozenQueue))
 	}
-	if _, queue, ok := hub.PopQueuedSessionMessage(sessionKey, ""); ok {
+	if _, queue, ok := hub.PopQueuedSessionMessage("", sessionKey, ""); ok {
 		t.Fatal("expected frozen queue to block automatic pop")
 	} else if len(queue) != 2 {
 		t.Fatalf("expected frozen queue to remain intact, got %d items", len(queue))
 	}
 
-	queue, ok := hub.PromoteQueuedSessionMessage(sessionKey, "second")
+	queue, ok := hub.PromoteQueuedSessionMessage("", sessionKey, "second")
 	if !ok {
 		t.Fatal("expected promote to succeed")
 	}
@@ -185,7 +201,7 @@ func TestStreamHubFrozenQueueBlocksAutomaticPopUntilUnfrozen(t *testing.T) {
 		t.Fatalf("expected promoted item at queue head, got %#v", queue)
 	}
 
-	item, queue, ok := hub.PopQueuedSessionMessage(sessionKey, "")
+	item, queue, ok := hub.PopQueuedSessionMessage("", sessionKey, "")
 	if !ok {
 		t.Fatal("expected promoted queue to be unfrozen")
 	}
@@ -207,19 +223,19 @@ func TestStreamHubUnfreezeQueueAllowsAutomaticPop(t *testing.T) {
 			Timestamp: time.Now().UTC(),
 		},
 	})
-	_, frozen := hub.FreezeQueuedSessionMessages(sessionKey)
+	_, _, frozen := hub.FreezeQueuedSessionMessages("", sessionKey)
 	if !frozen {
 		t.Fatal("expected queue freeze to succeed")
 	}
 
-	unfrozenQueue, changed := hub.UnfreezeQueuedSessionMessages(sessionKey)
+	unfrozenQueue, changed := hub.UnfreezeQueuedSessionMessages("", sessionKey)
 	if !changed {
 		t.Fatal("expected queue unfreeze to report changed")
 	}
 	if len(unfrozenQueue) != 1 {
 		t.Fatalf("expected unfreeze queue snapshot to contain 1 item, got %d", len(unfrozenQueue))
 	}
-	item, queue, ok := hub.PopQueuedSessionMessage(sessionKey, "")
+	item, queue, ok := hub.PopQueuedSessionMessage("", sessionKey, "")
 	if !ok {
 		t.Fatal("expected automatic pop after unfreeze")
 	}
@@ -228,6 +244,29 @@ func TestStreamHubUnfreezeQueueAllowsAutomaticPop(t *testing.T) {
 	}
 	if len(queue) != 0 {
 		t.Fatalf("expected empty queue, got %#v", queue)
+	}
+}
+
+func TestStreamHubFreezeGenerationDoesNotReleaseNewerFreeze(t *testing.T) {
+	hub := NewStreamHub(nil)
+	sessionKey := "session"
+	hub.EnqueueSessionMessage("root", sessionKey, "Session", QueuedUserMessage{ID: "first"})
+	_, firstFreeze, ok := hub.FreezeQueuedSessionMessages("", sessionKey)
+	if !ok {
+		t.Fatal("expected initial freeze")
+	}
+	if _, changed := hub.UnfreezeQueuedSessionMessages("", sessionKey); !changed {
+		t.Fatal("expected initial unfreeze")
+	}
+	_, secondFreeze, ok := hub.FreezeQueuedSessionMessages("", sessionKey)
+	if !ok || secondFreeze == firstFreeze {
+		t.Fatalf("freeze ids = %d, %d", firstFreeze, secondFreeze)
+	}
+	if _, changed := hub.UnfreezeQueuedSessionMessagesIfCurrent("", sessionKey, firstFreeze); changed {
+		t.Fatal("stale freeze must not release newer freeze")
+	}
+	if !hub.IsQueueFreezeCurrent("", sessionKey, secondFreeze) {
+		t.Fatal("newer freeze should remain current")
 	}
 }
 

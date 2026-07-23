@@ -90,6 +90,30 @@ export type ExchangeAux = {
   compact?: CompactNotice | null;
 };
 
+export type SessionErrorRecord = {
+  id: string;
+  session_key?: string;
+  request_id?: string;
+  after_message_id?: string;
+  after_seq?: number;
+  agent?: string;
+  model?: string;
+  code?: string;
+  kind?: string;
+  message: string;
+  recoverable?: boolean;
+  timestamp: string;
+};
+
+export type SessionRuntimeState = "idle" | "opening" | "connected" | "disconnected" | "error";
+
+export type SessionRuntimeInfo = {
+  agent?: string;
+  state?: SessionRuntimeState | string;
+  agent_session_id?: string;
+  message?: string;
+};
+
 export type Session = {
   key: string;
   session_key?: string;
@@ -117,6 +141,10 @@ export type Session = {
   related_files?: RelatedFile[];
   related_worktree?: RelatedWorktree | null;
   exchange_aux?: Record<string, ExchangeAux[]>;
+  errors?: SessionErrorRecord[];
+  runtime?: SessionRuntimeInfo | null;
+  runtimes?: SessionRuntimeInfo[];
+  agent_bindings?: Array<{ agent?: string; agent_session_id?: string; provider_id?: string; provider_revision?: string; provider_protocol?: string; provider_state?: string }>;
   exchanges?: Array<{
     seq?: number;
     role?: string;
@@ -289,6 +317,7 @@ class SessionService {
   private pendingStreams = new Map<string, StreamEvent[]>();
   private activeStreams = new Set<string>();
   private pendingMessages = new Map<string, PendingMessage>();
+  private canceledStreams = new Set<string>();
   private listeners = new Set<(event: SessionServiceEvent) => void>();
   private reconnectTimer: number | null = null;
   private connectTimeoutTimer: number | null = null;
@@ -664,6 +693,9 @@ class SessionService {
     msg: any,
   ) {
     const nextPayload = { ...payload };
+    if (type === "session.stream" && this.canceledStreams.has(sessionKey)) {
+      return;
+    }
     this.emit({ type, sessionKey, payload: nextPayload });
 
     if (!sessionKey) return;
@@ -746,11 +778,19 @@ class SessionService {
   ) {
     if (type === "session.done" || type === "session.error") {
       this.activeStreams.delete(sessionKey);
+      this.canceledStreams.delete(sessionKey);
+      return;
+    }
+    if (type === "session.user_message") {
+      this.canceledStreams.delete(sessionKey);
       return;
     }
     if (type !== "session.stream") return;
     const event = payload.event as StreamEvent | undefined;
     if (!event) return;
+    if (this.canceledStreams.has(sessionKey)) {
+      return;
+    }
     if (event.type === "error") {
       this.activeStreams.delete(sessionKey);
       return;
@@ -797,6 +837,7 @@ class SessionService {
     type: SessionType,
     agent: string,
     model?: string,
+    providerId?: string,
     agentMode?: string,
     effort?: string,
     fastService?: string,
@@ -824,6 +865,7 @@ class SessionService {
         type,
         agent,
         model,
+        provider_id: providerId,
         agent_mode: agentMode,
         effort,
         fast_service: fastService,
@@ -866,6 +908,7 @@ class SessionService {
     command: string,
     agent: string,
     model?: string,
+    providerId?: string,
     agentMode?: string,
     effort?: string,
     fastService?: string,
@@ -886,6 +929,7 @@ class SessionService {
         command,
         agent,
         model,
+        provider_id: providerId,
         agent_mode: agentMode,
         effort,
         fast_service: fastService,
@@ -924,7 +968,12 @@ class SessionService {
       },
     };
 
-    return this.sendWSMessage(msg);
+    const sent = await this.sendWSMessage(msg);
+    if (sent) {
+      this.canceledStreams.add(sessionKey);
+      this.activeStreams.delete(sessionKey);
+    }
+    return sent;
   }
 
   async removeQueuedMessage(rootId: string, sessionKey: string, queueId: string): Promise<boolean> {
@@ -1133,6 +1182,47 @@ class SessionService {
     } catch (err) {
       console.error("[Session] Failed to search sessions:", err);
       return [];
+    }
+  }
+
+
+  
+  async migrateSessionProvider(
+    rootId: string,
+    sessionKey: string,
+    input: { agent?: string; provider_id: string; model?: string },
+  ): Promise<Session | null> {
+    try {
+      const params = new URLSearchParams({ root: rootId });
+      const data = await protectedJSON<Session>(
+        appURL(`/api/sessions/${encodeURIComponent(sessionKey)}/migrate-provider`, params),
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(input),
+        },
+      );
+      return data as Session;
+    } catch (err) {
+      console.error("[Session] Failed to migrate session provider:", err);
+      throw err;
+    }
+  }
+
+  async getSessionErrors(
+    rootId: string,
+    sessionKey: string,
+  ): Promise<SessionErrorRecord[] | null> {
+    try {
+      const params = new URLSearchParams({ root: rootId });
+      const data = await protectedJSON<{ errors?: SessionErrorRecord[] }>(
+        appURL(`/api/sessions/${encodeURIComponent(sessionKey)}/errors`, params),
+      );
+      return Array.isArray(data?.errors) ? data.errors : [];
+    } catch (err) {
+      console.error("[Session] Failed to get session errors:", err);
+      // null = request failed; callers must not treat this as an empty log.
+      return null;
     }
   }
 

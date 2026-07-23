@@ -1,5 +1,9 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { AgentSelector } from "./AgentSelector";
+import { ModelSelector } from "./ModelSelector";
+import { AgentModeSelector } from "./AgentModeSelector";
+import { EffortSelector } from "./EffortSelector";
+import { FastServiceSelector } from "./FastServiceSelector";
 import { AgentIcon } from "./AgentIcon";
 import {
   deleteStageTemplate,
@@ -98,6 +102,15 @@ function stageChangedFromTemplate(stage: StageTemplate, templates: StageTemplate
 
 function toFastService(value?: string): "" | "on" | "off" {
   return value === "on" || value === "off" ? value : "";
+}
+
+function modelDefaultEffort(agent: AgentStatus | null, modelID: string): string {
+  const model = agent?.models?.find((item) => item.id === modelID);
+  if (model && !model.supportEffort) return "";
+  const modelEfforts = model?.efforts ?? [];
+  const efforts = modelEfforts.length > 0 ? modelEfforts : agent?.efforts ?? [];
+  return [model?.default_effort || "", agent?.default_effort || ""]
+    .find((item) => item && efforts.includes(item)) || efforts[0] || "";
 }
 
 export function TaskTemplateDialog({ open, agents, template, onClose, onSaved }: TaskTemplateDialogProps) {
@@ -391,10 +404,6 @@ export function TaskTemplateDialog({ open, agents, template, onClose, onSaved }:
                     role={snapshot.role}
                     disabled={index === 0}
                     agent={snapshot.agent || "codex"}
-                    model={snapshot.model || ""}
-                    mode={snapshot.mode || ""}
-                    effort={snapshot.effort || ""}
-                    fastService={toFastService(snapshot.fast_service)}
                     agents={agents}
                     onUserClick={() => updateStage(index, { ...blankUserStage(), name: snapshot.name || "" })}
                     onAgentActivate={() => {
@@ -409,21 +418,62 @@ export function TaskTemplateDialog({ open, agents, template, onClose, onSaved }:
                         ...(status?.protocol === "acp" ? { plan_mode: false } : {}),
                       });
                     }}
-                    onAgentChange={(agent, model) => {
+                    onAgentChange={(agent) => {
                       const status = agents.find((item) => item.name === agent) || null;
+                      // Keep model empty so stage templates can intentionally omit a model (94931c7).
                       updateStage(index, {
                         agent,
-                        model: model || "",
+                        model: "",
                         mode: status?.current_mode_id || "",
                         effort: "",
                         fast_service: "",
                         ...(status?.protocol === "acp" ? { plan_mode: false } : {}),
                       });
                     }}
-                    onModeChange={(mode) => updateStage(index, { mode: mode || "" })}
-                    onEffortChange={(effort) => updateStage(index, { effort: effort || "" })}
-                    onFastServiceChange={(fastService) => updateStage(index, { fast_service: fastService || "" })}
                   />
+                  {isAgent ? (
+                    <>
+                      <ModelSelector
+                        agent={selectedAgentStatus}
+                        model={snapshot.model || ""}
+                        compact
+                        menuPlacement="bottom"
+                        maxButtonWidth="132px"
+                        onModelChange={(model) =>
+                          updateStage(index, {
+                            model,
+                            effort: modelDefaultEffort(selectedAgentStatus, model),
+                          })
+                        }
+                      />
+                      <AgentModeSelector
+                        agent={selectedAgentStatus}
+                        mode={snapshot.mode || ""}
+                        compact
+                        menuPlacement="bottom"
+                        maxButtonWidth="132px"
+                        onModeChange={(mode) => updateStage(index, { mode: mode || "" })}
+                      />
+                      <EffortSelector
+                        agent={selectedAgentStatus}
+                        model={snapshot.model || ""}
+                        effort={snapshot.effort || ""}
+                        compact
+                        menuPlacement="bottom"
+                        maxButtonWidth="132px"
+                        onEffortChange={(effort) => updateStage(index, { effort: effort || "" })}
+                      />
+                      <FastServiceSelector
+                      agent={selectedAgentStatus}
+                      fastService={toFastService(snapshot.fast_service)}
+                      compact
+                      onFastServiceChange={(fastService) => updateStage(index, { fast_service: fastService || "" })}
+                      />
+                      <span style={{ fontSize: "11px", color: "var(--text-secondary)", flex: "1 1 180px" }}>
+                        Uses the current global agent configuration and its official login or backup settings. Session API providers are not supported for Kanban stages.
+                      </span>
+                    </>
+                  ) : null}
                   <StageOptionsMenu
                     isAgent={isAgent}
                     autoAdvance={snapshot.auto_advance === true}
@@ -807,32 +857,18 @@ function RoleAgentSwitch({
   role,
   disabled,
   agent,
-  model,
-  mode,
-  effort,
-  fastService,
   agents,
   onUserClick,
   onAgentActivate,
   onAgentChange,
-  onModeChange,
-  onEffortChange,
-  onFastServiceChange,
 }: {
   role: "user" | "agent";
   disabled?: boolean;
   agent: string;
-  model: string;
-  mode: string;
-  effort: string;
-  fastService: "" | "on" | "off";
   agents: AgentStatus[];
   onUserClick: () => void;
   onAgentActivate: () => void;
-  onAgentChange: (agent: string, model?: string) => void;
-  onModeChange: (mode?: string) => void;
-  onEffortChange: (effort?: string) => void;
-  onFastServiceChange: (fastService?: "" | "on" | "off") => void;
+  onAgentChange: (agent: string) => void;
 }) {
   const { t } = useI18n();
   const userActive = role === "user";
@@ -874,18 +910,11 @@ function RoleAgentSwitch({
         >
           <AgentSelector
             agent={agent}
-            model={model}
-            mode={mode}
-            effort={effort}
-            fastService={fastService}
             agents={agents}
             compact
             menuPlacement="bottom"
             showChevron
             onAgentChange={onAgentChange}
-            onModeChange={onModeChange}
-            onEffortChange={onEffortChange}
-            onFastServiceChange={onFastServiceChange}
           />
         </div>
       ) : (

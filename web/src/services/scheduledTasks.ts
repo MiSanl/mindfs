@@ -9,6 +9,7 @@ export type ScheduledAgentTask = {
   task_cron: string;
   agent: string;
   model?: string;
+  provider_id?: string;
   mode?: string;
   effort?: string;
   fast_service?: "" | "on" | "off";
@@ -33,6 +34,7 @@ export type ScheduledAgentTaskInput = {
   task_cron: string;
   agent: string;
   model?: string;
+  provider_id?: string;
   mode?: string;
   effort?: string;
   fast_service?: "" | "on" | "off";

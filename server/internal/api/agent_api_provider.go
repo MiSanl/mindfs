@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,12 +18,25 @@ import (
 	"time"
 
 	"mindfs/server/internal/agent"
+	agenttypes "mindfs/server/internal/agent/types"
+	"mindfs/server/internal/api/usecase"
 	"mindfs/server/internal/apperr"
 	configpkg "mindfs/server/internal/config"
 	"mindfs/server/internal/preferences"
 
 	"gopkg.in/yaml.v3"
 )
+
+// mindFSConfigDir is overridable in tests.
+var mindFSConfigDir = configpkg.MindFSConfigDir
+
+func init() {
+	// Allow send/resume to accept models from the active API provider catalog
+	// even when the agent probe ListModels catalog is still native/stale.
+	usecase.AgentAPIProviderModelAllowed = agentModelAllowedByActiveProvider
+	usecase.SessionProviderResolver = resolveSessionProviderConfig
+	usecase.ProviderSelectionValidator = validateProviderSelection
+}
 
 const (
 	apiProviderProtocolOpenAICompatible    = "openai-compatible"
@@ -60,6 +74,18 @@ type agentAPIProviderCreateRequest struct {
 	APIKey  string `json:"apiKey"`
 }
 
+type agentAPIProviderUpdateRequest struct {
+	Name    string   `json:"name"`
+	BaseURL string   `json:"baseUrl"`
+	APIKey  string   `json:"apiKey"`
+	Models  []string `json:"models"`
+	// ModelsSet is true when the client explicitly sent a models field (including empty).
+	// JSON decoding cannot distinguish omitted vs null/empty, so clients that want to
+	// keep existing models simply omit the field and set Reprobe when needed.
+	ModelsSet bool `json:"-"`
+	Reprobe   bool `json:"reprobe"`
+}
+
 type agentAPIProviderSyncRequest struct {
 	Providers []agentAPIProviderCreateRequest `json:"providers"`
 }
@@ -73,6 +99,123 @@ type agentAPIProviderProbeResult struct {
 	Protocols     []string
 	Models        []string
 	ModelFamilies []string
+}
+
+func resolveSessionProviderConfig(agentName, providerID string) (*usecase.SessionProviderConfig, error) {
+	providerID = strings.TrimSpace(providerID)
+	if providerID == "" {
+		return nil, errors.New("session_provider_unavailable: provider id required")
+	}
+	providers, err := readAgentAPIProviders()
+	if err != nil {
+		return nil, fmt.Errorf("session_provider_unavailable: read providers: %w", err)
+	}
+	var provider agentAPIProvider
+	for _, item := range providers {
+		if item.ID == providerID {
+			provider = item
+			break
+		}
+	}
+	if provider.ID == "" {
+		return nil, fmt.Errorf("session_provider_unavailable: provider %q was deleted", providerID)
+	}
+	protocol, ok := selectAPIProviderProtocolForAgent(provider, agentName)
+	if !ok {
+		return nil, fmt.Errorf("session_provider_unavailable: provider %q is incompatible with agent %q", providerID, strings.TrimSpace(agentName))
+	}
+	return &usecase.SessionProviderConfig{
+		ID:               provider.ID,
+		Revision:         sessionProviderRevision(provider),
+		EndpointRevision: sessionProviderEndpointRevision(provider, protocol),
+		Protocol:         protocol,
+		Models:           append([]string{}, provider.Models...),
+		Env:              sessionProviderRuntimeEnv(agentName, provider),
+		Args:             sessionProviderRuntimeArgs(agentName, provider),
+	}, nil
+}
+
+func validateProviderSelection(agentName, model, providerID string) error {
+	providerID = strings.TrimSpace(providerID)
+	if providerID == "" {
+		return nil
+	}
+	config, err := resolveSessionProviderConfig(agentName, providerID)
+	if err != nil {
+		return err
+	}
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return fmt.Errorf("model is required for provider %q", config.ID)
+	}
+	if len(config.Models) == 0 {
+		return nil
+	}
+	for _, candidate := range config.Models {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == model || strings.HasSuffix(candidate, "/"+model) || strings.HasSuffix(model, "/"+candidate) {
+			return nil
+		}
+	}
+	return fmt.Errorf("model %q is not supported by provider %q", model, providerID)
+}
+
+func sessionProviderRevision(provider agentAPIProvider) string {
+	keyFingerprint := ""
+	if key := strings.TrimSpace(provider.APIKey); key != "" {
+		sum := sha256.Sum256([]byte(key))
+		keyFingerprint = fmt.Sprintf("%x", sum[:8])
+	}
+	payload := strings.Join([]string{
+		strings.TrimSpace(provider.BaseURL),
+		strings.Join(agentAPIProviderProtocols(provider), ","),
+		strings.Join(provider.Models, "\x00"),
+		strings.TrimSpace(provider.UpdatedAt),
+		keyFingerprint,
+	}, "\x00")
+	sum := sha256.Sum256([]byte(payload))
+	return fmt.Sprintf("%x", sum[:])
+}
+
+func sessionProviderEndpointRevision(provider agentAPIProvider, protocol string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(provider.BaseURL) + "\x00" + strings.TrimSpace(protocol)))
+	return fmt.Sprintf("%x", sum[:])
+}
+
+func sessionProviderRuntimeEnv(agentName string, provider agentAPIProvider) map[string]string {
+	switch normalizedAPIProviderAgent(agentName) {
+	case "claude":
+		// Claude CLI appends /v1/messages; strip a trailing /v1 so dual-protocol
+		// OpenAI-style roots (https://host/v1) do not become /v1/v1/messages.
+		return map[string]string{
+			"ANTHROPIC_BASE_URL":   anthropicBaseURL(provider.BaseURL),
+			"ANTHROPIC_API_KEY":    provider.APIKey,
+			"ANTHROPIC_AUTH_TOKEN": provider.APIKey,
+		}
+	case "codex":
+		return map[string]string{
+			"OPENAI_BASE_URL": openAIModelsBaseURL(provider.BaseURL),
+			"OPENAI_API_KEY":  provider.APIKey,
+		}
+	default:
+		return nil
+	}
+}
+
+func sessionProviderRuntimeArgs(agentName string, provider agentAPIProvider) []string {
+	if normalizedAPIProviderAgent(agentName) != "codex" {
+		return nil
+	}
+	providerName := agentAPIProviderConfigName(provider)
+	return []string{
+		"-c", "model_provider=" + tomlQuote(providerName),
+		"-c", "model_providers." + providerName + ".base_url=" + tomlQuote(openAIModelsBaseURL(provider.BaseURL)),
+		"-c", "model_providers." + providerName + ".wire_api=\"responses\"",
+	}
+}
+
+func tomlQuote(value string) string {
+	return strconv.Quote(strings.TrimSpace(value))
 }
 
 func (h *HTTPHandler) handleAgentAPIProvidersList(w http.ResponseWriter, r *http.Request) {
@@ -134,6 +277,14 @@ func (h *HTTPHandler) handleAgentAPIProviderDelete(w http.ResponseWriter, r *htt
 		respondError(w, http.StatusBadRequest, errInvalidRequest("provider id required"))
 		return
 	}
+	affectedSessions := 0
+	if h.AppContext != nil {
+		for _, manager := range h.AppContext.LoadedSessionManagers() {
+			if count, err := manager.CountProviderBindings(r.Context(), id); err == nil {
+				affectedSessions += count
+			}
+		}
+	}
 	providers, err := deleteAgentAPIProvider(id)
 	if err != nil {
 		respondError(w, http.StatusBadRequest, err)
@@ -143,7 +294,49 @@ func (h *HTTPHandler) handleAgentAPIProviderDelete(w http.ResponseWriter, r *htt
 	for _, provider := range providers {
 		out = append(out, publicAgentAPIProvider(provider))
 	}
-	respondJSON(w, http.StatusOK, map[string]any{"deleted": true, "id": id, "providers": out})
+	respondJSON(w, http.StatusOK, map[string]any{"deleted": true, "id": id, "providers": out, "loaded_affected_sessions": affectedSessions})
+}
+
+func (h *HTTPHandler) handleAgentAPIProviderUpdate(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.URL.Query().Get("id"))
+	if id == "" {
+		respondError(w, http.StatusBadRequest, errInvalidRequest("provider id required"))
+		return
+	}
+	var raw map[string]json.RawMessage
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxUploadRequestBytes)).Decode(&raw); err != nil {
+		respondError(w, http.StatusBadRequest, errInvalidRequest("invalid request body"))
+		return
+	}
+	var req agentAPIProviderUpdateRequest
+	if value, ok := raw["name"]; ok {
+		_ = json.Unmarshal(value, &req.Name)
+	}
+	if value, ok := raw["baseUrl"]; ok {
+		_ = json.Unmarshal(value, &req.BaseURL)
+	}
+	if value, ok := raw["apiKey"]; ok {
+		_ = json.Unmarshal(value, &req.APIKey)
+	}
+	if value, ok := raw["reprobe"]; ok {
+		_ = json.Unmarshal(value, &req.Reprobe)
+	}
+	if value, ok := raw["models"]; ok {
+		req.ModelsSet = true
+		_ = json.Unmarshal(value, &req.Models)
+	}
+	provider, err := updateAgentAPIProvider(r.Context(), id, req)
+	if err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, errAgentAPIProviderNotFound) {
+			status = http.StatusNotFound
+		} else if errors.Is(err, errAgentConfigConflict) {
+			status = http.StatusConflict
+		}
+		respondError(w, status, err)
+		return
+	}
+	respondJSON(w, http.StatusOK, publicAgentAPIProvider(provider))
 }
 
 func (h *HTTPHandler) handleAgentAPIProviderSwitch(w http.ResponseWriter, r *http.Request) {
@@ -195,7 +388,7 @@ func createAgentAPIProvider(ctx context.Context, req agentAPIProviderCreateReque
 			return agentAPIProvider{}, errAgentConfigConflict
 		}
 	}
-	now := time.Now().Format(time.RFC3339)
+	now := time.Now().UTC().Format(time.RFC3339Nano)
 	provider := agentAPIProvider{
 		ID:            id,
 		Name:          name,
@@ -226,7 +419,7 @@ func syncAgentAPIProviders(ctx context.Context, requests []agentAPIProviderCreat
 	for i, provider := range providers {
 		byName[strings.TrimSpace(provider.Name)] = i
 	}
-	now := time.Now().Format(time.RFC3339)
+	now := time.Now().UTC().Format(time.RFC3339Nano)
 	changed := make([]agentAPIProvider, 0, len(requests))
 	seenNames := map[string]struct{}{}
 	for _, req := range requests {
@@ -306,6 +499,109 @@ func providerIDExists(providers []agentAPIProvider, id string) bool {
 	return false
 }
 
+var errAgentAPIProviderNotFound = errors.New("provider not found")
+
+func updateAgentAPIProvider(ctx context.Context, id string, req agentAPIProviderUpdateRequest) (agentAPIProvider, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return agentAPIProvider{}, errors.New("provider id required")
+	}
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		return agentAPIProvider{}, errors.New("provider name required")
+	}
+	if strings.Contains(name, "..") || strings.ContainsAny(name, `/\`) {
+		return agentAPIProvider{}, errors.New("provider name must not contain path separators")
+	}
+	baseURL, err := normalizeAPIProviderBaseURL(req.BaseURL)
+	if err != nil {
+		return agentAPIProvider{}, err
+	}
+
+	providers, err := readAgentAPIProviders()
+	if err != nil {
+		return agentAPIProvider{}, err
+	}
+	index := -1
+	for i, provider := range providers {
+		if provider.ID == id {
+			index = i
+			break
+		}
+	}
+	if index < 0 {
+		return agentAPIProvider{}, errAgentAPIProviderNotFound
+	}
+	for i, provider := range providers {
+		if i == index {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(provider.Name), name) {
+			return agentAPIProvider{}, errAgentConfigConflict
+		}
+	}
+
+	current := providers[index]
+	apiKey := strings.TrimSpace(req.APIKey)
+	if apiKey == "" {
+		apiKey = current.APIKey
+	}
+	if apiKey == "" {
+		return agentAPIProvider{}, errors.New("api key required")
+	}
+
+	urlChanged := baseURL != strings.TrimSpace(current.BaseURL)
+	keyChanged := apiKey != strings.TrimSpace(current.APIKey)
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	previousModels := append([]string(nil), current.Models...)
+	current.Name = name
+	current.BaseURL = baseURL
+	current.APIKey = apiKey
+	current.UpdatedAt = now
+
+	// Prefer re-probe when credentials/endpoint changed and the client either
+	// asked for it, omitted models, or left the model list unchanged (common
+	// FileTree save path still sends models from the form).
+	//
+	// URL/key changes always refresh protocols (even when the user also edited
+	// models). Otherwise an OpenAI-probed provider moved to an Anthropic
+	// gateway keeps stale protocols and disappears from Claude's list.
+	shouldReprobe := req.Reprobe || urlChanged || keyChanged
+	modelsUnchanged := !req.ModelsSet || modelIDListsEqual(previousModels, normalizeModelIDs(req.Models))
+	explicitModels := req.ModelsSet && !modelsUnchanged && !req.Reprobe
+	if shouldReprobe {
+		probe, probeErr := probeAgentAPIProvider(ctx, baseURL, apiKey)
+		if probeErr != nil {
+			return agentAPIProvider{}, probeErr
+		}
+		current.Protocols = probe.Protocols
+		if explicitModels {
+			// Keep curated model list but take fresh protocols/families from probe.
+			current.Models = normalizeModelIDs(req.Models)
+			current.ModelFamilies = inferModelFamilies(current.Models)
+			if len(current.ModelFamilies) == 0 {
+				current.ModelFamilies = probe.ModelFamilies
+			}
+		} else {
+			current.ModelFamilies = probe.ModelFamilies
+			current.Models = probe.Models
+		}
+	} else if req.ModelsSet {
+		current.Models = normalizeModelIDs(req.Models)
+		current.ModelFamilies = inferModelFamilies(current.Models)
+		// Keep existing protocols when manually editing models unless empty.
+		if len(current.Protocols) == 0 {
+			current.Protocols = []string{apiProviderProtocolOpenAICompatible}
+		}
+	}
+
+	providers[index] = current
+	if err := writeAgentAPIProviders(providers); err != nil {
+		return agentAPIProvider{}, err
+	}
+	return current, nil
+}
+
 func deleteAgentAPIProvider(id string) ([]agentAPIProvider, error) {
 	providers, err := readAgentAPIProviders()
 	if err != nil {
@@ -321,7 +617,7 @@ func deleteAgentAPIProvider(id string) ([]agentAPIProvider, error) {
 		next = append(next, provider)
 	}
 	if !found {
-		return nil, errors.New("provider not found")
+		return nil, errAgentAPIProviderNotFound
 	}
 	if err := writeAgentAPIProviders(next); err != nil {
 		return nil, err
@@ -343,7 +639,13 @@ func switchAgentAPIProvider(req agentAPIProviderSwitchRequest, app *AppContext) 
 	}
 	providerID := strings.TrimSpace(req.ProviderID)
 	if providerID == "" {
-		return agentAPIProvider{}, errors.New("provider id required")
+		if app != nil && app.GetPreferences() != nil {
+			if err := app.GetPreferences().ClearAgentLastConfigSelection(agentName); err != nil {
+				return agentAPIProvider{}, err
+			}
+		}
+		triggerAgentConfigSwitchProbe(app, agentName)
+		return agentAPIProvider{}, nil
 	}
 	providers, err := readAgentAPIProviders()
 	if err != nil {
@@ -364,8 +666,11 @@ func switchAgentAPIProvider(req agentAPIProviderSwitchRequest, app *AppContext) 
 		return agentAPIProvider{}, fmt.Errorf("provider protocols %s are not compatible with agent %s", strings.Join(agentAPIProviderProtocols(provider), ", "), agentName)
 	}
 	provider.activeProtocol = selectedProtocol
-	if err := applyAgentAPIProvider(agentName, provider, app); err != nil {
-		return agentAPIProvider{}, err
+	isSessionBoundAgent := normalizedAPIProviderAgent(agentName) == "claude" || normalizedAPIProviderAgent(agentName) == "codex"
+	if !isSessionBoundAgent {
+		if err := applyAgentAPIProvider(agentName, provider, app); err != nil {
+			return agentAPIProvider{}, err
+		}
 	}
 	if app != nil && app.GetPreferences() != nil {
 		if err := app.GetPreferences().UpdateAgentLastConfigSelection(agentName, preferences.LastConfigSelection{
@@ -376,7 +681,7 @@ func switchAgentAPIProvider(req agentAPIProviderSwitchRequest, app *AppContext) 
 			return agentAPIProvider{}, err
 		}
 	}
-	if app != nil && app.GetAgentPool() != nil {
+	if app != nil && app.GetAgentPool() != nil && !isSessionBoundAgent {
 		app.GetAgentPool().KillAgentProcess(agentName, 0)
 	}
 	triggerAgentConfigSwitchProbe(app, agentName)
@@ -390,8 +695,11 @@ func applyAgentAPIProvider(agentName string, provider agentAPIProvider, app *App
 			return err
 		}
 	case "claude":
+		if err := applyClaudeAPIProvider(provider); err != nil {
+			return err
+		}
 		env, err := mergeAgentEnvConfig(agentName, map[string]string{
-			"ANTHROPIC_BASE_URL": provider.BaseURL,
+			"ANTHROPIC_BASE_URL": anthropicBaseURL(provider.BaseURL),
 			"ANTHROPIC_API_KEY":  provider.APIKey,
 		})
 		if err != nil {
@@ -445,7 +753,7 @@ func applyAgentAPIProvider(agentName string, provider agentAPIProvider, app *App
 		}
 	default:
 		if err := applyAgentProviderEnv(agentName, map[string]string{
-			"OPENAI_BASE_URL": provider.BaseURL,
+			"OPENAI_BASE_URL": openAIModelsBaseURL(provider.BaseURL),
 			"OPENAI_API_KEY":  provider.APIKey,
 		}, app); err != nil {
 			return err
@@ -913,7 +1221,7 @@ func probeAgentAPIProvider(ctx context.Context, baseURL, apiKey string) (agentAP
 	defer cancel()
 	attempts := []struct {
 		protocol string
-		fn       func(context.Context, string, string) ([]string, error)
+		fn       func(context.Context, string, string) (probeProtocolModels, error)
 	}{
 		{apiProviderProtocolOpenAICompatible, probeOpenAICompatibleModels},
 		{apiProviderProtocolAnthropicCompatible, probeAnthropicCompatibleModels},
@@ -921,31 +1229,39 @@ func probeAgentAPIProvider(ctx context.Context, baseURL, apiKey string) (agentAP
 	}
 	type probeAttemptResult struct {
 		protocol string
-		models   []string
+		result   probeProtocolModels
 		err      error
 	}
 	results := make(chan probeAttemptResult, len(attempts))
 	for _, attempt := range attempts {
 		attempt := attempt
 		go func() {
-			models, err := attempt.fn(ctx, baseURL, apiKey)
-			results <- probeAttemptResult{protocol: attempt.protocol, models: models, err: err}
+			result, err := attempt.fn(ctx, baseURL, apiKey)
+			results <- probeAttemptResult{protocol: attempt.protocol, result: result, err: err}
 		}()
 	}
 	var failures []string
 	modelsByProtocol := map[string][]string{}
+	var openAIHintAnthropic bool
 	for range attempts {
 		result := <-results
 		if result.err != nil {
 			failures = append(failures, result.protocol+": "+result.err.Error())
 			continue
 		}
-		if len(result.models) == 0 {
+		if len(result.result.Models) == 0 {
 			failures = append(failures, result.protocol+": no models returned")
 			continue
 		}
-		modelsByProtocol[result.protocol] = result.models
+		modelsByProtocol[result.protocol] = result.result.Models
+		if result.protocol == apiProviderProtocolOpenAICompatible && result.result.SuggestAnthropic {
+			openAIHintAnthropic = true
+		}
 	}
+	// Gateways like ilfy often only pass OpenAI /v1/models probing, while the
+	// catalog is Claude-family and Claude Code works with Anthropic env vars.
+	// Promote anthropic-compatible so Claude's provider list is not filtered out.
+	promoteAnthropicProtocolFromOpenAI(modelsByProtocol, openAIHintAnthropic)
 	protocols := successfulProbeProtocols(modelsByProtocol)
 	if len(protocols) > 0 {
 		models := mergeProtocolModels(modelsByProtocol, protocols)
@@ -959,33 +1275,48 @@ func probeAgentAPIProvider(ctx context.Context, baseURL, apiKey string) (agentAP
 	return agentAPIProviderProbeResult{}, fmt.Errorf("unable to identify API protocol: %s", strings.Join(failures, "; "))
 }
 
-func probeOpenAICompatibleModels(ctx context.Context, baseURL, apiKey string) ([]string, error) {
+type probeProtocolModels struct {
+	Models           []string
+	SuggestAnthropic bool
+}
+
+func probeOpenAICompatibleModels(ctx context.Context, baseURL, apiKey string) (probeProtocolModels, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, openAIModelsURL(baseURL), nil)
 	if err != nil {
-		return nil, err
+		return probeProtocolModels{}, err
 	}
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	var payload struct {
 		Data []struct {
-			ID string `json:"id"`
+			ID                     string   `json:"id"`
+			SupportedEndpointTypes []string `json:"supported_endpoint_types"`
+			SupportedEndpoints     []string `json:"supported_endpoints"`
 		} `json:"data"`
 	}
 	if err := doModelProbe(req, &payload); err != nil {
-		return nil, err
+		return probeProtocolModels{}, err
 	}
 	models := make([]string, 0, len(payload.Data))
+	suggestAnthropic := false
 	for _, item := range payload.Data {
 		if id := strings.TrimSpace(item.ID); id != "" {
 			models = append(models, id)
 		}
+		if endpointTypesSuggestAnthropic(item.SupportedEndpointTypes) || endpointTypesSuggestAnthropic(item.SupportedEndpoints) {
+			suggestAnthropic = true
+		}
 	}
-	return normalizeModelIDs(models), nil
+	models = normalizeModelIDs(models)
+	if !suggestAnthropic {
+		suggestAnthropic = providerModelsSuggestAnthropic(models)
+	}
+	return probeProtocolModels{Models: models, SuggestAnthropic: suggestAnthropic}, nil
 }
 
-func probeAnthropicCompatibleModels(ctx context.Context, baseURL, apiKey string) ([]string, error) {
+func probeAnthropicCompatibleModels(ctx context.Context, baseURL, apiKey string) (probeProtocolModels, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, openAIModelsURL(baseURL), nil)
 	if err != nil {
-		return nil, err
+		return probeProtocolModels{}, err
 	}
 	req.Header.Set("x-api-key", apiKey)
 	req.Header.Set("anthropic-version", "2023-06-01")
@@ -996,7 +1327,7 @@ func probeAnthropicCompatibleModels(ctx context.Context, baseURL, apiKey string)
 		} `json:"data"`
 	}
 	if err := doModelProbe(req, &payload); err != nil {
-		return nil, err
+		return probeProtocolModels{}, err
 	}
 	models := make([]string, 0, len(payload.Data))
 	for _, item := range payload.Data {
@@ -1004,20 +1335,20 @@ func probeAnthropicCompatibleModels(ctx context.Context, baseURL, apiKey string)
 			models = append(models, id)
 		}
 	}
-	return normalizeModelIDs(models), nil
+	return probeProtocolModels{Models: normalizeModelIDs(models)}, nil
 }
 
-func probeGeminiCompatibleModels(ctx context.Context, baseURL, apiKey string) ([]string, error) {
+func probeGeminiCompatibleModels(ctx context.Context, baseURL, apiKey string) (probeProtocolModels, error) {
 	endpoint, err := url.Parse(geminiModelsURL(baseURL))
 	if err != nil {
-		return nil, err
+		return probeProtocolModels{}, err
 	}
 	q := endpoint.Query()
 	q.Set("key", apiKey)
 	endpoint.RawQuery = q.Encode()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
 	if err != nil {
-		return nil, err
+		return probeProtocolModels{}, err
 	}
 	var payload struct {
 		Models []struct {
@@ -1026,7 +1357,7 @@ func probeGeminiCompatibleModels(ctx context.Context, baseURL, apiKey string) ([
 		} `json:"models"`
 	}
 	if err := doModelProbe(req, &payload); err != nil {
-		return nil, err
+		return probeProtocolModels{}, err
 	}
 	models := make([]string, 0, len(payload.Models))
 	for _, item := range payload.Models {
@@ -1036,7 +1367,62 @@ func probeGeminiCompatibleModels(ctx context.Context, baseURL, apiKey string) ([
 			models = append(models, name)
 		}
 	}
-	return normalizeModelIDs(models), nil
+	return probeProtocolModels{Models: normalizeModelIDs(models)}, nil
+}
+
+func endpointTypesSuggestAnthropic(values []string) bool {
+	for _, raw := range values {
+		lower := strings.ToLower(strings.TrimSpace(raw))
+		if lower == "" {
+			continue
+		}
+		if strings.Contains(lower, "anthropic") || strings.Contains(lower, "claude") {
+			return true
+		}
+	}
+	return false
+}
+
+func providerModelsSuggestAnthropic(models []string) bool {
+	families := inferModelFamilies(models)
+	for _, family := range families {
+		if family == "anthropic" {
+			return true
+		}
+	}
+	// Prefer explicit Claude markers. Bare "sonnet"/"opus"/"haiku" substrings are
+	// too broad (e.g. router-opus-v2) and falsely promote Anthropic protocols.
+	for _, model := range models {
+		lower := strings.ToLower(strings.TrimSpace(model))
+		if strings.Contains(lower, "claude") || strings.Contains(lower, "anthropic") {
+			return true
+		}
+		// ilfy / custom Claude codenames sometimes omit the "claude-" prefix.
+		if strings.Contains(lower, "fable") && (strings.Contains(lower, "claude") || strings.HasPrefix(lower, "fable") || strings.Contains(lower, "-fable")) {
+			return true
+		}
+	}
+	return false
+}
+
+// promoteAnthropicProtocolFromOpenAI copies OpenAI-compatible catalog models into
+// anthropic-compatible when the catalog looks Claude-family (or the OpenAI probe
+// already hinted Anthropic endpoints) and Anthropic probing itself failed/empty.
+// Mutates modelsByProtocol in place.
+func promoteAnthropicProtocolFromOpenAI(modelsByProtocol map[string][]string, openAIHintAnthropic bool) {
+	if modelsByProtocol == nil {
+		return
+	}
+	if len(modelsByProtocol[apiProviderProtocolAnthropicCompatible]) > 0 {
+		return
+	}
+	openaiModels := modelsByProtocol[apiProviderProtocolOpenAICompatible]
+	if len(openaiModels) == 0 {
+		return
+	}
+	if openAIHintAnthropic || providerModelsSuggestAnthropic(openaiModels) {
+		modelsByProtocol[apiProviderProtocolAnthropicCompatible] = append([]string(nil), openaiModels...)
+	}
 }
 
 func doModelProbe(req *http.Request, target any) error {
@@ -1108,7 +1494,7 @@ func writeAgentAPIProviders(providers []agentAPIProvider) error {
 }
 
 func agentAPIProvidersPath() (string, error) {
-	configDir, err := configpkg.MindFSConfigDir()
+	configDir, err := mindFSConfigDir()
 	if err != nil {
 		return "", err
 	}
@@ -1139,6 +1525,9 @@ func normalizeAPIProviderBaseURL(input string) (string, error) {
 	}
 	if parsed.Scheme != "http" && parsed.Scheme != "https" {
 		return "", errors.New("baseUrl scheme must be http or https")
+	}
+	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", errors.New("baseUrl must not contain credentials, query, or fragment")
 	}
 	return baseURL, nil
 }
@@ -1210,14 +1599,306 @@ func agentAPIProviderActiveProtocol(provider agentAPIProvider) string {
 }
 
 func applyAgentAPIProviderCapabilities(statuses []agent.Status) []agent.Status {
+	// When last_config_selection is an api_provider, surface that provider's
+	// model catalog on the agent status (claude/codex/opencode and peers).
+	// Runtime probe catalogs often lag after soft-invalidate / process recycle.
+	providers, providersErr := readAgentAPIProviders()
+	providerByID := map[string]agentAPIProvider{}
+	if providersErr == nil {
+		for _, provider := range providers {
+			providerByID[provider.ID] = provider
+		}
+	}
+
 	out := make([]agent.Status, len(statuses))
 	for i, status := range statuses {
 		protocols := agentSupportedAPIProtocols(status.Name)
 		status.SupportedAPIProviderProtocols = append([]string(nil), protocols...)
 		status.SupportsAPIProviderSwitch = len(protocols) > 0
+		if status.SupportsAPIProviderSwitch {
+			if typ, id, _ := lastConfigSelectionFields(status.LastConfigSelection); typ == "api_provider" && id != "" {
+				if provider, ok := providerByID[id]; ok {
+					status = overlaySelectedProviderModels(status, provider)
+				}
+			}
+		}
 		out[i] = status
 	}
 	return out
+}
+
+func lastConfigSelectionFields(value any) (typ, id, name string) {
+	switch v := value.(type) {
+	case preferences.LastConfigSelection:
+		return strings.TrimSpace(v.Type), strings.TrimSpace(v.ID), strings.TrimSpace(v.Name)
+	case *preferences.LastConfigSelection:
+		if v == nil {
+			return "", "", ""
+		}
+		return strings.TrimSpace(v.Type), strings.TrimSpace(v.ID), strings.TrimSpace(v.Name)
+	case map[string]any:
+		typ, _ = v["type"].(string)
+		id, _ = v["id"].(string)
+		name, _ = v["name"].(string)
+		return strings.TrimSpace(typ), strings.TrimSpace(id), strings.TrimSpace(name)
+	case map[string]string:
+		return strings.TrimSpace(v["type"]), strings.TrimSpace(v["id"]), strings.TrimSpace(v["name"])
+	default:
+		return "", "", ""
+	}
+}
+
+func overlaySelectedProviderModels(status agent.Status, provider agentAPIProvider) agent.Status {
+	if len(provider.Models) == 0 {
+		return status
+	}
+	agentName := normalizedAPIProviderAgent(status.Name)
+	providerName := strings.TrimSpace(agentAPIProviderConfigName(provider))
+	models := make([]agenttypes.ModelInfo, 0, len(provider.Models))
+	seen := map[string]struct{}{}
+	for _, raw := range provider.Models {
+		model := strings.TrimSpace(raw)
+		if model == "" {
+			continue
+		}
+		id := model
+		// opencode (and similar multi-provider agents) address models as provider/model.
+		if agentName == "opencode" || agentName == "openclaw" || agentName == "omp" || agentName == "pi" {
+			if !strings.Contains(model, "/") && providerName != "" {
+				id = providerName + "/" + model
+			}
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		name := model
+		if i := strings.LastIndex(id, "/"); i >= 0 && i+1 < len(id) {
+			name = id[i+1:]
+		}
+		models = append(models, agenttypes.ModelInfo{
+			ID:   id,
+			Name: name,
+			// Only enable effort after probe metadata merges in; bare overlay
+			// would otherwise fall back to agent-global efforts for unknown IDs.
+			SupportEffort: false,
+		})
+	}
+	if len(models) == 0 {
+		return status
+	}
+
+	// Prefer provider catalog for the picker after an explicit provider switch.
+	// Merge effort metadata from the existing probe catalog when IDs match
+	// exactly or by provider/model suffix (opencode-style ids).
+	probeModels := append([]agenttypes.ModelInfo(nil), status.Models...)
+	for i, model := range models {
+		if existing, ok := findProbeModel(probeModels, model.ID); ok {
+			if existing.Name != "" {
+				models[i].Name = existing.Name
+			}
+			models[i].Description = existing.Description
+			models[i].Hidden = existing.Hidden
+			models[i].SupportEffort = existing.SupportEffort
+			models[i].Efforts = append([]string(nil), existing.Efforts...)
+			models[i].DefaultEffort = existing.DefaultEffort
+		}
+	}
+	status.Models = models
+
+	if !modelListContainsID(models, status.CurrentModelID) {
+		if matched := matchModelID(models, status.CurrentModelID); matched != "" {
+			status.CurrentModelID = matched
+		} else {
+			status.CurrentModelID = models[0].ID
+		}
+	}
+	if !modelListContainsID(models, status.DefaultModelID) {
+		if matched := matchModelID(models, status.DefaultModelID); matched != "" {
+			status.DefaultModelID = matched
+		} else {
+			status.DefaultModelID = models[0].ID
+		}
+	}
+	// Keep agent-level effort union aligned with the overlaid catalog when possible.
+	if agentName == "codex" {
+		if efforts := inferOverlayEfforts(models); len(efforts) > 0 {
+			status.Efforts = efforts
+		}
+	}
+	return status
+}
+
+func findProbeModel(probeModels []agenttypes.ModelInfo, id string) (agenttypes.ModelInfo, bool) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return agenttypes.ModelInfo{}, false
+	}
+	for _, model := range probeModels {
+		mid := strings.TrimSpace(model.ID)
+		if mid == id {
+			return model, true
+		}
+	}
+	// Suffix / bare-id fallback for provider-prefixed catalogs.
+	for _, model := range probeModels {
+		mid := strings.TrimSpace(model.ID)
+		if mid == "" {
+			continue
+		}
+		if strings.HasSuffix(mid, "/"+id) || strings.HasSuffix(id, "/"+mid) {
+			return model, true
+		}
+		if i := strings.LastIndex(mid, "/"); i >= 0 && mid[i+1:] == id {
+			return model, true
+		}
+		if i := strings.LastIndex(id, "/"); i >= 0 && id[i+1:] == mid {
+			return model, true
+		}
+	}
+	return agenttypes.ModelInfo{}, false
+}
+
+func inferOverlayEfforts(models []agenttypes.ModelInfo) []string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0)
+	for _, model := range models {
+		for _, raw := range model.Efforts {
+			effort := strings.ToLower(strings.TrimSpace(raw))
+			if effort == "" {
+				continue
+			}
+			if _, ok := seen[effort]; ok {
+				continue
+			}
+			seen[effort] = struct{}{}
+			out = append(out, effort)
+		}
+	}
+	return out
+}
+
+func modelListContainsID(models []agenttypes.ModelInfo, id string) bool {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return false
+	}
+	for _, model := range models {
+		if strings.TrimSpace(model.ID) == id {
+			return true
+		}
+	}
+	return false
+}
+
+func matchModelID(models []agenttypes.ModelInfo, id string) string {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return ""
+	}
+	for _, model := range models {
+		mid := strings.TrimSpace(model.ID)
+		if mid == id {
+			return mid
+		}
+		if strings.HasSuffix(mid, "/"+id) {
+			return mid
+		}
+		if i := strings.LastIndex(mid, "/"); i >= 0 && mid[i+1:] == id {
+			return mid
+		}
+	}
+	return ""
+}
+
+// agentModelAllowedByActiveProvider returns true when the agent is currently
+// using an API provider whose stored model catalog contains model (exact or
+// provider/model suffix match). Used by usecase.validateAgentModel so custom
+// provider models (e.g. grok-4.5) are not rejected as "not supported by codex".
+func agentModelAllowedByActiveProvider(agentName, model string, lastConfig any) bool {
+	agentName = strings.TrimSpace(agentName)
+	model = strings.TrimSpace(model)
+	if agentName == "" || model == "" {
+		return false
+	}
+	typ, providerID, _ := lastConfigSelectionFields(lastConfig)
+	if typ != "api_provider" || providerID == "" {
+		return false
+	}
+	// Only agents that support API provider switch participate.
+	if len(agentSupportedAPIProtocols(agentName)) == 0 {
+		return false
+	}
+	providers, err := readAgentAPIProviders()
+	if err != nil {
+		return false
+	}
+	var provider agentAPIProvider
+	for _, item := range providers {
+		if item.ID == providerID {
+			provider = item
+			break
+		}
+	}
+	if provider.ID == "" || len(provider.Models) == 0 {
+		return false
+	}
+	// Build the same IDs the overlay/picker would expose (incl. opencode prefix).
+	status := overlaySelectedProviderModels(agent.Status{
+		Name:   agentName,
+		Models: nil,
+	}, provider)
+	if modelIDInProviderCatalog(status.Models, provider.Models, model, agentName, provider) {
+		return true
+	}
+	return false
+}
+
+func modelIDInProviderCatalog(overlaid []agenttypes.ModelInfo, rawModels []string, model, agentName string, provider agentAPIProvider) bool {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return false
+	}
+	for _, item := range overlaid {
+		id := strings.TrimSpace(item.ID)
+		if id == "" {
+			continue
+		}
+		if id == model {
+			return true
+		}
+		if strings.HasSuffix(id, "/"+model) || strings.HasSuffix(model, "/"+id) {
+			return true
+		}
+		if i := strings.LastIndex(id, "/"); i >= 0 && id[i+1:] == model {
+			return true
+		}
+		if i := strings.LastIndex(model, "/"); i >= 0 && model[i+1:] == id {
+			return true
+		}
+	}
+	// Also accept raw provider model ids before overlay prefixing.
+	for _, raw := range rawModels {
+		id := strings.TrimSpace(raw)
+		if id == "" {
+			continue
+		}
+		if id == model {
+			return true
+		}
+		if strings.HasSuffix(id, "/"+model) || strings.HasSuffix(model, "/"+id) {
+			return true
+		}
+		if i := strings.LastIndex(id, "/"); i >= 0 && id[i+1:] == model {
+			return true
+		}
+		if i := strings.LastIndex(model, "/"); i >= 0 && model[i+1:] == id {
+			return true
+		}
+	}
+	_ = agentName
+	_ = provider
+	return false
 }
 
 func agentSupportedAPIProtocols(agentName string) []string {
@@ -1341,6 +2022,20 @@ func slugifyAPIProviderName(name string) string {
 		}
 	}
 	return strings.Trim(b.String(), "-")
+}
+
+func modelIDListsEqual(left, right []string) bool {
+	left = normalizeModelIDs(left)
+	right = normalizeModelIDs(right)
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func normalizeModelIDs(input []string) []string {

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"fmt"
 	"context"
 	"errors"
 	"log"
@@ -50,6 +51,9 @@ type AppContext struct {
 	Prefs     *preferences.Store
 	Scheduled *scheduled.Service
 	Kanban    *kanban.Service
+	// QueueDrainer optionally starts the next queued WS/user message for a session.
+	// Wired by the WS layer so kanban/scheduled completion can drain leftovers.
+	QueueDrainer func(rootID, sessionKey string)
 
 	mu                       sync.RWMutex
 	roots                    map[string]*RootContext // root id -> root context
@@ -120,6 +124,21 @@ func (s *AppContext) GetSessionManager(rootID string) (*session.Manager, error) 
 	rootCtx.Session = mgr
 
 	return mgr, nil
+}
+
+func (s *AppContext) LoadedSessionManagers() []*session.Manager {
+	if s == nil {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	managers := make([]*session.Manager, 0, len(s.roots))
+	for _, root := range s.roots {
+		if root != nil && root.Session != nil {
+			managers = append(managers, root.Session)
+		}
+	}
+	return managers
 }
 
 func (s *AppContext) GetKanbanService() (*kanban.Service, error) {
@@ -267,16 +286,17 @@ func (s *AppContext) RunAgentStage(ctx context.Context, exec kanban.AgentStageEx
 	updateTracker := newTurnUpdateTracker()
 	planMode := exec.Stage.PlanMode
 	err := uc.SendMessage(ctx, usecase.SendMessageInput{
-		RootID:          exec.RootID,
-		RuntimeRootPath: exec.RuntimeRootPath,
-		Key:             sessionKey,
-		Agent:           exec.Stage.Agent,
-		Model:           exec.Stage.Model,
-		Mode:            exec.Stage.Mode,
-		Effort:          exec.Stage.Effort,
-		FastService:     normalizeFastServiceValue(exec.Stage.FastService),
-		PlanMode:        &planMode,
-		Content:         exec.Prompt,
+		RootID:               exec.RootID,
+		RuntimeRootPath:      exec.RuntimeRootPath,
+		Key:                  sessionKey,
+		Agent:                exec.Stage.Agent,
+		Model:                exec.Stage.Model,
+		UseGlobalAgentConfig: true,
+		Mode:                 exec.Stage.Mode,
+		Effort:               exec.Stage.Effort,
+		FastService:          normalizeFastServiceValue(exec.Stage.FastService),
+		PlanMode:             &planMode,
+		Content:              exec.Prompt,
 		OnStart: func() {
 			s.BroadcastSessionUserMessage(exec.RootID, sessionKey, session.TypeChat, sessionName, exec.Stage.Agent, exec.Stage.Model, exec.Stage.Mode, exec.Stage.Effort, exec.Stage.FastService, planMode, exec.Prompt)
 		},
@@ -686,6 +706,55 @@ func (s *AppContext) BroadcastSessionMetaUpdated(rootID string, sess *session.Se
 	})
 }
 
+
+// WireRuntimeStateNotifier connects usecase runtime open/close events to WS clients.
+func WireRuntimeStateNotifier(app *AppContext) {
+	usecase.RuntimeStateNotifier = func(rootID, sessionKey, agentName, state, agentSessionID, message string) {
+		if app == nil {
+			return
+		}
+		app.BroadcastSessionRuntimeChanged(rootID, sessionKey, agentName, state, agentSessionID, message)
+	}
+}
+
+func (s *AppContext) BroadcastSessionRuntimeChanged(rootID, sessionKey, agentName, state, agentSessionID, message string) {
+	if s == nil {
+		return
+	}
+	rootID = strings.TrimSpace(rootID)
+	sessionKey = strings.TrimSpace(sessionKey)
+	agentName = strings.TrimSpace(agentName)
+	state = strings.TrimSpace(state)
+	if rootID == "" || sessionKey == "" || agentName == "" || state == "" {
+		return
+	}
+	payload := map[string]any{
+		"root_id":     rootID,
+		"session_key": sessionKey,
+		"agent":       agentName,
+		"state":       state,
+	}
+	if sid := strings.TrimSpace(agentSessionID); sid != "" {
+		payload["agent_session_id"] = sid
+	}
+	if msg := strings.TrimSpace(message); msg != "" {
+		payload["message"] = msg
+	}
+	hub := s.GetSessionStreamHub()
+	resp := WSResponse{
+		Type:    "session.runtime.changed",
+		Payload: payload,
+	}
+	clientIDs := hub.GetSessionClientIDs(rootID, sessionKey, false)
+	if len(clientIDs) == 0 {
+		hub.BroadcastAll(resp)
+		return
+	}
+	for _, clientID := range clientIDs {
+		hub.SendToClient(clientID, resp)
+	}
+}
+
 func (s *AppContext) BroadcastAgentStatusChanged(agentName string) {
 	agentName = strings.TrimSpace(agentName)
 	if s == nil || agentName == "" || s.GetProber() == nil {
@@ -749,11 +818,144 @@ func (s *AppContext) BroadcastSessionUpdate(rootID, sessionKey string, update ag
 }
 
 func (s *AppContext) BroadcastSessionError(rootID, sessionKey, message string) {
-	s.UpdateTaskSessionErrorForSession(rootID, sessionKey, message)
-	s.GetSessionStreamHub().BroadcastSessionStream(rootID, sessionKey, &StreamEvent{
+	s.BroadcastSessionErrorWithRequest(rootID, sessionKey, "", message)
+}
+
+// BroadcastSessionErrorWithRequest surfaces a terminal send/resume error to the UI.
+// requestID (when known) lets the frontend clear pending_ack for the exact outbound message.
+//
+// Emits a single session.error frame (not also a stream "error" event) to avoid
+// double toasts: App handles session.error and stream type=error both via reportError.
+func (s *AppContext) BroadcastSessionErrorWithRequest(rootID, sessionKey, requestID, message string) {
+	trimmed := strings.TrimSpace(message)
+	if trimmed == "" {
+		trimmed = "session error"
+	}
+	normalized := normalizeAgentErrorMessage(errors.New(trimmed))
+	s.UpdateTaskSessionErrorForSession(rootID, sessionKey, normalized)
+	recoverable := isRecoverableTransportErrorText(normalized)
+	s.persistSessionError(rootID, sessionKey, requestID, "session.message_failed", "turn", normalized, recoverable)
+	hub := s.GetSessionStreamHub()
+	// Still append to reply event log so reconnect/replay can surface the failure.
+	hub.AppendReplyEvent(rootID, sessionKey, StreamEvent{
 		Type: "error",
-		Data: map[string]string{"message": normalizeAgentErrorMessage(errors.New(message))},
+		Data: map[string]string{"message": normalized},
 	})
+	// Explicit session.error frame carries request_id so App can drop pending_ack
+	// and stop the "sending / generating" state even when stream handlers miss it.
+	payload := map[string]any{
+		"root_id":     rootID,
+		"session_key": sessionKey,
+		"message":     normalized,
+		"recoverable": recoverable,
+		// Mirror stream error shape so SessionViewer/timeline can read it if needed.
+		"event": map[string]any{
+			"type": "error",
+			"data": map[string]string{"message": normalized},
+		},
+	}
+	if strings.TrimSpace(requestID) != "" {
+		payload["request_id"] = strings.TrimSpace(requestID)
+	}
+	resp := WSResponse{
+		ID:      strings.TrimSpace(requestID),
+		Type:    "session.error",
+		Payload: payload,
+		Error: &WSResponseError{
+			Code:    "session.message_failed",
+			Message: normalized,
+		},
+	}
+	// Prefer session-bound clients; fall back to all live clients so the sender
+	// still sees the failure if BindSessionClient raced.
+	clientIDs := hub.GetSessionClientIDs(rootID, sessionKey, false)
+	if len(clientIDs) == 0 {
+		hub.BroadcastAll(resp)
+		return
+	}
+	for _, clientID := range clientIDs {
+		hub.SendToClient(clientID, resp)
+	}
+}
+
+
+func isRecoverableTransportErrorText(message string) bool {
+	value := strings.ToLower(strings.TrimSpace(message))
+	for _, needle := range []string{
+		"peer disconnected",
+		"stream disconnected",
+		"upstream connection error",
+		"connection closed",
+		"connection reset",
+		"broken pipe",
+		"unexpected eof",
+		"websocket: close",
+		"504",
+		"gateway time-out",
+		"gateway timeout",
+	} {
+		if strings.Contains(value, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *AppContext) persistSessionError(rootID, sessionKey, requestID, code, kind, message string, recoverable bool) {
+	if s == nil {
+		return
+	}
+	rootID = strings.TrimSpace(rootID)
+	sessionKey = strings.TrimSpace(sessionKey)
+	if rootID == "" || sessionKey == "" || strings.TrimSpace(message) == "" {
+		return
+	}
+	manager, err := s.GetSessionManager(rootID)
+	if err != nil || manager == nil {
+		log.Printf("[session/error] persist.skip root=%s session=%s err=%v", rootID, sessionKey, err)
+		return
+	}
+	afterSeq := 0
+	agentName := ""
+	model := ""
+	if current, getErr := manager.Get(context.Background(), sessionKey, 0); getErr == nil && current != nil {
+		afterSeq = len(current.Exchanges)
+		for i := len(current.Exchanges) - 1; i >= 0; i-- {
+			ex := current.Exchanges[i]
+			if strings.EqualFold(strings.TrimSpace(ex.Role), "user") && ex.Seq > 0 {
+				afterSeq = ex.Seq
+				break
+			}
+		}
+		agentName = session.InferAgentFromSession(current)
+		model = strings.TrimSpace(current.Model)
+		if model == "" && len(current.Exchanges) > 0 {
+			for i := len(current.Exchanges) - 1; i >= 0; i-- {
+				if m := strings.TrimSpace(current.Exchanges[i].Model); m != "" {
+					model = m
+					break
+				}
+			}
+		}
+	}
+	afterMessageID := strings.TrimSpace(requestID)
+	if afterMessageID == "" && afterSeq > 0 {
+		afterMessageID = fmt.Sprintf("seq-%d", afterSeq)
+	}
+	entry := session.SessionError{
+		RequestID:      strings.TrimSpace(requestID),
+		AfterMessageID: afterMessageID,
+		AfterSeq:       afterSeq,
+		Agent:          agentName,
+		Model:          model,
+		Code:           strings.TrimSpace(code),
+		Kind:           strings.TrimSpace(kind),
+		Message:        strings.TrimSpace(message),
+		Recoverable:    recoverable,
+	}
+	if err := manager.AppendSessionError(context.Background(), sessionKey, entry); err != nil {
+		log.Printf("[session/error] persist.error root=%s session=%s err=%v", rootID, sessionKey, err)
+	}
 }
 
 func (s *AppContext) ClearTaskAuxFlagsForSession(rootID, sessionKey string) {
@@ -780,11 +982,34 @@ func (s *AppContext) UpdateTaskSessionErrorForSession(rootID, sessionKey, messag
 
 func (s *AppContext) BroadcastSessionDone(rootID, sessionKey, requestID string) {
 	hub := s.GetSessionStreamHub()
-	pending := hub.PendingSessionSnapshot(sessionKey)
+	pending := hub.PendingSessionSnapshot(rootID, sessionKey)
 	s.notifySessionDone(rootID, sessionKey, requestID, pending)
-	hub.ClearSessionPending(sessionKey)
+	hub.ClearSessionPending(rootID, sessionKey)
 	hub.BroadcastSessionDone(rootID, sessionKey, requestID)
+	// Drain leftovers after any completion path (WS, kanban, scheduled).
+	s.StartNextQueuedSessionMessage(rootID, sessionKey)
 }
+
+// StartNextQueuedSessionMessage drains one queued user message if the session
+// is idle. Used by non-WS completion paths (kanban/scheduled) so leftovers are
+// not skipped by later direct sends.
+func (s *AppContext) StartNextQueuedSessionMessage(rootID, sessionKey string) {
+	if s == nil {
+		return
+	}
+	if s.QueueDrainer != nil {
+		s.QueueDrainer(rootID, sessionKey)
+		return
+	}
+	hub := s.GetSessionStreamHub()
+	if hub == nil || hub.IsSessionReplying(rootID, sessionKey) || !hub.HasQueuedSessionMessages(rootID, sessionKey) {
+		return
+	}
+	if queue, changed := hub.UnfreezeQueuedSessionMessages(rootID, sessionKey); changed {
+		hub.BroadcastSessionQueueUpdated(rootID, sessionKey, queue)
+	}
+}
+
 
 func (s *AppContext) BroadcastScheduledTaskDone(rootID, taskID, taskName, sessionKey, summary string) {
 	s.notifyScheduled(rootID, taskID, taskName, sessionKey, summary, "", true)

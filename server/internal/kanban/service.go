@@ -31,6 +31,7 @@ type Service struct {
 	stores       map[string]*TaskStore
 	scheduleRun  map[string]bool
 	schedulePend map[string]bool
+	closed       bool
 }
 
 var errStopTaskExecution = errors.New("stop task execution")
@@ -46,6 +47,30 @@ func (s *Service) SetRunner(runner Runner) {
 	s.mu.Lock()
 	s.Runner = runner
 	s.mu.Unlock()
+}
+
+// Close releases task database handles held for managed roots.
+func (s *Service) Close() error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil
+	}
+	s.closed = true
+	stores := s.stores
+	s.stores = nil
+	s.mu.Unlock()
+
+	var closeErr error
+	for _, store := range stores {
+		if err := store.Close(); err != nil && closeErr == nil {
+			closeErr = err
+		}
+	}
+	return closeErr
 }
 
 type CreateTaskInput struct {
@@ -1186,6 +1211,9 @@ func (s *Service) taskStore(rootID string) (*TaskStore, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed {
+		return nil, errors.New("kanban service closed")
+	}
 	if s.stores == nil {
 		s.stores = map[string]*TaskStore{}
 	}

@@ -127,6 +127,8 @@ func Start(ctx context.Context, addr string, opts StartOptions) error {
 		WebPush: webpush.NewService(webPushConfig, webPushStore),
 		Notify:  notifyscript.NewService(notifyscript.Config{Script: opts.NotifyScript}),
 	}
+	api.WireRuntimeStateNotifier(services)
+	api.WireSessionQueueDrainer(services)
 	services.Scheduled = scheduled.NewService(services, services)
 	services.Scheduled.Start(ctx)
 	taskTemplates, err := kanban.NewTemplateStore()
@@ -187,6 +189,7 @@ func Start(ctx context.Context, addr string, opts StartOptions) error {
 		<-ctx.Done()
 		agentProber.Stop()
 		agentPool.CloseAll()
+		_ = services.Kanban.Close()
 		server.Shutdown(context.Background())
 	}()
 

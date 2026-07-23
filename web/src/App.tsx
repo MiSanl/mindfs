@@ -40,7 +40,7 @@ import {
   protectedAPIReady,
   protectedJSON as apiProtectedJSON,
 } from "./services/api";
-import { reportError } from "./services/error";
+import { reportError, type ErrorCode } from "./services/error";
 import {
   fetchFile,
   clearFileCacheForRoot,
@@ -168,6 +168,96 @@ function formatDocumentTitle(relayStatus: RelayStatusPayload | null): string {
 
 function isTopLevelSessionItem(session: SessionItem): boolean {
   return !String(session?.parent_session_key || "").trim();
+}
+
+
+function mergeSessionErrorLists(
+  serverErrors: any[] | null | undefined,
+  localErrors: any[] | null | undefined,
+  options?: { hasInFlightTurn?: boolean },
+): any[] {
+  // null/undefined server = fetch failed: keep local only.
+  if (serverErrors == null) {
+    return Array.isArray(localErrors) ? [...localErrors].slice(-100) : [];
+  }
+  const server = Array.isArray(serverErrors) ? [...serverErrors] : [];
+  const local = Array.isArray(localErrors) ? [...localErrors] : [];
+  // Authoritative empty server list: drop stale optimistic noise unless a turn
+  // is still in-flight (race: durable append not visible yet).
+  if (server.length === 0) {
+    if (options?.hasInFlightTurn) {
+      return local.slice(-100);
+    }
+    return [];
+  }
+  const merged = [...server];
+  for (const opt of local) {
+    const optId = String(opt?.id || "");
+    const optReq = String(opt?.request_id || "");
+    const exists = merged.some((e) => {
+      const id = String(e?.id || "");
+      const req = String(e?.request_id || "");
+      return (
+        (optId && id && optId === id) ||
+        (optReq && req && optReq === req) ||
+        (String(e?.message || "") === String(opt?.message || "") &&
+          String(e?.timestamp || "") === String(opt?.timestamp || ""))
+      );
+    });
+    if (!exists) merged.push(opt);
+  }
+  return merged.slice(-100);
+}
+
+function isCanceledSessionError(message: string): boolean {
+  const normalized = message.trim().toLowerCase();
+  return (
+    normalized.includes("turn canceled") ||
+    normalized.includes("turn cancelled") ||
+    normalized.includes("context canceled") ||
+    normalized.includes("context cancelled")
+  );
+}
+
+function sessionErrorCode(message: string): ErrorCode {
+  const normalized = message.trim().toLowerCase();
+  if (normalized.includes("session_provider_unavailable")) {
+    return "session.provider_unavailable";
+  }
+  if (normalized.includes("session_provider_mismatch")) {
+    return "session.provider_mismatch";
+  }
+  if (normalized.includes("session_provider_changed")) {
+    return "session.provider_changed";
+  }
+  if (
+    normalized.includes("context length") ||
+    normalized.includes("context_length") ||
+    normalized.includes("context window") ||
+    normalized.includes("maximum context") ||
+    normalized.includes("prompt is too long") ||
+    normalized.includes("prompt too long") ||
+    normalized.includes("too many tokens") ||
+    normalized.includes("token limit") ||
+    normalized.includes("remote compaction failed") ||
+    normalized.includes("context overflow")
+  ) {
+    // Bare "max_tokens" is often a completion limit, not a process crash.
+    return "agent.crashed";
+  }
+  if (
+    normalized.includes("peer disconnected") ||
+    normalized.includes("stream disconnected") ||
+    normalized.includes("upstream connection error") ||
+    normalized.includes("connection closed") ||
+    normalized.includes("connection reset") ||
+    normalized.includes("broken pipe") ||
+    normalized.includes("unexpected eof") ||
+    normalized.includes("websocket: close")
+  ) {
+    return "network.disconnected";
+  }
+  return "agent.crashed";
 }
 
 function firstUserInputTemplate(template: TaskTemplate | null): string {
@@ -306,7 +396,34 @@ export type SessionItem = {
   updated_at?: string;
   closed_at?: string;
   title?: string;
-  agent_session_id?: string;
+	agent_session_id?: string;
+	agent_bindings?: Array<{ agent?: string; agent_session_id?: string; provider_id?: string; provider_revision?: string; provider_protocol?: string; provider_state?: string }>;
+  runtime?: {
+    agent?: string;
+    state?: string;
+    agent_session_id?: string;
+    message?: string;
+  } | null;
+  runtimes?: Array<{
+    agent?: string;
+    state?: string;
+    agent_session_id?: string;
+    message?: string;
+  }>;
+  errors?: Array<{
+    id?: string;
+    session_key?: string;
+    request_id?: string;
+    after_message_id?: string;
+    after_seq?: number;
+    agent?: string;
+    model?: string;
+    code?: string;
+    kind?: string;
+    message?: string;
+    recoverable?: boolean;
+    timestamp?: string;
+  }>;
   context_window?: {
     totalTokens: number;
     modelContextWindow: number;
@@ -449,7 +566,11 @@ function toSessionItem(
       typeof session?.agent === "string" && session.agent.trim()
         ? session.agent
         : latestExchangeText(session?.exchanges, "agent"),
-    model: typeof session?.model === "string" ? session.model : "",
+		model: typeof session?.model === "string" ? session.model : "",
+		agent_bindings: Array.isArray(session?.agent_bindings) ? session.agent_bindings : undefined,
+    runtime: session?.runtime && typeof session.runtime === "object" ? session.runtime : undefined,
+    runtimes: Array.isArray(session?.runtimes) ? session.runtimes : undefined,
+    errors: Array.isArray(session?.errors) ? session.errors : undefined,
     shell: typeof session?.shell === "string" ? session.shell : "",
     mode:
       typeof session?.mode === "string" && session.mode.trim()
@@ -475,12 +596,14 @@ function toSessionItem(
     closed_at:
       typeof session?.closed_at === "string" ? session.closed_at : undefined,
     context_window:
-      session?.context_window &&
-      Number(session.context_window.totalTokens) > 0 &&
-      Number(session.context_window.modelContextWindow) > 0
+      session?.context_window && Number(session.context_window.totalTokens) > 0
         ? {
             totalTokens: Number(session.context_window.totalTokens),
-            modelContextWindow: Number(session.context_window.modelContextWindow),
+            // 0 is valid: some agents report usage without a known window size.
+            modelContextWindow: Math.max(
+              0,
+              Number(session.context_window.modelContextWindow || 0),
+            ),
           }
         : undefined,
     search_seq:
@@ -1460,6 +1583,7 @@ export function App({ onGoHome }: AppProps) {
   const pendingDraftRef = useRef<PendingSend | null>(null);
   const pendingBySessionRef = useRef<Record<string, PendingSend>>({});
   const pendingRequestRef = useRef<Record<string, PendingSend>>({});
+  const skipCompletionSoundBySessionRef = useRef<Record<string, boolean>>({});
   const queuedMessagesBySessionRef = useRef<Record<string, SessionQueueItem[]>>({});
   const queueFrozenBySessionRef = useRef<Record<string, boolean>>({});
   const optimisticDequeuedIdsRef = useRef<Record<string, Set<string>>>({});
@@ -1550,6 +1674,7 @@ export function App({ onGoHome }: AppProps) {
   const taskTemplateActionMenuRef = useRef<HTMLDivElement | null>(null);
   const taskCreateTemplateMenuRef = useRef<HTMLDivElement | null>(null);
   const [availableAgents, setAvailableAgents] = useState<AgentStatus[]>([]);
+  const availableAgentsRef = useRef<AgentStatus[]>([]);
   const [scheduledAgentDialogOpen, setScheduledAgentDialogOpen] = useState(false);
   const [taskTemplates, setTaskTemplates] = useState<TaskTemplate[]>([]);
   const [taskTemplateDialogOpen, setTaskTemplateDialogOpen] = useState(false);
@@ -2567,6 +2692,7 @@ export function App({ onGoHome }: AppProps) {
     fetchAgents(true)
       .then((items) => {
         if (cancelled) return;
+        availableAgentsRef.current = items;
         setAvailableAgents(items);
       })
       .catch(() => {});
@@ -3158,6 +3284,13 @@ export function App({ onGoHome }: AppProps) {
             : typeof (cached as any)?.pending === "boolean"
               ? !!(cached as any).pending
               : undefined;
+      const errors = Array.isArray((cached as any)?.errors)
+        ? ((cached as any).errors as any[])
+        : Array.isArray((session as any)?.errors)
+          ? ((session as any).errors as any[])
+          : Array.isArray((drawerSession as any)?.errors) && drawerSession?.key === key
+            ? ((drawerSession as any).errors as any[])
+            : [];
       return {
         ...(session as any),
         ...(cached as any),
@@ -3168,6 +3301,7 @@ export function App({ onGoHome }: AppProps) {
         search_snippet: (session as any).search_snippet,
         search_match_type: (session as any).search_match_type,
         exchanges,
+        errors,
         pending,
       } as any;
     },
@@ -4247,7 +4381,8 @@ export function App({ onGoHome }: AppProps) {
     ) => {
       const totalTokens = Math.max(0, Number(contextWindow?.totalTokens || 0));
       const modelContextWindow = Math.max(0, Number(contextWindow?.modelContextWindow || 0));
-      if (!totalTokens || !modelContextWindow) {
+      // Keep usage even when model window is unknown (0); badge shows absolute tokens.
+      if (!totalTokens) {
         return;
       }
       const cacheKey = rootSessionKey(rootID, sessionKey);
@@ -5146,10 +5281,16 @@ export function App({ onGoHome }: AppProps) {
           typeof (fullSession as any)?.pending === "boolean"
             ? !!(fullSession as any).pending
             : undefined;
+        // Live local pending wins while a turn is in-flight, but authoritative
+        // server pending=false must clear sticky local generating state.
+        const localPending = resolvePendingForSession(targetRoot, key, preservePending);
+        if (serverPending === false && localPending) {
+          delete pendingBySessionRef.current[cacheKey];
+        }
         const pending =
-          serverPending !== undefined
-            ? serverPending
-            : resolvePendingForSession(targetRoot, key, preservePending);
+          serverPending === false
+            ? false
+            : localPending || serverPending === true;
         const normalized = {
           ...(fullSession as any),
           key,
@@ -5183,11 +5324,53 @@ export function App({ onGoHome }: AppProps) {
           bumpCacheVersion();
         }
       };
+      const refreshSessionErrors = () => {
+        void sessionService.getSessionErrors(targetRoot, key).then((serverErrors) => {
+          // null means fetch failed — keep existing optimistic/local errors.
+          if (serverErrors == null || !Array.isArray(serverErrors)) return;
+          const existing = sessionCacheRef.current[cacheKey];
+          const prevErrors = Array.isArray((existing as any)?.errors)
+            ? ([...((existing as any).errors as any[])] as any[])
+            : Array.isArray((selectedSessionRef.current as any)?.errors) &&
+                ((selectedSessionRef.current as any)?.key === key ||
+                  (selectedSessionRef.current as any)?.session_key === key)
+              ? ([...((selectedSessionRef.current as any).errors as any[])] as any[])
+              : [];
+          const hasInFlightTurn = !!pendingBySessionRef.current[cacheKey];
+          const merged = mergeSessionErrorLists(serverErrors, prevErrors, {
+            hasInFlightTurn,
+          });
+          if (existing && typeof existing === "object") {
+            sessionCacheRef.current[cacheKey] = {
+              ...(existing as any),
+              errors: merged,
+            } as any;
+          }
+          setSelectedSession((prev) => {
+            const prevKey = prev?.key || prev?.session_key;
+            const prevRoot =
+              (prev?.root_id as string | undefined) || currentRootIdRef.current;
+            if (!prev || prevKey !== key || prevRoot !== targetRoot) return prev;
+            return { ...(prev as any), errors: merged } as SessionItem;
+          });
+          if ((boundSessionByRootRef.current[targetRoot] || null) === key) {
+            const drawer = drawerSessionByRootRef.current[targetRoot];
+            if (drawer && (drawer.key === key || (drawer as any).session_key === key)) {
+              setDrawerSessionForRoot(targetRoot, {
+                ...(drawer as any),
+                errors: merged,
+              } as Session);
+            }
+          }
+          bumpCacheVersion();
+        });
+      };
       const cached = sessionCacheRef.current[cacheKey];
       if (cached) {
         applySession(cached);
         if (!shouldSyncHistory && hasSessionExchanges(cached)) {
           loadedSessionRef.current[cacheKey] = true;
+          refreshSessionErrors();
           return;
         }
       } else {
@@ -5196,11 +5379,13 @@ export function App({ onGoHome }: AppProps) {
           applySession(persisted);
           if (!shouldSyncHistory && hasSessionExchanges(persisted)) {
             loadedSessionRef.current[cacheKey] = true;
+            refreshSessionErrors();
             return;
           }
         }
       }
       if (!shouldSyncHistory && loadedSessionRef.current[cacheKey]) {
+        refreshSessionErrors();
         return;
       }
       try {
@@ -5214,6 +5399,9 @@ export function App({ onGoHome }: AppProps) {
         }
       } catch (err) {
         setSelectedSessionLoading(false);
+      } finally {
+        // Durable error logs are not part of list/cache payloads. Always fetch.
+        refreshSessionErrors();
       }
     },
     [
@@ -5519,9 +5707,52 @@ export function App({ onGoHome }: AppProps) {
           reportError("session.sync_failed", t("session.syncFailed"));
           return;
         }
+        // Streams can arrive while the HTTP sync is in flight, so use the
+        // most recent local state when merging the response.
+        const localSession = sessionCacheRef.current[cacheKey];
+        const localPending = resolvePendingForSession(
+          rootID,
+          sessionKey,
+          !!(session as any)?.pending,
+        );
+        const syncedExchanges = Array.isArray((synced as any)?.exchanges)
+          ? ((synced as any).exchanges as Exchange[])
+          : [];
+        const localPendingExchanges = Array.isArray((localSession as any)?.exchanges)
+          ? ((localSession as any).exchanges as Exchange[]).filter(
+              (exchange) => exchange?.pending_ack === true,
+            )
+          : [];
+        const pendingExchanges = localPendingExchanges.filter(
+          (localExchange) =>
+            !syncedExchanges.some(
+              (syncedExchange) =>
+                syncedExchange.role === localExchange.role &&
+                syncedExchange.content === localExchange.content &&
+                syncedExchange.timestamp === localExchange.timestamp,
+            ),
+        );
+        const serverPending =
+          typeof (synced as any)?.pending === "boolean"
+            ? !!(synced as any).pending
+            : undefined;
+        // Authoritative server pending=false must clear sticky local generating
+        // (same semantics as session select / GET). Live turns still win via
+        // pendingBySessionRef when server omits/true.
+        if (serverPending === false && localPending) {
+          delete pendingBySessionRef.current[cacheKey];
+        }
+        const pending =
+          serverPending === false
+            ? false
+            : !!pendingBySessionRef.current[cacheKey] ||
+              localPending ||
+              serverPending === true;
         const normalized = {
           ...(synced as any),
           key: sessionKey,
+          pending,
+          exchanges: [...syncedExchanges, ...pendingExchanges],
         } as Session;
         sessionCacheRef.current[cacheKey] = normalized;
         loadedSessionRef.current[cacheKey] = true;
@@ -5568,6 +5799,7 @@ export function App({ onGoHome }: AppProps) {
       bumpCacheVersion,
       clearSessionStale,
       mergeSessionItems,
+      resolvePendingForSession,
       rootSessionKey,
       setDrawerSessionForRoot,
     ],
@@ -5929,34 +6161,27 @@ export function App({ onGoHome }: AppProps) {
       if (sendSessionKey && session) {
         const targetSessionKey = sendSessionKey;
         const previousAgent = session.agent || "";
-        const useTargetSessionDefaults =
-          !!currentBoundSessionKey && currentBoundSessionKey !== targetSessionKey;
         effectiveMode = normalizeMode(session.type as any);
-        effectiveAgent =
-          (useTargetSessionDefaults ? previousAgent : agent) ||
-          previousAgent ||
-          "";
+        // The action bar selection is the source of truth for this send. A
+        // viewed session may differ from the previously bound drawer session.
+        effectiveAgent = agent || previousAgent || "";
         effectiveModel =
-          (useTargetSessionDefaults ? session.model || "" : model) ||
+          model ||
           (effectiveAgent === previousAgent ? session.model || "" : "");
         effectiveAgentMode =
-          (useTargetSessionDefaults ? (session as any).mode || "" : agentMode) ||
+          agentMode ||
           (effectiveAgent === previousAgent ? (session as any).mode || "" : "");
         effectiveEffort =
-          (useTargetSessionDefaults ? (session as any).effort || "" : effort) ||
+          effort ||
           (effectiveAgent === previousAgent ? (session as any).effort || "" : "");
         effectiveFastService =
-          (useTargetSessionDefaults
-            ? (((session as any).fast_service || "") as "" | "on" | "off")
-            : ((fastService || "") as "" | "on" | "off")) ||
+          ((fastService || "") as "" | "on" | "off") ||
           (effectiveAgent === previousAgent
             ? (((session as any).fast_service || "") as "" | "on" | "off")
             : "");
         effectiveShell =
           effectiveMode === "command"
-            ? ((useTargetSessionDefaults ? (session as any).shell || "" : shell) ||
-                (session as any).shell ||
-                "")
+            ? (shell || (session as any).shell || "")
             : "";
         updateSessionAgentForKey(
           activeRoot,
@@ -6079,12 +6304,20 @@ export function App({ onGoHome }: AppProps) {
           };
           return next;
         });
+        const slashProvider =
+          availableAgents.find((item) => item.name === effectiveAgent)
+            ?.last_config_selection;
+        const slashProviderID =
+          effectiveAgent === "codex" && slashProvider?.type === "api_provider"
+            ? String(slashProvider.id || "").trim() || undefined
+            : undefined;
         const sent = await sessionService.runSlashCommand(
           activeRoot,
           targetSessionKey,
           transientSlashCommand,
           effectiveAgent,
           effectiveModel || undefined,
+          slashProviderID,
           effectiveAgentMode || undefined,
           effectiveEffort || undefined,
           effectiveFastService,
@@ -6305,6 +6538,46 @@ export function App({ onGoHome }: AppProps) {
       if (applyPendingPlanPrefix) {
         outgoingMessage = `/plan ${outgoingMessage}`;
       }
+      const selectedProvider = availableAgents.find(
+        (item) => item.name === effectiveAgent,
+      )?.last_config_selection;
+      // Prefer the session's bound provider for existing conversations so a
+      // global provider switch does not force session_provider_mismatch.
+      // Fall back to the UI selection for new/unbound sessions.
+      const boundProviderID = (() => {
+        if (!(effectiveAgent === "claude" || effectiveAgent === "codex")) {
+          return "";
+        }
+        // Resolve bindings from the *send target* session (drawer/bound key can
+        // differ from the main selected session).
+        const targetKey = String(sendSessionKey || "").trim();
+        const targetCache =
+          targetKey && activeRoot
+            ? sessionCacheRef.current[rootSessionKey(activeRoot, targetKey)]
+            : null;
+        const targetSession =
+          (targetCache as any) ||
+          (session as any) ||
+          (selectedSessionRef.current as any) ||
+          null;
+        const bindings = Array.isArray(targetSession?.agent_bindings)
+          ? (targetSession.agent_bindings as any[])
+          : [];
+        const match = bindings.find(
+          (item) =>
+            String(item?.agent || "").toLowerCase() === String(effectiveAgent || "").toLowerCase() &&
+            String(item?.provider_id || "").trim(),
+        );
+        return String(match?.provider_id || "").trim();
+      })();
+      const selectedProviderID =
+        selectedProvider?.type === "api_provider"
+          ? String(selectedProvider.id || "").trim()
+          : "";
+      const effectiveProviderID =
+        (effectiveAgent === "claude" || effectiveAgent === "codex")
+          ? boundProviderID || selectedProviderID || undefined
+          : undefined;
       const sent = await sessionService.sendMessage(
         activeRoot,
         sendSessionKey || undefined,
@@ -6312,6 +6585,7 @@ export function App({ onGoHome }: AppProps) {
         effectiveMode,
         effectiveAgent,
         effectiveModel || undefined,
+        effectiveProviderID,
         effectiveAgentMode || undefined,
         effectiveEffort || undefined,
         effectiveFastService,
@@ -8936,20 +9210,24 @@ export function App({ onGoHome }: AppProps) {
           );
           tokenStationRefreshRef.current?.();
           break;
-        case "error":
-          reportError(
-            "session.resume_failed",
-            event.data?.message || t("session.resumeFailed"),
-            {
+        case "error": {
+          const streamErrorMessage =
+            typeof event.data?.message === "string" && event.data.message.trim()
+              ? event.data.message.trim()
+              : t("session.messageSendFailed");
+          if (!isCanceledSessionError(streamErrorMessage)) {
+            reportError(sessionErrorCode(streamErrorMessage), streamErrorMessage, {
               details: {
                 rootId: activeRoot,
                 sessionKey: streamKey,
                 eventType: event.type,
               },
-            },
-          );
+            });
+          }
+          skipCompletionSoundBySessionRef.current[rootSessionKey(activeRoot, streamKey)] = true;
           handleSessionStreamDone(activeRoot, streamKey);
           break;
+        }
       }
     };
     const handleSlashCommandStream = (payload: any) => {
@@ -9506,39 +9784,298 @@ export function App({ onGoHome }: AppProps) {
         }
         case "session.error": {
           const requestId =
-            typeof payload?.request_id === "string" ? payload.request_id : "";
+            typeof payload?.request_id === "string"
+              ? payload.request_id
+              : typeof (payload as any)?.id === "string"
+                ? (payload as any).id
+                : "";
+          const payloadSessionKey =
+            typeof payload?.session_key === "string" ? payload.session_key : "";
+          const payloadRootId =
+            typeof payload?.root_id === "string" ? payload.root_id : "";
+          const errorMessage =
+            typeof payload?.message === "string" && payload.message.trim()
+              ? payload.message.trim()
+              : typeof (payload as any)?.error?.message === "string"
+                ? String((payload as any).error.message)
+                : t("session.messageSendFailed");
           const pending = requestId
             ? pendingRequestRef.current[requestId]
             : null;
-          if (!requestId || !pending) {
-            console.warn("[session/ws] error_without_pending", { requestId, payloadSessionKey: typeof payload?.session_key === "string" ? payload.session_key : null });
-            break;
+          // Always clear state, even after session.accepted removed the local
+          // pending request. Cancellation is a normal terminal outcome.
+          if (!isCanceledSessionError(errorMessage)) {
+            const recoverable =
+              typeof (payload as any)?.recoverable === "boolean"
+                ? Boolean((payload as any).recoverable)
+                : /peer disconnected|stream disconnected|504|timeout|connection/i.test(
+                    errorMessage,
+                  );
+            const errCode = sessionErrorCode(errorMessage);
+            const errRootId = payloadRootId || pending?.rootId || currentRootIdRef.current;
+            const errSessionKey = payloadSessionKey || pending?.sessionKey || null;
+            const providerRecovery =
+              errCode === "session.provider_unavailable" ||
+              errCode === "session.provider_mismatch" ||
+              errCode === "session.provider_changed";
+            reportError(errCode, errorMessage, {
+              recoverable: recoverable || providerRecovery,
+              retryAction: providerRecovery
+                ? async () => {
+                    const root = String(errRootId || "").trim();
+                    const key = String(errSessionKey || "").trim();
+                    if (!root || !key) {
+                      throw new Error(errorMessage);
+                    }
+                    const agentName = String(
+                      (pending as any)?.agent ||
+                        selectedSessionRef.current?.agent ||
+                        "",
+                    ).trim();
+                    const agentInfo = (availableAgentsRef.current || []).find(
+                      (item) => item.name === agentName,
+                    );
+                    const providerId =
+                      agentInfo?.last_config_selection?.type === "api_provider"
+                        ? String(agentInfo.last_config_selection.id || "").trim()
+                        : "";
+                    if (!providerId) {
+                      throw new Error(
+                        "Select a valid API provider in Agent Config, then retry to migrate this session.",
+                      );
+                    }
+                    const migrated = await sessionService.migrateSessionProvider(
+                      root,
+                      key,
+                      {
+                        agent: agentName || undefined,
+                        provider_id: providerId,
+                        model:
+                          String(
+                            (pending as any)?.model ||
+                              selectedSessionRef.current?.model ||
+                              "",
+                          ).trim() || undefined,
+                      },
+                    );
+                    if (!migrated) {
+                      throw new Error("session provider migration failed");
+                    }
+                    const select = handleSelectSessionRef.current;
+                    if (select) {
+                      await select({
+                        ...migrated,
+                        root_id: root,
+                        key: migrated.key || (migrated as any).session_key,
+                        session_key: migrated.key || (migrated as any).session_key,
+                      });
+                    }
+                  }
+                : undefined,
+              details: {
+                rootId: errRootId,
+                sessionKey: errSessionKey,
+                requestId: requestId || null,
+              },
+            });
           }
-          console.warn("[session/ws] error", { requestId, rootId: pending.rootId, sessionKey: pending.sessionKey || null, tempKey: pending.tempKey || null });
-          delete pendingRequestRef.current[requestId];
-          const targetKey = pending.tempKey || "";
-          const failedKey = pending.sessionKey || targetKey;
-          const rootID = pending.rootId;
-          if (failedKey) {
-            setMultiProjectSessionPending(rootID, failedKey, false);
+          {
+            const errRoot = payloadRootId || pending?.rootId || currentRootIdRef.current || "";
+            const errKey = payloadSessionKey || pending?.sessionKey || "";
+            if (errRoot && errKey && !isCanceledSessionError(errorMessage)) {
+              const cacheKey = rootSessionKey(errRoot, errKey);
+              const recoverable =
+                typeof (payload as any)?.recoverable === "boolean"
+                  ? Boolean((payload as any).recoverable)
+                  : /peer disconnected|stream disconnected|504|timeout|connection/i.test(
+                      errorMessage,
+                    );
+              const optimistic = {
+                id: requestId || `err-${Date.now()}`,
+                session_key: errKey,
+                request_id: requestId || "",
+                after_message_id: requestId || "",
+                after_seq: 0,
+                message: errorMessage,
+                code: "session.message_failed",
+                kind: "turn",
+                recoverable,
+                timestamp: new Date().toISOString(),
+              };
+              const prevErrors = Array.isArray((sessionCacheRef.current[cacheKey] as any)?.errors)
+                ? ([...(sessionCacheRef.current[cacheKey] as any).errors] as any[])
+                : Array.isArray((selectedSessionRef.current as any)?.errors) &&
+                    (selectedSessionRef.current?.key === errKey ||
+                      (selectedSessionRef.current as any)?.session_key === errKey)
+                  ? ([...(selectedSessionRef.current as any).errors] as any[])
+                  : [];
+              const nextErrors = [
+                ...prevErrors.filter(
+                  (e) => e?.id !== optimistic.id && e?.request_id !== optimistic.request_id,
+                ),
+                optimistic,
+              ].slice(-100);
+              const cached = sessionCacheRef.current[cacheKey];
+              sessionCacheRef.current[cacheKey] = {
+                ...(cached && typeof cached === "object" ? cached : { key: errKey, session_key: errKey, root_id: errRoot }),
+                errors: nextErrors,
+              } as any;
+              const latestDrawer = drawerSessionByRootRef.current[errRoot];
+              if (latestDrawer && (latestDrawer.key === errKey || (latestDrawer as any).session_key === errKey)) {
+                setDrawerSessionForRoot(errRoot, { ...(latestDrawer as any), errors: nextErrors } as Session);
+              }
+              setSelectedSession((prev) => {
+                const prevKey = prev?.key || prev?.session_key;
+                if (!prev || prevKey !== errKey) return prev;
+                return { ...(prev as any), errors: nextErrors } as SessionItem;
+              });
+              bumpCacheVersion();
+              void sessionService.getSessionErrors(errRoot, errKey).then((serverErrors) => {
+                // Prefer server list; keep optimistic only while a turn may still
+                // be racing durable append. Empty server list is authoritative when
+                // no in-flight turn remains.
+                if (serverErrors == null) return;
+                const hasInFlightTurn = !!pendingBySessionRef.current[cacheKey];
+                const merged = mergeSessionErrorLists(serverErrors, nextErrors, {
+                  hasInFlightTurn,
+                });
+                if (sessionCacheRef.current[cacheKey]) {
+                  sessionCacheRef.current[cacheKey] = {
+                    ...(sessionCacheRef.current[cacheKey] as any),
+                    errors: merged,
+                  } as any;
+                }
+                const drawer = drawerSessionByRootRef.current[errRoot];
+                if (drawer && (drawer.key === errKey || (drawer as any).session_key === errKey)) {
+                  setDrawerSessionForRoot(errRoot, { ...(drawer as any), errors: merged } as Session);
+                }
+                setSelectedSession((prev) => {
+                  const prevKey = prev?.key || prev?.session_key;
+                  if (!prev || prevKey !== errKey) return prev;
+                  return { ...(prev as any), errors: merged } as SessionItem;
+                });
+                bumpCacheVersion();
+              });
+            }
           }
-          const latestDrawer = drawerSessionByRootRef.current[rootID];
-          if (targetKey && latestDrawer?.key === targetKey) {
-            const exchanges = Array.isArray((latestDrawer as any).exchanges)
-              ? ((latestDrawer as any).exchanges as Exchange[]).map(
-                  (exchange) =>
-                    exchange.pending_ack === true &&
-                    exchange.content === pending.message &&
-                    exchange.timestamp === pending.timestamp
+          if (requestId && pending) {
+            console.warn("[session/ws] error", {
+              requestId,
+              rootId: pending.rootId,
+              sessionKey: pending.sessionKey || null,
+              tempKey: pending.tempKey || null,
+              message: errorMessage,
+            });
+            delete pendingRequestRef.current[requestId];
+            const targetKey = pending.tempKey || "";
+            const failedKey = pending.sessionKey || targetKey || payloadSessionKey;
+            const rootID = pending.rootId || payloadRootId || currentRootIdRef.current || "";
+            if (failedKey && rootID) {
+              setMultiProjectSessionPending(rootID, failedKey, false);
+              handleSessionStreamDone(rootID, failedKey);
+              const cacheKey = rootSessionKey(rootID, failedKey);
+              const clearAck = <T,>(session: T): T => {
+                const exchanges = (session as any)?.exchanges;
+                if (!Array.isArray(exchanges)) {
+                  return session;
+                }
+                return {
+                  ...(session as any),
+                  pending: false,
+                  exchanges: exchanges.map((exchange: any) =>
+                    exchange?.pending_ack === true &&
+                    (!pending.message || exchange.content === pending.message)
                       ? { ...exchange, pending_ack: false }
                       : exchange,
-                )
-              : [];
-            setDrawerSessionForRoot(rootID, {
-              ...(latestDrawer as any),
-              pending: false,
-              exchanges,
-            } as Session);
+                  ),
+                } as T;
+              };
+              if (sessionCacheRef.current[cacheKey]) {
+                sessionCacheRef.current[cacheKey] = clearAck(sessionCacheRef.current[cacheKey]);
+              }
+              const latestDrawer = drawerSessionByRootRef.current[rootID];
+              if (latestDrawer && (latestDrawer.key === failedKey || latestDrawer.key === targetKey)) {
+                setDrawerSessionForRoot(rootID, clearAck(latestDrawer) as Session);
+              }
+              setSelectedSession((prev) => {
+                const prevKey = prev?.key || prev?.session_key;
+                if (!prev || prevKey !== failedKey) {
+                  return prev;
+                }
+                return clearAck(prev) as SessionItem;
+              });
+              setSessions((prev) =>
+                prev.map((item) => {
+                  const itemKey = item.key || item.session_key;
+                  if (itemKey !== failedKey) {
+                    return item;
+                  }
+                  return clearAck(item) as SessionItem;
+                }),
+              );
+              bumpCacheVersion();
+            }
+          } else if (payloadRootId && payloadSessionKey) {
+            console.warn("[session/ws] error_without_pending", {
+              requestId,
+              payloadSessionKey,
+              message: errorMessage,
+            });
+            // Common path: session.accepted already deleted pendingRequestRef, but
+            // we still must clear generating/pending_ack for this session.
+            setMultiProjectSessionPending(payloadRootId, payloadSessionKey, false);
+            handleSessionStreamDone(payloadRootId, payloadSessionKey);
+            const cacheKey = rootSessionKey(payloadRootId, payloadSessionKey);
+            const clearAnyAck = <T,>(session: T): T => {
+              const exchanges = (session as any)?.exchanges;
+              if (!Array.isArray(exchanges)) {
+                return { ...(session as any), pending: false } as T;
+              }
+              return {
+                ...(session as any),
+                pending: false,
+                exchanges: exchanges.map((exchange: any) =>
+                  exchange?.pending_ack === true
+                    ? { ...exchange, pending_ack: false }
+                    : exchange,
+                ),
+              } as T;
+            };
+            if (sessionCacheRef.current[cacheKey]) {
+              sessionCacheRef.current[cacheKey] = clearAnyAck(sessionCacheRef.current[cacheKey]);
+            }
+            const latestDrawer = drawerSessionByRootRef.current[payloadRootId];
+            if (latestDrawer && (latestDrawer.key === payloadSessionKey)) {
+              setDrawerSessionForRoot(payloadRootId, clearAnyAck(latestDrawer) as Session);
+            }
+            setSelectedSession((prev) => {
+              const prevKey = prev?.key || prev?.session_key;
+              if (!prev || prevKey !== payloadSessionKey) return prev;
+              return clearAnyAck(prev) as SessionItem;
+            });
+            setSessions((prev) =>
+              prev.map((item) => {
+                const itemKey = item.key || item.session_key;
+                if (itemKey !== payloadSessionKey) return item;
+                return clearAnyAck(item) as SessionItem;
+              }),
+            );
+            bumpCacheVersion();
+          } else {
+            console.warn("[session/ws] error_without_pending", {
+              requestId,
+              payloadSessionKey,
+              message: errorMessage,
+            });
+          }
+          {
+            const skipKey =
+              (pending?.sessionKey || pending?.tempKey || payloadSessionKey || "").trim();
+            const skipRoot =
+              (pending?.rootId || payloadRootId || currentRootIdRef.current || "").trim();
+            if (skipKey && skipRoot) {
+              skipCompletionSoundBySessionRef.current[rootSessionKey(skipRoot, skipKey)] = true;
+            }
           }
           break;
         }
@@ -9552,7 +10089,11 @@ export function App({ onGoHome }: AppProps) {
                 currentRootIdRef.current ||
                 "";
           if (rootID && sessionKey) {
-            if (payload?.replay !== true) {
+            const doneCacheKey = rootSessionKey(rootID, sessionKey);
+            const skipSound = !!skipCompletionSoundBySessionRef.current[doneCacheKey];
+            if (skipSound) {
+              delete skipCompletionSoundBySessionRef.current[doneCacheKey];
+            } else if (payload?.replay !== true) {
               playCompletionSound();
             }
             setMultiProjectSessionPending(rootID, sessionKey, false);
@@ -9916,6 +10457,94 @@ export function App({ onGoHome }: AppProps) {
         case "file.changed":
           handleFileChanged(payload);
           break;
+        case "session.runtime.changed": {
+          const rtRoot =
+            typeof payload?.root_id === "string" ? payload.root_id : currentRootIdRef.current || "";
+          const rtKey = typeof payload?.session_key === "string" ? payload.session_key : "";
+          const rtAgent = typeof payload?.agent === "string" ? payload.agent.trim() : "";
+          const rtState = typeof payload?.state === "string" ? payload.state.trim() : "";
+          const rtSid =
+            typeof payload?.agent_session_id === "string" ? payload.agent_session_id : "";
+          const rtMessage = typeof payload?.message === "string" ? payload.message.trim() : "";
+          if (!rtRoot || !rtKey || !rtAgent || !rtState) {
+            break;
+          }
+          const runtimeInfo = {
+            agent: rtAgent,
+            state: rtState,
+            agent_session_id: rtSid || undefined,
+            message: rtMessage || undefined,
+          };
+          const cacheKey = rootSessionKey(rtRoot, rtKey);
+          const applyRuntime = (sess: any) => {
+            if (!sess) return sess;
+            const prevRuntimes = Array.isArray(sess.runtimes) ? [...sess.runtimes] : [];
+            const without = prevRuntimes.filter(
+              (item) => String(item?.agent || "").toLowerCase() !== rtAgent.toLowerCase(),
+            );
+            const nextRuntimes =
+              rtState === "disconnected"
+                ? without
+                : [...without, runtimeInfo];
+            return {
+              ...sess,
+              agent: rtState === "connected" || rtState === "opening" ? rtAgent : sess.agent,
+              runtime:
+                rtState === "disconnected"
+                  ? nextRuntimes[nextRuntimes.length - 1] || {
+                      agent: rtAgent,
+                      state: "disconnected",
+                    }
+                  : runtimeInfo,
+              runtimes: nextRuntimes,
+            };
+          };
+          if (sessionCacheRef.current[cacheKey]) {
+            sessionCacheRef.current[cacheKey] = applyRuntime(sessionCacheRef.current[cacheKey]);
+          }
+          const latestDrawer = drawerSessionByRootRef.current[rtRoot];
+          if (
+            latestDrawer &&
+            (latestDrawer.key === rtKey || (latestDrawer as any).session_key === rtKey)
+          ) {
+            setDrawerSessionForRoot(rtRoot, applyRuntime(latestDrawer));
+          }
+          setSelectedSession((prev) => {
+            const prevKey = prev?.key || prev?.session_key;
+            if (!prev || prevKey !== rtKey) return prev;
+            return applyRuntime(prev) as SessionItem;
+          });
+          setCurrentSession((prev) => {
+            const prevKey = prev?.key || prev?.session_key;
+            if (!prev || prevKey !== rtKey) return prev;
+            return applyRuntime(prev) as SessionItem;
+          });
+          bumpCacheVersion();
+
+          const activeKey =
+            selectedSessionRef.current?.key ||
+            selectedSessionRef.current?.session_key ||
+            currentSessionRef.current?.key ||
+            currentSessionRef.current?.session_key ||
+            "";
+          if (activeKey && activeKey === rtKey) {
+            // Keep runtime status in the ActionBar indicator. Only toast real
+            // disconnects that carry a message (skip settings reopen churn).
+            // Open failures already emit session.error (avoid double toast).
+            if (rtState === "disconnected" && rtMessage) {
+              reportError(
+                "network.disconnected",
+                rtMessage || t("session.runtime.disconnected", { agent: rtAgent }),
+                {
+                  severity: "warning",
+                  recoverable: true,
+                  details: { agent: rtAgent, rootId: rtRoot, sessionKey: rtKey, state: "disconnected" },
+                },
+              );
+            }
+          }
+          break;
+        }
         case "agent.status.changed":
           setAgentsVersion((v) => v + 1);
           break;
@@ -13582,6 +14211,11 @@ export function App({ onGoHome }: AppProps) {
             selectedDirKey={selectedDirKey}
             selectedPath={file?.path}
             rootId={currentRootId}
+            rootPaths={Object.fromEntries(
+              Object.entries(managedRootByIdRef.current)
+                .filter(([, root]) => !!root.root_path)
+                .map(([id, root]) => [id, root.root_path as string]),
+            )}
             rootSessionIndicators={rootSessionIndicators}
             creatingRootName={
               creatingRootKind === "worktree" ? null : creatingRootName
@@ -13649,6 +14283,7 @@ export function App({ onGoHome }: AppProps) {
             multiProjectSessionsEnabled={multiProjectSessionsEnabled}
             onMultiProjectSessionsChange={setMultiProjectSessionsEnabled}
             onRunAgentLifecycleCommand={handleRunAgentLifecycleCommand}
+            onAgentsChanged={() => setAgentsVersion((v) => v + 1)}
             onGoHome={onGoHome}
           />
         }
@@ -13724,6 +14359,61 @@ export function App({ onGoHome }: AppProps) {
             <ActionBar
               status={status}
               agentsVersion={agentsVersion}
+              onRuntimeReconnect={async (targetAgent) => {
+                const root = currentRootIdRef.current || "";
+                // Prefer the ActionBar-bound session (drawer may differ from main select).
+                const key =
+                  (actionBarSession as any)?.key ||
+                  (actionBarSession as any)?.session_key ||
+                  selectedSessionRef.current?.key ||
+                  selectedSessionRef.current?.session_key ||
+                  "";
+                try {
+                  const { restartAgent } = await import("./services/agents");
+                  await restartAgent(targetAgent);
+                } catch (err) {
+                  console.warn("[runtime/reconnect] restart failed", err);
+                }
+                setAgentsVersion((v) => v + 1);
+                // Process restart is not a session open. Mark disconnected (not opening)
+                // and fan out to cache/selected/drawer so GET/sync cannot rehydrate stale
+                // "connected" from an old cache entry.
+                if (root && key) {
+                  const cacheKey = rootSessionKey(root, key);
+                  delete pendingBySessionRef.current[cacheKey];
+                  const runtime = {
+                    agent: targetAgent,
+                    state: "disconnected",
+                    message: "agent process restarted; next message will reconnect",
+                  };
+                  const cached = sessionCacheRef.current[cacheKey];
+                  if (cached && typeof cached === "object") {
+                    sessionCacheRef.current[cacheKey] = {
+                      ...(cached as any),
+                      pending: false,
+                      runtime,
+                    } as any;
+                  }
+                  setSelectedSession((prev) =>
+                    prev && (prev.key === key || prev.session_key === key)
+                      ? ({
+                          ...(prev as any),
+                          pending: false,
+                          runtime,
+                        } as SessionItem)
+                      : prev,
+                  );
+                  const drawer = drawerSessionByRootRef.current[root];
+                  if (drawer && (drawer.key === key || (drawer as any).session_key === key)) {
+                    setDrawerSessionForRoot(root, {
+                      ...(drawer as any),
+                      pending: false,
+                      runtime,
+                    } as any);
+                  }
+                  bumpCacheVersion();
+                }
+              }}
               currentRootId={currentRootId}
               currentSession={actionBarSession}
               pendingPlanMode={pendingPlanMode}

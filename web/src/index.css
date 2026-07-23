@@ -303,14 +303,6 @@ html {
 :root[data-theme="meadow"] a { color: #2d5a32; }
 :root[data-theme="meadow"] a:hover { color: #3a6b3f; }
 
-:root[data-theme="meadow"] .mindfs-sidebar-resize-rail::before {
-  background: linear-gradient(transparent, rgba(40, 80, 45, 0.08) 12%, rgba(40, 80, 45, 0.55), rgba(40, 80, 45, 0.08) 88%, transparent);
-  box-shadow: 0 0 16px rgba(40, 80, 45, 0.22);
-}
-:root[data-theme="meadow"] .mindfs-sidebar-resize-rail:focus-visible::before {
-  background: linear-gradient(transparent, rgba(40, 80, 45, 0.12) 12%, rgba(40, 80, 45, 0.7), rgba(40, 80, 45, 0.12) 88%, transparent);
-}
-
 :root[data-theme="meadow"] pre[class*="language-"],
 :root[data-theme="meadow"] code[class*="language-"] {
   box-shadow: none !important;
@@ -405,14 +397,6 @@ html {
 :root[data-theme="moss"] a { color: #415b3f; }
 :root[data-theme="moss"] a:hover { color: #344a33; }
 
-:root[data-theme="moss"] .mindfs-sidebar-resize-rail::before {
-  background: linear-gradient(transparent, rgba(65, 91, 63, 0.08) 12%, rgba(65, 91, 63, 0.55), rgba(65, 91, 63, 0.08) 88%, transparent);
-  box-shadow: 0 0 16px rgba(65, 91, 63, 0.22);
-}
-:root[data-theme="moss"] .mindfs-sidebar-resize-rail:focus-visible::before {
-  background: linear-gradient(transparent, rgba(65, 91, 63, 0.12) 12%, rgba(65, 91, 63, 0.7), rgba(65, 91, 63, 0.12) 88%, transparent);
-}
-
 :root[data-theme="moss"] pre[class*="language-"],
 :root[data-theme="moss"] code[class*="language-"] {
   box-shadow: none !important;
@@ -445,7 +429,7 @@ html {
   position: absolute;
   top: 50%;
   width: 12px;
-  height: 88px;
+  height: 44px;
   padding: 0;
   border: 0;
   background: transparent;
@@ -459,35 +443,30 @@ html {
 .mindfs-sidebar-resize-rail::before {
   content: "";
   position: absolute;
-  top: 8px;
-  bottom: 8px;
+  top: 4px;
+  bottom: 4px;
   left: 50%;
-  width: 4px;
+  width: 3px;
   border-radius: 999px;
-  background:
-    linear-gradient(
-      180deg,
-      transparent 0%,
-      rgba(148, 163, 184, 0.22) 12%,
-      rgba(148, 163, 184, 0.72) 50%,
-      rgba(148, 163, 184, 0.22) 88%,
-      transparent 100%
-    );
-  box-shadow: 0 0 10px rgba(148, 163, 184, 0.08);
-  opacity: 0.72;
-  transform: translateX(-50%) scaleY(0.88);
+  background: var(--text-secondary);
+  box-shadow: none;
+  opacity: 0.56;
+  transform: translateX(-50%) scaleY(0.9);
   transition:
     opacity 0.16s ease,
     transform 0.16s ease,
-    box-shadow 0.16s ease;
+    box-shadow 0.16s ease,
+    background 0.16s ease;
 }
 
 .mindfs-sidebar-resize-rail:hover::before,
-.mindfs-sidebar-resize-rail:focus-visible::before {
-  opacity: 1;
-  width: 5px;
-  transform: translateX(-50%) scaleY(1.06);
-  box-shadow: 0 0 16px rgba(148, 163, 184, 0.22);
+.mindfs-sidebar-resize-rail:focus-visible::before,
+.mindfs-sidebar-resize-rail.is-preview::before {
+  width: 4px;
+  background: color-mix(in srgb, var(--accent-color) 72%, var(--text-secondary));
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent-color) 14%, transparent);
+  opacity: 0.82;
+  transform: translateX(-50%) scaleY(1);
 }
 
 .mindfs-sidebar-resize-rail--left.is-open::before {
@@ -504,6 +483,30 @@ html {
 
 .mindfs-sidebar-resize-rail--right.is-closed::before {
   left: 9px;
+}
+
+.mindfs-sidebar-resize-guide {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  z-index: 119;
+  pointer-events: none;
+  background: color-mix(in srgb, var(--accent-color) 72%, var(--text-secondary));
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent-color) 14%, transparent);
+  opacity: 0;
+  transition: opacity 80ms ease;
+}
+
+.mindfs-sidebar-resize-shade {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  z-index: 118;
+  pointer-events: none;
+  background: color-mix(in srgb, var(--accent-color) 10%, transparent);
+  opacity: 0;
+  transition: opacity 80ms ease;
 }
 
 .token.operator,

@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -37,7 +38,7 @@ func TestShellCommandUsesConfiguredArgs(t *testing.T) {
 	if shell != fallback {
 		t.Fatalf("shell = %q, want %q", shell, fallback)
 	}
-	if len(args) != 2 || args[0] != "-custom" || args[1] != "echo ok" {
+	if len(args) != 2 || args[0] != "-custom" || !strings.HasSuffix(args[1], "echo ok") {
 		t.Fatalf("args = %#v, want configured args plus command", args)
 	}
 }
@@ -88,7 +89,7 @@ func TestLongShellBootstrapDisablesUserHistory(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.shell, func(t *testing.T) {
-			bootstrap := longShellBootstrap(tt.shell)
+			bootstrap := longShellBootstrapForOS(tt.shell, "linux")
 			for _, want := range tt.want {
 				if !strings.Contains(bootstrap, want) {
 					t.Fatalf("bootstrap for %s does not contain %q: %q", tt.shell, want, bootstrap)
@@ -108,6 +109,9 @@ func TestLongShellBootstrapDisablesPowerShellHistory(t *testing.T) {
 }
 
 func TestLongShellEnvOverridesHistoryFile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix shell history environment is not used on Windows")
+	}
 	env := longShellEnv([]string{"HISTFILE=/tmp/user-history"}, "zsh")
 	if got := lastEnvValue(env, "HISTFILE"); got != "/dev/null" {
 		t.Fatalf("HISTFILE = %q, want /dev/null", got)
@@ -172,6 +176,9 @@ func TestLongShellDoesNotFeedControlScriptToCommandStdin(t *testing.T) {
 }
 
 func TestLongShellEvalKeepsShellState(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows uses the one-shot shell fallback")
+	}
 	if _, err := exec.LookPath("sh"); err != nil {
 		t.Skip("sh not available")
 	}

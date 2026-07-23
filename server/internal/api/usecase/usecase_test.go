@@ -15,6 +15,7 @@ import (
 
 	"mindfs/server/internal/agent"
 	agenttypes "mindfs/server/internal/agent/types"
+	"mindfs/server/internal/commandexec"
 	rootfs "mindfs/server/internal/fs"
 	"mindfs/server/internal/preferences"
 	"mindfs/server/internal/session"
@@ -201,7 +202,7 @@ func TestGetGitDiffUsesRepoPath(t *testing.T) {
 func TestSendCommandMessagePersistsFinalToolCallAndSuggestion(t *testing.T) {
 	rootDir := t.TempDir()
 	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
-	manager := session.NewManager(root)
+	manager := newTestSessionManager(t, root)
 	registry := &commandTestRegistry{root: root, manager: manager}
 	service := Service{Registry: registry}
 
@@ -212,6 +213,7 @@ func TestSendCommandMessagePersistsFinalToolCallAndSuggestion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create command session: %v", err)
 	}
+	t.Cleanup(func() { commandexec.CloseSession(root.ID, created.Key) })
 
 	var sawStart, sawFinal, sawDone bool
 	err = service.SendMessage(context.Background(), SendMessageInput{
@@ -279,8 +281,8 @@ func TestSearchSessionsMultiRootIncludesRootIDs(t *testing.T) {
 	ctx := context.Background()
 	rootA := rootfs.NewRootInfo("root-a", "Root A", t.TempDir())
 	rootB := rootfs.NewRootInfo("root-b", "Root B", t.TempDir())
-	managerA := session.NewManager(rootA)
-	managerB := session.NewManager(rootB)
+	managerA := newTestSessionManager(t, rootA)
+	managerB := newTestSessionManager(t, rootB)
 	registry := &multiRootSearchTestRegistry{
 		roots:    []rootfs.RootInfo{rootA, rootB},
 		managers: map[string]*session.Manager{rootA.ID: managerA, rootB.ID: managerB},
@@ -322,8 +324,8 @@ func TestSearchSessionsMultiRootAppliesGlobalLimit(t *testing.T) {
 	ctx := context.Background()
 	rootA := rootfs.NewRootInfo("root-a", "Root A", t.TempDir())
 	rootB := rootfs.NewRootInfo("root-b", "Root B", t.TempDir())
-	managerA := session.NewManager(rootA)
-	managerB := session.NewManager(rootB)
+	managerA := newTestSessionManager(t, rootA)
+	managerB := newTestSessionManager(t, rootB)
 	registry := &multiRootSearchTestRegistry{
 		roots:    []rootfs.RootInfo{rootA, rootB},
 		managers: map[string]*session.Manager{rootA.ID: managerA, rootB.ID: managerB},
@@ -356,7 +358,7 @@ func TestSearchSessionsMultiRootAppliesGlobalLimit(t *testing.T) {
 func TestSendCommandMessagePersistsCancelledSuggestion(t *testing.T) {
 	rootDir := t.TempDir()
 	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
-	manager := session.NewManager(root)
+	manager := newTestSessionManager(t, root)
 	registry := &commandTestRegistry{root: root, manager: manager}
 	service := Service{Registry: registry}
 
@@ -412,7 +414,7 @@ func TestDeleteSessionDeletesSubSessionTree(t *testing.T) {
 	ctx := context.Background()
 	rootDir := t.TempDir()
 	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
-	manager := session.NewManager(root)
+	manager := newTestSessionManager(t, root)
 	registry := &commandTestRegistry{root: root, manager: manager}
 	service := Service{Registry: registry}
 
@@ -450,7 +452,7 @@ func TestSubSessionSyntheticDonePersistsPartialResponse(t *testing.T) {
 	ctx := context.Background()
 	rootDir := t.TempDir()
 	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
-	manager := session.NewManager(root)
+	manager := newTestSessionManager(t, root)
 	child, err := manager.Create(ctx, session.CreateInput{Type: session.TypeChat, Agent: "codex", Name: "child"})
 	if err != nil {
 		t.Fatalf("create child: %v", err)
@@ -493,7 +495,7 @@ func TestClaudeSubagentRouterCreatesChildSessionAndRoutesChunks(t *testing.T) {
 	ctx := context.Background()
 	rootDir := t.TempDir()
 	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
-	manager := session.NewManager(root)
+	manager := newTestSessionManager(t, root)
 	parent, err := manager.Create(ctx, session.CreateInput{Type: session.TypeChat, Agent: "claude", Name: "parent"})
 	if err != nil {
 		t.Fatalf("create parent: %v", err)
@@ -577,7 +579,7 @@ func TestClaudeSubagentRouterDoesNotCreateChildFromTaskIDOnly(t *testing.T) {
 	ctx := context.Background()
 	rootDir := t.TempDir()
 	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
-	manager := session.NewManager(root)
+	manager := newTestSessionManager(t, root)
 	parent, err := manager.Create(ctx, session.CreateInput{Type: session.TypeChat, Agent: "claude", Name: "parent"})
 	if err != nil {
 		t.Fatalf("create parent: %v", err)
@@ -640,7 +642,7 @@ func TestClaudeSubagentRouterRoutesTaskNotificationSummaryAndKeepsParentUpdate(t
 	ctx := context.Background()
 	rootDir := t.TempDir()
 	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
-	manager := session.NewManager(root)
+	manager := newTestSessionManager(t, root)
 	parent, err := manager.Create(ctx, session.CreateInput{Type: session.TypeChat, Agent: "claude", Name: "parent"})
 	if err != nil {
 		t.Fatalf("create parent: %v", err)
@@ -915,7 +917,7 @@ func TestSendCommandMessageUsesLongShellPerSession(t *testing.T) {
 		t.Fatalf("mkdir nested: %v", err)
 	}
 	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
-	manager := session.NewManager(root)
+	manager := newTestSessionManager(t, root)
 	registry := &commandTestRegistry{root: root, manager: manager}
 	service := Service{Registry: registry}
 
@@ -976,7 +978,7 @@ func sendCommandAndFinal(t *testing.T, service Service, rootID, sessionKey, comm
 func TestSearchCommandCandidatesMergesMindFSAndShellHistory(t *testing.T) {
 	rootDir := t.TempDir()
 	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
-	manager := session.NewManager(root)
+	manager := newTestSessionManager(t, root)
 	if err := UpsertCommandSuggestion(manager, CommandSuggestion{
 		Command:      "git status",
 		Cwd:          ".",
@@ -1009,7 +1011,7 @@ func TestSearchCommandCandidatesMergesMindFSAndShellHistory(t *testing.T) {
 func TestSearchCommandCandidatesCleansMindFSControlHistory(t *testing.T) {
 	rootDir := t.TempDir()
 	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
-	manager := session.NewManager(root)
+	manager := newTestSessionManager(t, root)
 	historyFile := filepath.Join(rootDir, "zsh_history")
 	history := strings.Join([]string{
 		": 1710000000:0;command printf '\\n%s\\n' '__MINDFS_CMD_START_abc__'",
@@ -1161,8 +1163,7 @@ func TestRenameManagedDirRollsBackDirectoryWhenRegistryFails(t *testing.T) {
 }
 
 func TestSkillCandidateProviderSearch(t *testing.T) {
-	homeDir := t.TempDir()
-	t.Setenv("HOME", homeDir)
+	homeDir := setTestHomeDir(t)
 	rootDir := t.TempDir()
 	mustWriteFile(t, filepath.Join(homeDir, ".codex", "skills", "status", "SKILL.md"), "---\nname: status\ndescription: Home status skill\n---\n")
 	mustWriteFile(t, filepath.Join(homeDir, ".agents", "skills", "review", "SKILL.md"), "---\nname: review\ndescription: Shared review skill\n---\n")
@@ -1197,8 +1198,7 @@ func TestSkillCandidateProviderSearch(t *testing.T) {
 }
 
 func TestSkillCandidateProviderSearchIncludesCodexPluginCacheSkills(t *testing.T) {
-	homeDir := t.TempDir()
-	t.Setenv("HOME", homeDir)
+	homeDir := setTestHomeDir(t)
 	rootDir := t.TempDir()
 	mustWriteFile(t, filepath.Join(homeDir, ".codex", "plugins", "cache", "openai-primary-runtime", "documents", "26.1.0", "skills", "documents", "SKILL.md"), "---\nname: documents\ndescription: Old documents skill\n---\n")
 	mustWriteFile(t, filepath.Join(homeDir, ".codex", "plugins", "cache", "openai-primary-runtime", "documents", "26.10.0", "skills", "documents", "SKILL.md"), "---\nname: documents\ndescription: Current documents skill\n---\n")
@@ -1223,8 +1223,7 @@ func TestSkillCandidateProviderSearchIncludesCodexPluginCacheSkills(t *testing.T
 }
 
 func TestSkillCandidateProviderSearchFollowsSymlinkedSkillDir(t *testing.T) {
-	homeDir := t.TempDir()
-	t.Setenv("HOME", homeDir)
+	homeDir := setTestHomeDir(t)
 	rootDir := t.TempDir()
 	ssotDir := t.TempDir()
 	targetDir := filepath.Join(ssotDir, "linked")
@@ -1255,8 +1254,7 @@ func TestSkillCandidateProviderSearchFollowsSymlinkedSkillDir(t *testing.T) {
 }
 
 func TestSkillCandidateProviderSearchExpandsNamespacedSkillBundle(t *testing.T) {
-	homeDir := t.TempDir()
-	t.Setenv("HOME", homeDir)
+	homeDir := setTestHomeDir(t)
 	rootDir := t.TempDir()
 	ssotDir := t.TempDir()
 	targetDir := filepath.Join(ssotDir, "aegis-skills")
@@ -1295,8 +1293,7 @@ func TestSkillCandidateProviderSearchExpandsNamespacedSkillBundle(t *testing.T) 
 }
 
 func TestSkillCandidateProviderSearchMatchesNamespacedChildName(t *testing.T) {
-	homeDir := t.TempDir()
-	t.Setenv("HOME", homeDir)
+	homeDir := setTestHomeDir(t)
 	rootDir := t.TempDir()
 	mustWriteFile(t, filepath.Join(homeDir, ".agents", "skills", "aegis", "brainstorming", "SKILL.md"), "---\nname: brainstorming\ndescription: Aegis brainstorm\n---\n")
 	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
@@ -1315,8 +1312,7 @@ func TestSkillCandidateProviderSearchMatchesNamespacedChildName(t *testing.T) {
 }
 
 func TestSkillCandidateProviderSearchSkipsNonDirectoryScanPath(t *testing.T) {
-	homeDir := t.TempDir()
-	t.Setenv("HOME", homeDir)
+	homeDir := setTestHomeDir(t)
 	rootDir := t.TempDir()
 	mustWriteFile(t, filepath.Join(homeDir, ".codex"), "not a directory")
 	mustWriteFile(t, filepath.Join(homeDir, ".agents", "skills", "review", "SKILL.md"), "---\nname: review\ndescription: Shared review skill\n---\n")
@@ -1480,7 +1476,7 @@ func TestPromptCandidateProviderSearchReturnsNewestFirst(t *testing.T) {
 func TestSwitchReadHintPathUsesRuntimeRoot(t *testing.T) {
 	rootDir := t.TempDir()
 	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
-	manager := session.NewManager(root)
+	manager := newTestSessionManager(t, root)
 	created, err := manager.Create(context.Background(), session.CreateInput{
 		Type: session.TypeChat,
 		Name: "Task",
@@ -1710,6 +1706,9 @@ func TestIsNonRecoverableAgentError(t *testing.T) {
 		{errors.New("remote compaction failed while compact_remote retried"), true},
 		{errors.New("usageLimitExceeded"), true},
 		{errors.New("responseTooManyFailedAttempts"), true},
+		{errors.New("agent peer disconnected"), false},
+		{errors.New("connection reset by peer"), false},
+		{errors.New("stream disconnected before completion: Upstream request failed"), false},
 		{errors.New("temporary websocket EOF"), false},
 		{context.Canceled, false},
 	}
@@ -1721,10 +1720,30 @@ func TestIsNonRecoverableAgentError(t *testing.T) {
 	}
 }
 
+func TestIsRecoverableTransportError(t *testing.T) {
+	testCases := []struct {
+		err  error
+		want bool
+	}{
+		{nil, false},
+		{errors.New("agent peer disconnected"), true},
+		{errors.New("connection reset by peer"), true},
+		{errors.New("stream disconnected before completion: Upstream request failed"), true},
+		{errors.New("websocket: close 1006"), true},
+		{errors.New("429 Too Many Requests"), false},
+	}
+
+	for _, tc := range testCases {
+		if got := isRecoverableTransportError(tc.err); got != tc.want {
+			t.Fatalf("isRecoverableTransportError(%v) = %v, want %v", tc.err, got, tc.want)
+		}
+	}
+}
+
 func TestRecoverAgentTurnStopsOnNonRecoverableError(t *testing.T) {
 	rootDir := t.TempDir()
 	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
-	manager := session.NewManager(root)
+	manager := newTestSessionManager(t, root)
 	current, err := manager.Create(context.Background(), session.CreateInput{
 		Type:  session.TypeChat,
 		Agent: "codex",
@@ -1746,7 +1765,7 @@ func TestRecoverAgentTurnStopsOnNonRecoverableError(t *testing.T) {
 		CurrentSession:    runtime,
 		Prompt:            "original prompt",
 		SawAssistantChunk: true,
-		SendWithAttachment: func(_ agenttypes.Session, content string) error {
+		SendWithAttachment: func(_ context.Context, _ agenttypes.Session, content string) error {
 			sent = append(sent, content)
 			return errors.New("codex turn failed: exceeded retry limit, last status: 429 Too Many Requests")
 		},
@@ -1762,10 +1781,106 @@ func TestRecoverAgentTurnStopsOnNonRecoverableError(t *testing.T) {
 	}
 }
 
+func TestRecoverAgentTurnRetriesTransportFailureWithStatus(t *testing.T) {
+	rootDir := t.TempDir()
+	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
+	manager := newTestSessionManager(t, root)
+	current, err := manager.Create(context.Background(), session.CreateInput{Type: session.TypeChat, Agent: "claude", Name: "chat"})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	originalDelay := sessionRecoveryDelay
+	sessionRecoveryDelay = time.Millisecond
+	t.Cleanup(func() { sessionRecoveryDelay = originalDelay })
+	runtime := &fakeUsecaseAgentSession{id: "claude-thread"}
+	var sent, statuses []string
+	gotSess, err := (&Service{}).recoverAgentTurn(context.Background(), SendRecoveryInput{
+		RootID:         root.ID,
+		SessionKey:     current.Key,
+		Manager:        manager,
+		Current:        current,
+		AgentName:      "claude",
+		CurrentSession: runtime,
+		Prompt:         "original prompt",
+		SendWithAttachment: func(_ context.Context, _ agenttypes.Session, content string) error {
+			sent = append(sent, content)
+			if len(sent) == 1 {
+				return errors.New("peer disconnected")
+			}
+			return nil
+		},
+		OnUpdate: func(event agenttypes.Event) {
+			if status, ok := event.Data.(agenttypes.RecoveryStatus); ok {
+				statuses = append(statuses, status.Message)
+			}
+		},
+	})
+	if err != nil {
+		t.Fatalf("recoverAgentTurn returned error: %v", err)
+	}
+	if gotSess != runtime {
+		t.Fatalf("recoverAgentTurn session = %#v, want runtime", gotSess)
+	}
+	if got, want := len(sent), 2; got != want {
+		t.Fatalf("send attempts = %d, want %d", got, want)
+	}
+	if len(statuses) < 3 || !strings.Contains(statuses[0], "1/3") || !strings.Contains(statuses[1], "2/3") {
+		t.Fatalf("recovery statuses = %#v, want visible first and second attempt", statuses)
+	}
+}
+
+func TestRecoverAgentTurnStopsDuringRetryDelayWhenCanceled(t *testing.T) {
+	rootDir := t.TempDir()
+	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
+	manager := newTestSessionManager(t, root)
+	current, err := manager.Create(context.Background(), session.CreateInput{Type: session.TypeChat, Agent: "claude", Name: "chat"})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	originalDelay := sessionRecoveryDelay
+	sessionRecoveryDelay = time.Second
+	t.Cleanup(func() { sessionRecoveryDelay = originalDelay })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	attempted := make(chan struct{}, 1)
+	result := make(chan error, 1)
+	go func() {
+		_, err := (&Service{}).recoverAgentTurn(ctx, SendRecoveryInput{
+			RootID:         root.ID,
+			SessionKey:     current.Key,
+			Manager:        manager,
+			Current:        current,
+			AgentName:      "claude",
+			CurrentSession: &fakeUsecaseAgentSession{id: "claude-thread"},
+			Prompt:         "original prompt",
+			SendWithAttachment: func(context.Context, agenttypes.Session, string) error {
+				select {
+				case attempted <- struct{}{}:
+				default:
+				}
+				return errors.New("peer disconnected")
+			},
+		})
+		result <- err
+	}()
+	<-attempted
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("recoverAgentTurn error = %v, want context canceled", err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("recovery did not stop after cancellation")
+	}
+}
+
 func TestCancelRuntimeAfterNonRecoverableErrorClosesSession(t *testing.T) {
 	runtime := &fakeUsecaseAgentSession{id: "codex-thread"}
 
-	cancelRuntimeAfterNonRecoverableError(runtime, nil, "codex", errors.New("429 Too Many Requests"))
+	cancelRuntimeAfterNonRecoverableError(runtime, nil, "root", "sess-1", "codex", errors.New("429 Too Many Requests"))
 
 	if runtime.cancelCalls != 1 {
 		t.Fatalf("cancel calls = %d, want 1", runtime.cancelCalls)
@@ -1794,6 +1909,14 @@ func mustWriteFile(t *testing.T, path string, content string) {
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatalf("WriteFile(%q): %v", path, err)
 	}
+}
+
+func setTestHomeDir(t *testing.T) string {
+	t.Helper()
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	t.Setenv("USERPROFILE", homeDir)
+	return homeDir
 }
 
 func runUsecaseGit(t *testing.T, root string, args ...string) string {
@@ -1964,7 +2087,7 @@ func (s *fakeUsecaseAgentSession) emit(event agenttypes.Event) {
 func TestCancelSessionTurnCancelsTransientActiveTurn(t *testing.T) {
 	rootDir := t.TempDir()
 	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
-	manager := session.NewManager(root)
+	manager := newTestSessionManager(t, root)
 	service := Service{Registry: &commandTestRegistry{root: root, manager: manager}}
 	sessionKey := "transient-login-test"
 	turnCtx, cancel := context.WithCancel(context.Background())
@@ -1987,9 +2110,58 @@ func TestCancelSessionTurnCancelsTransientActiveTurn(t *testing.T) {
 	}
 }
 
+func TestActiveSessionTurnGenerationChangesForReplacementTurn(t *testing.T) {
+	rootID := "root"
+	sessionKey := "session"
+	registerActiveTurn(rootID, sessionKey, func() {})
+	defer unregisterActiveTurn(rootID, sessionKey)
+
+	first, ok := ActiveSessionTurnGeneration(rootID, sessionKey)
+	if !ok || first == 0 {
+		t.Fatalf("first active turn generation = %d, %v", first, ok)
+	}
+	registerActiveTurn(rootID, sessionKey, func() {})
+	second, ok := ActiveSessionTurnGeneration(rootID, sessionKey)
+	if !ok || second == first {
+		t.Fatalf("replacement active turn generation = %d, want distinct from %d", second, first)
+	}
+	if IsActiveSessionTurnGeneration(rootID, sessionKey, first) {
+		t.Fatal("stale generation must not match replacement turn")
+	}
+	if !IsActiveSessionTurnGeneration(rootID, sessionKey, second) {
+		t.Fatal("current generation must match replacement turn")
+	}
+}
+
+func TestForceCancelSessionTurnIfCurrentSkipsReplacementTurn(t *testing.T) {
+	rootID := "root"
+	sessionKey := "session"
+	firstCanceled := false
+	registerActiveTurn(rootID, sessionKey, func() { firstCanceled = true })
+	first, _ := ActiveSessionTurnGeneration(rootID, sessionKey)
+	secondCanceled := false
+	registerActiveTurn(rootID, sessionKey, func() { secondCanceled = true })
+	second, _ := ActiveSessionTurnGeneration(rootID, sessionKey)
+	defer unregisterActiveTurn(rootID, sessionKey)
+
+	if (&Service{}).ForceCancelSessionTurnIfCurrent(context.Background(), CancelSessionTurnInput{RootID: rootID, Key: sessionKey}, first) {
+		t.Fatal("stale watchdog generation must not cancel replacement turn")
+	}
+	if firstCanceled || secondCanceled {
+		t.Fatal("stale watchdog cancellation invoked a turn cancel function")
+	}
+	if !(&Service{}).ForceCancelSessionTurnIfCurrent(context.Background(), CancelSessionTurnInput{RootID: rootID, Key: sessionKey}, second) {
+		t.Fatal("current watchdog generation should cancel active turn")
+	}
+	if !secondCanceled {
+		t.Fatal("current watchdog did not invoke active turn cancel function")
+	}
+}
+
 type commandTestRegistry struct {
 	root    rootfs.RootInfo
 	manager *session.Manager
+	pool    *agent.Pool
 }
 
 func (r *commandTestRegistry) GetRoot(rootID string) (rootfs.RootInfo, error) {
@@ -2020,7 +2192,7 @@ func (r *commandTestRegistry) ListRoots() []rootfs.RootInfo {
 }
 
 func (r *commandTestRegistry) GetAgentPool() *agent.Pool {
-	return nil
+	return r.pool
 }
 
 func (r *commandTestRegistry) GetPreferences() *preferences.Store {
@@ -2183,3 +2355,161 @@ func (*renameManagedDirTestRegistry) GetFileWatcher(string, *session.Manager) (*
 }
 
 func (*renameManagedDirTestRegistry) ReleaseFileWatcher(string, string) {}
+
+
+func TestIsContextOverflowAgentError(t *testing.T) {
+	if !isContextOverflowAgentError(errors.New("Prompt is too long for the model context window")) {
+		t.Fatal("expected context overflow detection")
+	}
+	if isContextOverflowAgentError(errors.New("peer disconnected")) {
+		t.Fatal("transport error must not be context overflow")
+	}
+	if !supportsPromptCompactRetry("opencode") {
+		t.Fatal("opencode should support compact retry")
+	}
+}
+
+
+func TestContextOverflowRetryPrecedence(t *testing.T) {
+	err := errors.New("prompt is too long for the model context window")
+	if !isContextOverflowAgentError(err) {
+		t.Fatal("overflow classifier failed")
+	}
+	if !supportsPromptCompactRetry("opencode") {
+		t.Fatal("opencode should compact-retry")
+	}
+	// Compact path must be considered before giving up as non-recoverable terminal.
+	if !isNonRecoverableAgentError(err) {
+		t.Fatal("overflow remains terminal after failed compact")
+	}
+	if !shouldAttemptContextOverflowCompact(err, "opencode", false) {
+		t.Fatal("expected compact attempt for overflow on opencode")
+	}
+	// Mid-turn overflow (assistant chunks already streamed) still gets one compact retry.
+	if !shouldAttemptContextOverflowCompact(err, "opencode", true) {
+		t.Fatal("expected compact attempt even after assistant chunks")
+	}
+	if shouldAttemptContextOverflowCompact(err, "unknown-agent-xyz", false) {
+		t.Fatal("unknown agent must not compact-retry")
+	}
+	if shouldAttemptContextOverflowCompact(errors.New("peer disconnected"), "opencode", false) {
+		t.Fatal("transport errors must not compact-retry")
+	}
+}
+
+func TestRunContextOverflowCompactRetrySuccess(t *testing.T) {
+	var notices []agenttypes.CompactNotice
+	var steps []string
+	err := runContextOverflowCompactRetry(
+		context.Background(),
+		"original user prompt",
+		func() error {
+			steps = append(steps, "reopen")
+			return nil
+		},
+		func(_ context.Context, compactPrompt string) error {
+			steps = append(steps, "compact:"+compactPrompt[:8])
+			if !strings.HasPrefix(compactPrompt, "/compact") {
+				t.Fatalf("compact prompt = %q", compactPrompt)
+			}
+			return nil
+		},
+		func(_ context.Context, prompt string) error {
+			steps = append(steps, "retry:"+prompt)
+			return nil
+		},
+		func(notice agenttypes.CompactNotice) {
+			notices = append(notices, notice)
+		},
+	)
+	if err != nil {
+		t.Fatalf("compact retry: %v", err)
+	}
+	if len(steps) != 3 || steps[0] != "reopen" || !strings.HasPrefix(steps[1], "compact:") || steps[2] != "retry:original user prompt" {
+		t.Fatalf("steps = %#v", steps)
+	}
+	if len(notices) != 2 {
+		t.Fatalf("notices = %#v, want auto+complete", notices)
+	}
+	if notices[0].Status != "auto" || notices[1].Status != "complete" {
+		t.Fatalf("notice statuses = %q, %q", notices[0].Status, notices[1].Status)
+	}
+}
+
+func TestRunContextOverflowCompactRetryPersistsNoticesOnCompactFailure(t *testing.T) {
+	var notices []agenttypes.CompactNotice
+	err := runContextOverflowCompactRetry(
+		context.Background(),
+		"prompt",
+		func() error { return nil },
+		func(context.Context, string) error {
+			return errors.New("compact command rejected")
+		},
+		func(context.Context, string) error {
+			return nil // retry still succeeds after reopen
+		},
+		func(notice agenttypes.CompactNotice) {
+			notices = append(notices, notice)
+		},
+	)
+	if err != nil {
+		t.Fatalf("expected retry success after compact prompt failure: %v", err)
+	}
+	// Compact prompt failed → only the initial "auto" notice is emitted.
+	if len(notices) != 1 || notices[0].Status != "auto" {
+		t.Fatalf("notices = %#v", notices)
+	}
+}
+
+func TestRunContextOverflowCompactRetryFailure(t *testing.T) {
+	err := runContextOverflowCompactRetry(
+		context.Background(),
+		"prompt",
+		func() error { return nil },
+		func(context.Context, string) error { return nil },
+		func(context.Context, string) error {
+			return errors.New("prompt is too long for the model context window")
+		},
+		nil,
+	)
+	if err == nil {
+		t.Fatal("expected compact retry failure")
+	}
+	if !strings.Contains(err.Error(), "context overflow persists after compact retry") {
+		t.Fatalf("err = %v", err)
+	}
+	if !isContextOverflowAgentError(err) && !strings.Contains(strings.ToLower(err.Error()), "context overflow") {
+		t.Fatalf("failed retry should stay terminal overflow-ish: %v", err)
+	}
+}
+
+func TestDurableCompactNoticeShapeForPendingAux(t *testing.T) {
+	// Mirrors emitDurableCompact in SendMessage: compact notices are stored on
+	// ExchangeAux so GET/mid-turn refresh can replay them.
+	var aux []session.ExchangeAux
+	emit := func(notice agenttypes.CompactNotice) {
+		compactCopy := notice
+		aux = append(aux, session.ExchangeAux{
+			Seq:     2,
+			Line:    0,
+			Compact: &compactCopy,
+		})
+	}
+	_ = runContextOverflowCompactRetry(
+		context.Background(),
+		"hi",
+		func() error { return nil },
+		func(context.Context, string) error { return nil },
+		func(context.Context, string) error { return nil },
+		emit,
+	)
+	if len(aux) != 2 {
+		t.Fatalf("aux len=%d want 2", len(aux))
+	}
+	if aux[0].Compact == nil || aux[0].Compact.Status != "auto" {
+		t.Fatalf("aux[0]=%#v", aux[0])
+	}
+	if aux[1].Compact == nil || aux[1].Compact.Status != "complete" {
+		t.Fatalf("aux[1]=%#v", aux[1])
+	}
+}

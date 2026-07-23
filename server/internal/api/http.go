@@ -309,9 +309,11 @@ func (h *HTTPHandler) Routes() http.Handler {
 	r.Post("/api/sessions/import", h.protectedEndpoint(h.handleExternalSessionImport))
 	r.Post("/api/sessions/import/batch", h.protectedEndpoint(h.handleExternalSessionImportBatch))
 	r.Post("/api/sessions/fork", h.protectedEndpoint(h.handleSessionFork))
+	r.Post("/api/sessions/{key}/migrate-provider", h.protectedEndpoint(h.handleSessionMigrateProvider))
 	r.Get("/api/sessions/{key}/toolcalls/{callID}", h.protectedEndpoint(h.handleSessionToolCallGet))
 	r.Post("/api/sessions/{key}/sync", h.protectedEndpoint(h.handleSessionSync))
 	r.Get("/api/sessions/{key}", h.protectedEndpoint(h.handleSessionGet))
+	r.Get("/api/sessions/{key}/errors", h.protectedEndpoint(h.handleSessionErrorsGet))
 	r.Get("/api/sessions/{key}/related-files", h.protectedEndpoint(h.handleSessionRelatedFilesGet))
 	r.Post("/api/sessions/{key}/rename", h.protectedEndpoint(h.handleSessionRename))
 	r.Delete("/api/sessions/{key}/related-files", h.protectedEndpoint(h.handleSessionRelatedFilesDelete))
@@ -372,6 +374,7 @@ func (h *HTTPHandler) Routes() http.Handler {
 	r.Post("/api/agent-config/switch", h.protectedEndpoint(h.handleAgentConfigSwitch))
 	r.Get("/api/agent-api-providers", h.protectedEndpoint(h.handleAgentAPIProvidersList))
 	r.Post("/api/agent-api-providers", h.protectedEndpoint(h.handleAgentAPIProviderCreate))
+	r.Put("/api/agent-api-providers", h.protectedEndpoint(h.handleAgentAPIProviderUpdate))
 	r.Post("/api/agent-api-providers/sync", h.protectedEndpoint(h.handleAgentAPIProvidersSync))
 	r.Delete("/api/agent-api-providers", h.protectedEndpoint(h.handleAgentAPIProviderDelete))
 	r.Post("/api/agent-api-providers/switch", h.protectedEndpoint(h.handleAgentAPIProviderSwitch))
@@ -742,6 +745,43 @@ func (h *HTTPHandler) handleExternalSessionImportBatch(w http.ResponseWriter, r 
 	respondJSON(w, http.StatusOK, out)
 }
 
+
+func (h *HTTPHandler) handleSessionErrorsGet(w http.ResponseWriter, r *http.Request) {
+	rootID := r.URL.Query().Get("root")
+	key := chi.URLParam(r, "key")
+	if strings.TrimSpace(key) == "" {
+		respondError(w, http.StatusBadRequest, errInvalidRequest("session key required"))
+		return
+	}
+	if h.AppContext == nil {
+		respondError(w, http.StatusServiceUnavailable, errors.New("app context unavailable"))
+		return
+	}
+	manager, err := h.AppContext.GetSessionManager(rootID)
+	if err != nil {
+		respondError(w, http.StatusNotFound, err)
+		return
+	}
+	// Require the session to exist so callers do not confuse empty logs with
+	// "no such session" (ListSessionErrors returns [] for missing files).
+	if _, err := manager.Get(r.Context(), key, 0); err != nil {
+		respondError(w, http.StatusNotFound, err)
+		return
+	}
+	errorsList, err := manager.ListSessionErrors(r.Context(), key)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if errorsList == nil {
+		errorsList = []session.SessionError{}
+	}
+	respondJSON(w, http.StatusOK, map[string]any{
+		"session_key": key,
+		"errors":      errorsList,
+	})
+}
+
 func (h *HTTPHandler) handleSessionGet(w http.ResponseWriter, r *http.Request) {
 	rootID := r.URL.Query().Get("root")
 	key := chi.URLParam(r, "key")
@@ -757,7 +797,7 @@ func (h *HTTPHandler) handleSessionGet(w http.ResponseWriter, r *http.Request) {
 	uc := h.service()
 	var pendingUser *session.Exchange
 	if h.AppContext != nil {
-		pendingUser = h.AppContext.GetSessionStreamHub().GetPendingUserExchange(key)
+		pendingUser = h.AppContext.GetSessionStreamHub().GetPendingUserExchange(rootID, key)
 	}
 	if pendingUser == nil {
 		if _, err := uc.SyncExternalSessionDelta(r.Context(), usecase.SyncExternalSessionDeltaInput{
@@ -785,7 +825,60 @@ func (h *HTTPHandler) handleSessionGet(w http.ResponseWriter, r *http.Request) {
 		Key:    key,
 		Seq:    afterSeq,
 	})
-	respondJSON(w, http.StatusOK, h.sessionResponse(out, pendingUser, contextWindow, exchangeAux))
+	if exchangeAux == nil {
+		exchangeAux = map[int][]session.ExchangeAux{}
+	}
+	// Include durable pending turn progress (active goal/agent stream) so a
+	// session refresh mid-turn still shows partial agent output.
+	if h.AppContext != nil {
+		if manager, mErr := h.AppContext.GetSessionManager(rootID); mErr == nil && manager != nil {
+			if pending, pErr := manager.PeekPendingTurn(r.Context(), key); pErr == nil && pending != nil {
+				// Preserve chronological order: user then agent. Do not use the
+				// pendingUser helper for disk pending (it forces Seq=0 and appends last).
+				alreadyUser := false
+				alreadyAgent := false
+				for _, ex := range out.Exchanges {
+					if ex.Seq == pending.User.Seq && strings.EqualFold(ex.Role, "user") {
+						alreadyUser = true
+					}
+					if ex.Seq == pending.Agent.Seq && strings.EqualFold(ex.Role, "agent") {
+						alreadyAgent = true
+					}
+				}
+				if !alreadyUser && (strings.TrimSpace(pending.User.Content) != "" || pending.User.Seq > 0) {
+					userCopy := pending.User
+					out.Exchanges = append(append([]session.Exchange{}, out.Exchanges...), userCopy)
+				}
+				if !alreadyAgent && (strings.TrimSpace(pending.Agent.Content) != "" || len(pending.Aux) > 0) {
+					agentCopy := pending.Agent
+					out.Exchanges = append(append([]session.Exchange{}, out.Exchanges...), agentCopy)
+					if len(pending.Aux) > 0 {
+						exchangeAux[agentCopy.Seq] = append([]session.ExchangeAux{}, pending.Aux...)
+					}
+				}
+				// Avoid duplicating stream-hub pending user when disk pending has the user.
+				if pendingUser != nil && (strings.TrimSpace(pending.User.Content) != "" || pending.User.Seq > 0) {
+					pendingUser = nil
+				}
+			}
+		}
+	}
+	resp := h.sessionResponseWithBindings(r.Context(), rootID, key, out, pendingUser, contextWindow, exchangeAux)
+	// Always emit a boolean so clients can clear sticky local generating state.
+	// Omitting the field made serverPending === undefined on the web client.
+	pending := false
+	if h.AppContext != nil {
+		if manager, mErr := h.AppContext.GetSessionManager(rootID); mErr == nil && manager != nil {
+			if diskPending, pErr := manager.PeekPendingTurn(r.Context(), key); pErr == nil && diskPending != nil {
+				pending = true
+			}
+		}
+		if h.AppContext.GetSessionStreamHub().IsSessionReplying(rootID, key) {
+			pending = true
+		}
+	}
+	resp["pending"] = pending
+	respondJSON(w, http.StatusOK, resp)
 }
 
 func (h *HTTPHandler) handleSessionSync(w http.ResponseWriter, r *http.Request) {
@@ -827,7 +920,95 @@ func (h *HTTPHandler) handleSessionSync(w http.ResponseWriter, r *http.Request) 
 		Key:    key,
 		Seq:    afterSeq,
 	})
-	respondJSON(w, http.StatusOK, h.sessionResponse(out, nil, contextWindow, exchangeAux))
+	respondJSON(w, http.StatusOK, h.sessionResponseWithBindings(r.Context(), rootID, key, out, nil, contextWindow, exchangeAux))
+}
+
+func (h *HTTPHandler) sessionResponseWithBindings(ctx context.Context, rootID, key string, s *session.Session, pendingUser *session.Exchange, contextWindow agenttypes.ContextWindow, exchangeAux map[int][]session.ExchangeAux) map[string]any {
+	response := h.sessionResponse(s, pendingUser, contextWindow, exchangeAux)
+	if h != nil && h.AppContext != nil {
+		if manager, err := h.AppContext.GetSessionManager(rootID); err == nil && manager != nil {
+			if errors, listErr := manager.ListSessionErrors(ctx, key); listErr == nil {
+				response["errors"] = errors
+			}
+		}
+	}
+	if h == nil || h.AppContext == nil {
+		return response
+	}
+	manager, err := h.AppContext.GetSessionManager(rootID)
+	if err != nil {
+		return response
+	}
+	bindings, err := manager.ListAgentBindings(ctx, key)
+	if err != nil {
+		return response
+	}
+	public := make([]map[string]any, 0, len(bindings))
+	for _, binding := range bindings {
+		item := map[string]any{
+			"agent": binding.Agent,
+		}
+		if sid := strings.TrimSpace(binding.AgentSessionID); sid != "" {
+			item["agent_session_id"] = sid
+		}
+		// Non-secret provider binding fields for UI (no keys/base URLs).
+		if pid := strings.TrimSpace(binding.ProviderID); pid != "" {
+			item["provider_id"] = pid
+		}
+		if rev := strings.TrimSpace(binding.ProviderRevision); rev != "" {
+			item["provider_revision"] = rev
+		}
+		if proto := strings.TrimSpace(binding.ProviderProtocol); proto != "" {
+			item["provider_protocol"] = proto
+		}
+		if state := strings.TrimSpace(binding.ProviderState); state != "" {
+			item["provider_state"] = state
+		}
+		// Keep legacy rows that only have an agent session id, and new
+		// provider-bound rows even before a native session exists.
+		if len(item) > 1 {
+			public = append(public, item)
+		}
+	}
+	response["agent_bindings"] = public
+	if pool := h.AppContext.GetAgentPool(); pool != nil {
+		runtimes := pool.ListRuntimeInfoForMindFSSession(key, rootID)
+		if len(runtimes) > 0 {
+			items := make([]map[string]any, 0, len(runtimes))
+			for _, rt := range runtimes {
+				// Live pool entries are connected; opening/error are WS-only states.
+				// Do not invent "connected" for missing agent session ids that still
+				// have a process handle — surface agent name and optional session id.
+				item := map[string]any{
+					"agent": rt.AgentName,
+					"state": "connected",
+					"live":  true,
+				}
+				if strings.TrimSpace(rt.AgentSession) != "" {
+					item["agent_session_id"] = rt.AgentSession
+				} else {
+					// Handle exists but native session id not ready yet.
+					item["state"] = "opening"
+				}
+				items = append(items, item)
+			}
+			response["runtimes"] = items
+			// Prefer the session display agent when present among live runtimes.
+			preferred := ""
+			if s != nil {
+				preferred = strings.TrimSpace(session.InferAgentFromSession(s))
+			}
+			active := items[0]
+			for _, item := range items {
+				if preferred != "" && strings.EqualFold(strings.TrimSpace(fmt.Sprint(item["agent"])), preferred) {
+					active = item
+					break
+				}
+			}
+			response["runtime"] = active
+		}
+	}
+	return response
 }
 
 func (h *HTTPHandler) handleSessionToolCallGet(w http.ResponseWriter, r *http.Request) {
@@ -949,6 +1130,45 @@ func (h *HTTPHandler) handleSessionFork(w http.ResponseWriter, r *http.Request) 
 		"session":     h.sessionResponse(out.Session, nil, agenttypes.ContextWindow{}, nil),
 	})
 }
+
+func (h *HTTPHandler) handleSessionMigrateProvider(w http.ResponseWriter, r *http.Request) {
+	rootID := r.URL.Query().Get("root")
+	key := chi.URLParam(r, "key")
+	var req struct {
+		Agent      string `json:"agent"`
+		ProviderID string `json:"provider_id"`
+		Model      string `json:"model"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, errInvalidRequest("invalid json body"))
+		return
+	}
+	if strings.TrimSpace(req.ProviderID) == "" {
+		respondError(w, http.StatusBadRequest, errInvalidRequest("provider_id required"))
+		return
+	}
+	out, err := h.service().MigrateSessionProvider(r.Context(), usecase.MigrateSessionProviderInput{
+		RootID:     rootID,
+		Key:        key,
+		Agent:      req.Agent,
+		ProviderID: req.ProviderID,
+		Model:      req.Model,
+	})
+	if err != nil {
+		msg := err.Error()
+		status := http.StatusBadRequest
+		if strings.Contains(msg, "not found") || strings.Contains(msg, "session_provider_unavailable") {
+			status = http.StatusNotFound
+		}
+		respondError(w, status, err)
+		return
+	}
+	if h.AppContext != nil && out.Session != nil {
+		h.AppContext.BroadcastSessionMetaUpdated(rootID, out.Session)
+	}
+	respondJSON(w, http.StatusOK, h.sessionResponseWithBindings(r.Context(), rootID, out.Session.Key, out.Session, nil, agenttypes.ContextWindow{}, nil))
+}
+
 
 func (h *HTTPHandler) handleSessionRename(w http.ResponseWriter, r *http.Request) {
 	rootID := r.URL.Query().Get("root")

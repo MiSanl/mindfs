@@ -22,7 +22,8 @@ import { AgentMenuList } from "./AgentMenuList";
 import { AgentIcon } from "./AgentIcon";
 import { SymlinkBadge } from "./SymlinkBadge";
 import { RelayLocalServicesDialog } from "./RelayLocalServicesDialog";
-import { fetchAgentCatalog, fetchAgents, type AgentStatus } from "../services/agents";
+import { copyText } from "../services/clipboard";
+import { fetchAgentCatalog, fetchAgents, scheduleAgentsRefresh, type AgentStatus } from "../services/agents";
 import {
   createAgentAPIProvider,
   createAgentConfigBackup,
@@ -33,6 +34,7 @@ import {
   fetchAgentConfigDefaults,
   switchAgentAPIProvider,
   switchAgentConfig,
+  updateAgentAPIProvider,
   type AgentAPIProvider,
   type AgentConfigBackup,
 } from "../services/agentConfig";
@@ -120,6 +122,7 @@ type FileTreeProps = {
   selectedDirKey?: string | null;
   selectedPath?: string | null;
   rootId?: string | null;
+  rootPaths?: Record<string, string>;
   rootSessionIndicators?: Record<string, RootSessionIndicator>;
   fileMetas?: Record<string, FileMeta>;
   activeSessionKey?: string | null;
@@ -167,15 +170,16 @@ type FileTreeProps = {
   multiProjectSessionsEnabled?: boolean;
   onMultiProjectSessionsChange?: (enabled: boolean) => void;
   onRunAgentLifecycleCommand?: (agentName: string, action: "install" | "update", commands: string[]) => void | Promise<void>;
+  onAgentsChanged?: () => void;
   onGoHome?: () => void;
   footerTopContent?: React.ReactNode;
 };
 
 type AgentConfigFlow = "backup" | "switch";
-type AgentConfigStep = "agent" | "details" | "confirm";
+type AgentConfigStep = "agent" | "details" | "confirm" | "edit_provider";
 type AgentConfigAddTab = "backup" | "api";
 type AgentConfigSwitchTab = "backup" | "api_provider";
-type AgentConfigSwitchSelection = { type: "backup" | "api_provider"; id: string };
+type AgentConfigSwitchSelection = { type: "backup" | "api_provider" | "system_global"; id: string };
 
 function isAgentConfigBackupConflict(error: unknown): boolean {
   const maybeError = error as { status?: unknown; message?: unknown; payload?: { error?: unknown; message?: unknown } } | null;
@@ -472,6 +476,15 @@ function TrashIcon() {
   );
 }
 
+function EditIcon() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M12 20h9" />
+      <path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z" />
+    </svg>
+  );
+}
+
 function AgentConfigLineEditor({
   value,
   onChange,
@@ -576,6 +589,10 @@ function AgentConfigPopover({
   apiProviderName,
   apiProviderBaseURL,
   apiProviderAPIKey,
+  apiProviderModelsBody,
+  editingProviderID,
+  reapplyPrompt,
+  reapplyRequired,
   backups,
   apiProviders,
   selectedBackupID,
@@ -592,13 +609,19 @@ function AgentConfigPopover({
   onAPIProviderNameChange,
   onAPIProviderBaseURLChange,
   onAPIProviderAPIKeyChange,
+  onAPIProviderModelsBodyChange,
   onSelectedBackupChange,
   onSelectedAPIProviderChange,
+  onEditAPIProvider,
   onDeleteBackup,
   onDeleteAPIProvider,
   onSave,
+  onSaveProviderEdit,
+  onReprobeProvider,
   onSwitch,
   onConfirm,
+  onConfirmReapply,
+  onCancelReapply,
   onCancel,
 }: {
   flow: AgentConfigFlow;
@@ -613,6 +636,10 @@ function AgentConfigPopover({
   apiProviderName: string;
   apiProviderBaseURL: string;
   apiProviderAPIKey: string;
+  apiProviderModelsBody: string;
+  editingProviderID: string;
+  reapplyPrompt: boolean;
+  reapplyRequired: boolean;
   backups: AgentConfigBackup[];
   apiProviders: AgentAPIProvider[];
   selectedBackupID: string;
@@ -629,13 +656,19 @@ function AgentConfigPopover({
   onAPIProviderNameChange: (value: string) => void;
   onAPIProviderBaseURLChange: (value: string) => void;
   onAPIProviderAPIKeyChange: (value: string) => void;
+  onAPIProviderModelsBodyChange: (value: string) => void;
   onSelectedBackupChange: (value: string) => void;
   onSelectedAPIProviderChange: (value: string) => void;
+  onEditAPIProvider: (id: string) => void;
   onDeleteBackup: (id: string) => void;
   onDeleteAPIProvider: (id: string) => void;
   onSave: () => void;
+  onSaveProviderEdit: () => void;
+  onReprobeProvider: () => void;
   onSwitch: () => void;
   onConfirm: () => void;
+  onConfirmReapply: () => void;
+  onCancelReapply: () => void;
   onCancel: () => void;
 }) {
   const { t } = useI18n();
@@ -719,6 +752,76 @@ function AgentConfigPopover({
               {confirmButtonLabel}
             </button>
           </div>
+        </>
+      ) : step === "edit_provider" ? (
+        <>
+          {reapplyPrompt ? (
+            <>
+              <div style={agentConfigHintStyle}>{t("agentConfig.reapplyProvider")}</div>
+              <div style={agentConfigActionRowStyle}>
+                {reapplyRequired ? null : (
+                  <button type="button" disabled={busy} onClick={onCancelReapply} style={agentConfigSecondaryButtonStyle(busy)}>
+                    {t("agentConfig.reapplyNo")}
+                  </button>
+                )}
+                <button type="button" disabled={busy} onClick={onConfirmReapply} style={agentConfigPrimaryButtonStyle(busy)}>
+                  {t("agentConfig.reapplyYes")}
+                </button>
+              </div>
+            </>
+          ) : (
+            <>
+              <div style={{ fontSize: "12px", fontWeight: 700, color: "var(--text-primary)" }}>
+                {t("agentConfig.editProvider")}
+                {editingProviderID ? ` · ${editingProviderID}` : ""}
+              </div>
+              <div style={agentConfigFieldStyle}>
+                <label style={agentConfigLabelStyle}>{t("agentConfig.providerName")}</label>
+                <input
+                  value={apiProviderName}
+                  onChange={(event) => onAPIProviderNameChange(event.target.value)}
+                  style={agentConfigInputStyle}
+                />
+              </div>
+              <div style={agentConfigFieldStyle}>
+                <label style={agentConfigLabelStyle}>Base URL</label>
+                <input
+                  value={apiProviderBaseURL}
+                  onChange={(event) => onAPIProviderBaseURLChange(event.target.value)}
+                  style={agentConfigInputStyle}
+                />
+              </div>
+              <div style={agentConfigFieldStyle}>
+                <label style={agentConfigLabelStyle}>API Key</label>
+                <input
+                  value={apiProviderAPIKey}
+                  type="password"
+                  onChange={(event) => onAPIProviderAPIKeyChange(event.target.value)}
+                  placeholder={t("agentConfig.apiKeyKeepHint")}
+                  style={agentConfigInputStyle}
+                />
+              </div>
+              <div style={agentConfigFieldStyle}>
+                <label style={agentConfigLabelStyle}>{t("agentConfig.models")}</label>
+                <AgentConfigLineEditor
+                  value={apiProviderModelsBody}
+                  onChange={onAPIProviderModelsBodyChange}
+                  placeholder={t("agentConfig.modelsPlaceholder")}
+                />
+              </div>
+              <div style={agentConfigActionRowStyle}>
+                <button type="button" disabled={busy} onClick={onCancel} style={agentConfigSecondaryButtonStyle(busy)}>
+                  {t("common.cancel")}
+                </button>
+                <button type="button" disabled={busy} onClick={onReprobeProvider} style={agentConfigSecondaryButtonStyle(busy)}>
+                  {t("agentConfig.reprobeModels")}
+                </button>
+                <button type="button" disabled={busy} onClick={onSaveProviderEdit} style={agentConfigPrimaryButtonStyle(busy)}>
+                  {t("agentConfig.saveProvider")}
+                </button>
+              </div>
+            </>
+          )}
         </>
       ) : flow === "backup" ? (
         <>
@@ -848,7 +951,7 @@ function AgentConfigPopover({
           <div style={{ display: "flex", flexDirection: "column", gap: "8px", maxHeight: "260px", overflow: "auto" }}>
             {busy ? (
               <div style={agentConfigHintStyle}>{t("agentConfig.loading")}</div>
-            ) : backups.length === 0 && (supportsAPIProvider ? apiProviders.length === 0 : true) ? (
+            ) : backups.length === 0 && !supportsAPIProvider ? (
               <div style={agentConfigHintStyle}>{t("agentConfig.noSwitchableConfig")}</div>
             ) : effectiveSwitchTab === "backup" ? (
               backups.length === 0 ? (
@@ -889,9 +992,25 @@ function AgentConfigPopover({
                 );
               })
             ) : (
-	              apiProviders.length === 0 ? (
+              <>
+                <div
+                  onClick={() => onSelectedAPIProviderChange("")}
+                  style={{
+                    border: "1px solid var(--border-color)",
+                    background: !selectedAPIProviderID ? "var(--selection-bg)" : "transparent",
+                    color: !selectedAPIProviderID ? "var(--accent-color)" : "var(--text-primary)",
+                    borderRadius: "8px",
+                    padding: "8px 10px",
+                    textAlign: "left",
+                    cursor: "pointer",
+                  }}
+                >
+                  <div style={{ fontSize: "12px", fontWeight: 600 }}>{t("agentConfig.systemGlobal")}</div>
+                  <div style={{ marginTop: "4px", fontSize: "11px", color: "var(--text-secondary)" }}>{t("agentConfig.systemGlobalHint")}</div>
+                </div>
+	              {apiProviders.length === 0 ? (
 	                <div style={agentConfigHintStyle}>{t("agentConfig.noAPIProviders")}</div>
-              ) : apiProviders.map((item) => {
+                  ) : apiProviders.map((item) => {
                 const selected = item.id === selectedAPIProviderID;
                 const summary = (item.modelFamilies || []).join(", ");
                 return (
@@ -915,6 +1034,19 @@ function AgentConfigPopover({
                       </div>
                       <button
                         type="button"
+                        aria-label={t("agentConfig.editAPIProvider", { name: item.name })}
+                        title={t("agentConfig.editProvider")}
+                        disabled={busy}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          onEditAPIProvider(item.id);
+                        }}
+                        style={agentConfigIconButtonStyle(busy)}
+                      >
+                        <EditIcon />
+                      </button>
+                      <button
+                        type="button"
                         aria-label={t("agentConfig.deleteAPIProvider", { name: item.name })}
                         title={t("common.delete")}
                         disabled={busy}
@@ -929,7 +1061,8 @@ function AgentConfigPopover({
                     </div>
                   </div>
                 );
-              })
+                  })}
+              </>
             )}
           </div>
           <div style={agentConfigActionRowStyle}>
@@ -938,9 +1071,9 @@ function AgentConfigPopover({
             </button>
             <button
               type="button"
-              disabled={busy || (effectiveSwitchTab === "backup" ? !selectedBackupID : !selectedAPIProviderID)}
+              disabled={busy || (effectiveSwitchTab === "backup" && !selectedBackupID)}
               onClick={onSwitch}
-              style={agentConfigPrimaryButtonStyle(busy || (effectiveSwitchTab === "backup" ? !selectedBackupID : !selectedAPIProviderID))}
+              style={agentConfigPrimaryButtonStyle(busy || (effectiveSwitchTab === "backup" && !selectedBackupID))}
             >
               {t("agentConfig.switch")}
             </button>
@@ -1230,6 +1363,7 @@ export function FileTree({
   selectedDirKey,
   selectedPath,
   rootId,
+  rootPaths = {},
   rootSessionIndicators = {},
   fileMetas = {},
   activeSessionKey,
@@ -1277,6 +1411,7 @@ export function FileTree({
   multiProjectSessionsEnabled = false,
   onMultiProjectSessionsChange,
   onRunAgentLifecycleCommand,
+  onAgentsChanged,
   onGoHome,
   footerTopContent,
 }: FileTreeProps) {
@@ -1323,6 +1458,12 @@ export function FileTree({
   const [agentAPIProviderName, setAgentAPIProviderName] = React.useState("");
   const [agentAPIProviderBaseURL, setAgentAPIProviderBaseURL] = React.useState("");
   const [agentAPIProviderAPIKey, setAgentAPIProviderAPIKey] = React.useState("");
+  const [agentAPIProviderModelsBody, setAgentAPIProviderModelsBody] = React.useState("");
+  const [editingAgentAPIProviderID, setEditingAgentAPIProviderID] = React.useState("");
+  const [editingProviderSnapshot, setEditingProviderSnapshot] = React.useState<{ name: string; baseUrl: string; modelsBody: string } | null>(null);
+  const [agentConfigReapplyPrompt, setAgentConfigReapplyPrompt] = React.useState(false);
+  const [pendingProviderReapplyID, setPendingProviderReapplyID] = React.useState("");
+  const [pendingProviderReapplyRequired, setPendingProviderReapplyRequired] = React.useState(false);
   const [agentConfigBackups, setAgentConfigBackups] = React.useState<AgentConfigBackup[]>([]);
   const [agentAPIProviders, setAgentAPIProviders] = React.useState<AgentAPIProvider[]>([]);
   const [selectedAgentConfigID, setSelectedAgentConfigID] = React.useState("");
@@ -1845,7 +1986,20 @@ export function FileTree({
     setAgentConfigConfirmMessage("");
     setAgentConfigSwitchSelection(null);
     setAgentConfigSwitchTab("backup");
+    setAgentAPIProviderModelsBody("");
+    setEditingAgentAPIProviderID("");
+    setEditingProviderSnapshot(null);
+    setAgentConfigReapplyPrompt(false);
+    setPendingProviderReapplyID("");
+    setPendingProviderReapplyRequired(false);
   }, []);
+
+  const bumpAgentsAfterProviderChange = React.useCallback(() => {
+    onAgentsChanged?.();
+    scheduleAgentsRefresh(() => {
+      onAgentsChanged?.();
+    });
+  }, [onAgentsChanged]);
 
   const openAgentLifecycleFlow = React.useCallback(() => {
     setAgentConfigFlow(null);
@@ -1961,10 +2115,19 @@ export function FileTree({
         setAgentConfigBackups(backups);
         setAgentAPIProviders(providers);
         setSelectedAgentConfigID("");
-        const preferredProvider = providers.find((provider) => agentConfigPreferredProviderIDs.includes(provider.id));
+        const selectedProviderID = selectedAgent?.last_config_selection?.type === "api_provider"
+          ? String(selectedAgent.last_config_selection.id || "").trim()
+          : "";
+        const preferredProvider = providers.find((provider) => provider.id === selectedProviderID);
         setSelectedAgentAPIProviderID(preferredProvider?.id || "");
-        setAgentConfigSwitchSelection(preferredProvider ? { type: "api_provider", id: preferredProvider.id } : null);
-        setAgentConfigSwitchTab(supportsAPIProvider && selectedAgent?.last_config_selection?.type === "api_provider" ? "api_provider" : "backup");
+        setAgentConfigSwitchSelection(
+          preferredProvider
+            ? { type: "api_provider", id: preferredProvider.id }
+            : supportsAPIProvider
+              ? { type: "system_global", id: "" }
+              : null,
+        );
+        setAgentConfigSwitchTab(supportsAPIProvider && (selectedAgent?.last_config_selection?.type === "api_provider" || agentConfigPreferredProviderIDs.length === 0) ? "api_provider" : "backup");
         if (supportsAPIProvider && agentConfigPreferredProviderIDs.length > 0) {
           setAgentConfigSwitchTab("api_provider");
         }
@@ -2036,6 +2199,132 @@ export function FileTree({
     }
   }, [agentAPIProviderAPIKey, agentAPIProviderBaseURL, agentAPIProviderName, closeAgentConfigFlow, t]);
 
+  const beginEditAgentAPIProvider = React.useCallback((id: string) => {
+    const provider = agentAPIProviders.find((item) => item.id === id);
+    if (!provider) {
+      return;
+    }
+    setEditingAgentAPIProviderID(provider.id);
+    setAgentAPIProviderName(provider.name || "");
+    setAgentAPIProviderBaseURL(provider.baseUrl || "");
+    setAgentAPIProviderAPIKey("");
+    const modelsBody = (provider.models || []).join("\n");
+    setAgentAPIProviderModelsBody(modelsBody);
+    setEditingProviderSnapshot({
+      name: provider.name || "",
+      baseUrl: provider.baseUrl || "",
+      modelsBody,
+    });
+    setAgentConfigReapplyPrompt(false);
+    setPendingProviderReapplyID("");
+    setPendingProviderReapplyRequired(false);
+    setAgentConfigError("");
+    setAgentConfigStep("edit_provider");
+  }, [agentAPIProviders]);
+
+  const saveEditedAgentAPIProvider = React.useCallback(async (options?: { reprobe?: boolean; reapply?: boolean }) => {
+    const providerID = editingAgentAPIProviderID.trim();
+    if (!providerID) {
+      return;
+    }
+    // Re-apply after a successful save: only switch + refresh. Do not PUT again
+    // (avoids double-write and accidental model overwrites if form state drifted).
+    if (options?.reapply) {
+      const reapplyID = pendingProviderReapplyID.trim() || providerID;
+      if (!reapplyID || !agentConfigAgent) {
+        setAgentConfigError(t("agentConfig.updateProviderFailed"));
+        return;
+      }
+      setAgentConfigBusy(true);
+      setAgentConfigError("");
+      try {
+        await switchAgentAPIProvider({ agent: agentConfigAgent, providerID: reapplyID });
+        bumpAgentsAfterProviderChange();
+        closeAgentConfigFlow();
+      } catch (error) {
+        setAgentConfigError(error instanceof Error ? error.message : t("agentConfig.switchFailed"));
+      } finally {
+        setAgentConfigBusy(false);
+      }
+      return;
+    }
+    if (!agentAPIProviderName.trim()) {
+      setAgentConfigError(t("agentConfig.providerNameRequired"));
+      return;
+    }
+    if (!agentAPIProviderBaseURL.trim()) {
+      setAgentConfigError(t("agentConfig.baseURLRequired"));
+      return;
+    }
+    const models = agentAPIProviderModelsBody
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+    const snapshot = editingProviderSnapshot;
+    const nameChanged = !!snapshot && agentAPIProviderName.trim() !== snapshot.name.trim();
+    const urlChanged = !!snapshot && agentAPIProviderBaseURL.trim() !== snapshot.baseUrl.trim();
+    const keyChanged = !!agentAPIProviderAPIKey.trim();
+    const modelsChanged = !!snapshot && agentAPIProviderModelsBody.replace(/\r\n/g, "\n").trim() !== snapshot.modelsBody.replace(/\r\n/g, "\n").trim();
+    const shouldAutoReprobe = !options?.reprobe && (urlChanged || keyChanged) && !modelsChanged;
+    setAgentConfigBusy(true);
+    setAgentConfigError("");
+    try {
+      const updated = await updateAgentAPIProvider(providerID, {
+        name: agentAPIProviderName.trim(),
+        baseUrl: agentAPIProviderBaseURL.trim(),
+        apiKey: agentAPIProviderAPIKey.trim() || undefined,
+        models: (options?.reprobe || shouldAutoReprobe) ? undefined : models,
+        reprobe: !!(options?.reprobe || shouldAutoReprobe),
+      });
+      setAgentAPIProviders((prev) => {
+        const next = prev.map((item) => (item.id === updated.id ? updated : item));
+        if (!next.some((item) => item.id === updated.id)) {
+          next.push(updated);
+        }
+        return next;
+      });
+      setSelectedAgentAPIProviderID(updated.id);
+      setAgentConfigSwitchSelection({ type: "api_provider", id: updated.id });
+      if (options?.reprobe || shouldAutoReprobe) {
+        setAgentAPIProviderModelsBody((updated.models || []).join("\n"));
+        if (options?.reprobe) {
+          return;
+        }
+      }
+      const selectedAgent = agentConfigAgents.find((item) => item.name === agentConfigAgent);
+      const activeProviderID = String(selectedAgent?.last_config_selection?.id || "").trim();
+      const isActive = selectedAgent?.last_config_selection?.type === "api_provider" && activeProviderID === providerID;
+      if (isActive) {
+        // Models-only edits still need re-apply for agents that write model maps
+        // into runtime config (opencode/codex/etc.). Overlay alone updates the
+        // picker but not the agent process catalog.
+        const requiresReapply = nameChanged || urlChanged || keyChanged || modelsChanged;
+        setPendingProviderReapplyID(providerID);
+        setPendingProviderReapplyRequired(requiresReapply);
+        setAgentConfigReapplyPrompt(true);
+        return;
+      }
+      closeAgentConfigFlow();
+    } catch (error) {
+      setAgentConfigError(error instanceof Error ? error.message : t("agentConfig.updateProviderFailed"));
+    } finally {
+      setAgentConfigBusy(false);
+    }
+  }, [
+    agentAPIProviderAPIKey,
+    agentAPIProviderBaseURL,
+    agentAPIProviderModelsBody,
+    agentAPIProviderName,
+    agentConfigAgent,
+    agentConfigAgents,
+    bumpAgentsAfterProviderChange,
+    closeAgentConfigFlow,
+    editingAgentAPIProviderID,
+    editingProviderSnapshot,
+    pendingProviderReapplyID,
+    t,
+  ]);
+
   const runAgentConfigSwitch = React.useCallback(async (confirmOverwrite = false) => {
     if (!agentConfigSwitchSelection) {
       setAgentConfigError(t("agentConfig.selectConfig"));
@@ -2045,7 +2334,38 @@ export function FileTree({
     setAgentConfigError("");
     try {
       if (agentConfigSwitchSelection.type === "api_provider") {
-        await switchAgentAPIProvider({ agent: agentConfigAgent, providerID: agentConfigSwitchSelection.id });
+        const providerID = agentConfigSwitchSelection.id;
+        const provider = agentAPIProviders.find((item) => item.id === providerID);
+        await switchAgentAPIProvider({ agent: agentConfigAgent, providerID });
+        // Keep local agent status in sync so a subsequent edit in the same
+        // open flow can detect the active provider and offer re-apply.
+        setAgentConfigAgents((prev) => prev.map((item) => {
+          if (item.name !== agentConfigAgent) {
+            return item;
+          }
+          return {
+            ...item,
+            last_config_selection: {
+              type: "api_provider",
+              id: providerID,
+              name: provider?.name || item.last_config_selection?.name || "",
+            },
+          };
+        }));
+        // Force ActionBar / model picker to re-fetch agent models after provider switch.
+        // Immediate + delayed bumps so late ProbeOne results are not missed.
+        bumpAgentsAfterProviderChange();
+        closeAgentConfigFlow();
+        return;
+      }
+      if (agentConfigSwitchSelection.type === "system_global") {
+        await switchAgentAPIProvider({ agent: agentConfigAgent, providerID: "" });
+        setAgentConfigAgents((prev) => prev.map((item) => (
+          item.name === agentConfigAgent
+            ? { ...item, last_config_selection: undefined }
+            : item
+        )));
+        bumpAgentsAfterProviderChange();
         closeAgentConfigFlow();
         return;
       }
@@ -2061,7 +2381,7 @@ export function FileTree({
     } finally {
       setAgentConfigBusy(false);
     }
-  }, [agentConfigAgent, agentConfigSwitchSelection, closeAgentConfigFlow, t]);
+  }, [agentAPIProviders, agentConfigAgent, agentConfigSwitchSelection, bumpAgentsAfterProviderChange, closeAgentConfigFlow, t]);
 
   const deleteSelectedAgentConfigBackup = React.useCallback(async (id: string) => {
     const trimmedID = String(id || "").trim();
@@ -2102,6 +2422,9 @@ export function FileTree({
         setSelectedAgentAPIProviderID("");
         setAgentConfigSwitchSelection(null);
       }
+	      if ((result.loaded_affected_sessions || 0) > 0) {
+	        setAgentConfigError(`Provider deleted. ${result.loaded_affected_sessions} loaded session(s) remain readable but cannot resume with this provider.`);
+	      }
     } catch (error) {
       setAgentConfigError(error instanceof Error ? error.message : t("agentConfig.deleteProviderFailed"));
     } finally {
@@ -2118,7 +2441,7 @@ export function FileTree({
   const selectAgentAPIProvider = React.useCallback((id: string) => {
     setSelectedAgentAPIProviderID(id);
     setSelectedAgentConfigID("");
-    setAgentConfigSwitchSelection(id ? { type: "api_provider", id } : null);
+    setAgentConfigSwitchSelection(id ? { type: "api_provider", id } : { type: "system_global", id: "" });
   }, []);
 
   React.useEffect(() => {
@@ -2274,6 +2597,9 @@ export function FileTree({
           : null;
         const showRootIndicator = !!rootIndicator?.bound;
         const isRootPending = !!rootIndicator?.pending;
+        const fullPath = isManagedRootNode
+          ? String(rootPaths[entry.path] || entry.path)
+          : `${String(rootPaths[entryRoot] || entryRoot).replace(/[\\/]+$/, "")}/${entry.path}`;
         const handleEntryClick = () => {
           if (entry.is_dir) {
             if (isManagedRootNode) {
@@ -2306,88 +2632,123 @@ export function FileTree({
 
         return (
           <li key={expandedKey}>
-            <button
-              type="button"
-              onClick={handleEntryClick}
+            <div
               style={{
-                border: "none",
-                background: isSelected ? "var(--selection-bg)" : "transparent",
-                cursor: "pointer",
-                padding: "6px 8px",
-                paddingLeft: PROJECT_TREE_ROOT_PADDING_LEFT + depth * PROJECT_TREE_INDENT,
                 display: "flex",
                 alignItems: "center",
                 gap: "4px",
                 width: "100%",
-                textAlign: "left",
-                color: isSelected ? "var(--accent-color)" : "var(--text-primary)",
-                fontSize: "13px",
-                borderRadius: "6px",
-                transition: "all 0.1s",
-                fontWeight: isSelected ? 600 : 400,
-                outline: "none",
               }}
-              onMouseEnter={(e) => { if (!isSelected) e.currentTarget.style.background = "rgba(0,0,0,0.04)"; }}
-              onMouseLeave={(e) => { if (!isSelected) e.currentTarget.style.background = "transparent"; }}
             >
-              <span
-                onClick={handleDirectoryIconClick}
-                title={entry.is_dir ? (isOpen ? t("common.collapse") : t("common.expand")) : undefined}
+              <button
+                type="button"
+                onClick={handleEntryClick}
+                title={fullPath}
                 style={{
+                  flex: 1,
+                  minWidth: 0,
+                  border: "none",
+                  background: isSelected ? "var(--selection-bg)" : "transparent",
+                  cursor: "pointer",
+                  padding: `6px 4px 6px ${PROJECT_TREE_ROOT_PADDING_LEFT + depth * PROJECT_TREE_INDENT}px`,
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "4px",
+                  textAlign: "left",
+                  color: isSelected ? "var(--accent-color)" : "var(--text-primary)",
+                  fontSize: "13px",
+                  borderRadius: "6px",
+                  transition: "all 0.1s",
+                  fontWeight: isSelected ? 600 : 400,
+                  outline: "none",
+                }}
+                onMouseEnter={(e) => { if (!isSelected) e.currentTarget.style.background = "rgba(0,0,0,0.04)"; }}
+                onMouseLeave={(e) => { if (!isSelected) e.currentTarget.style.background = "transparent"; }}
+              >
+                <span
+                  onClick={handleDirectoryIconClick}
+                  title={entry.is_dir ? (isOpen ? t("common.collapse") : t("common.expand")) : undefined}
+                  style={{
+                    display: "inline-flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    borderRadius: "4px",
+                    cursor: entry.is_dir ? "pointer" : "default",
+                  }}
+                >
+                  <DirectoryIconSlot entry={entry} isOpen={isOpen} />
+                </span>
+                <span
+                  style={{
+                    whiteSpace: "nowrap",
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    flex: 1,
+                    marginLeft: "4px",
+                  }}
+                >
+                  <span
+                    style={{
+                      ...(isManagedRootNode ? rootBadgeStyle : {}),
+                      maxWidth: "100%",
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                    }}
+                  >
+                    {entry.name}
+                  </span>
+                </span>
+                {showRootIndicator ? (
+                  <span
+                    aria-label={isRootPending ? t("fileTree.boundSessionReplying") : t("fileTree.boundSession")}
+                    title={isRootPending ? t("fileTree.boundSessionReplying") : t("fileTree.boundSession")}
+                    style={{
+                      width: "8px",
+                      height: "8px",
+                      borderRadius: "999px",
+                      flexShrink: 0,
+                      boxSizing: "border-box",
+                      border: "1.5px solid #2563eb",
+                      background: isRootPending ? "#2563eb" : "transparent",
+                      animation: isRootPending ? "mindfs-bound-pulse 2.2s ease-in-out infinite" : "none",
+                      boxShadow: isRootPending
+                        ? "0 0 0 1.5px rgba(37,99,235,0.14)"
+                        : "0 0 0 1px rgba(37,99,235,0.10)",
+                    }}
+                  />
+                ) : null}
+                {hasSessionLink && (
+                  <span style={{ fontSize: "10px", color: isFromActiveSession ? "#3b82f6" : "#9ca3af" }}>
+                    {isFromActiveSession ? "◆" : "◇"}
+                  </span>
+                )}
+              </button>
+              <button
+                type="button"
+                aria-label={t("fileTree.copyPath")}
+                title={`${t("fileTree.copyPath")}: ${fullPath}`}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  void copyText(fullPath).catch((error) => console.error("[file-tree] copy path failed", error));
+                }}
+                onKeyDown={(event) => event.stopPropagation()}
+                style={{
+                  width: "22px",
+                  height: "22px",
+                  flexShrink: 0,
+                  border: "none",
+                  borderRadius: "4px",
+                  background: "transparent",
+                  color: "var(--text-secondary)",
                   display: "inline-flex",
                   alignItems: "center",
                   justifyContent: "center",
-                  borderRadius: "4px",
-                  cursor: entry.is_dir ? "pointer" : "default",
+                  cursor: "pointer",
                 }}
               >
-                <DirectoryIconSlot entry={entry} isOpen={isOpen} />
-              </span>
-              <span
-                style={{
-                  whiteSpace: "nowrap",
-                  overflow: "hidden",
-                  textOverflow: "ellipsis",
-                  flex: 1,
-                  marginLeft: "4px",
-                }}
-              >
-                <span
-                  style={{
-                    ...(isManagedRootNode ? rootBadgeStyle : {}),
-                    maxWidth: "100%",
-                    overflow: "hidden",
-                    textOverflow: "ellipsis",
-                  }}
-                >
-                  {entry.name}
-                </span>
-              </span>
-              {showRootIndicator ? (
-                <span
-                  aria-label={isRootPending ? t("fileTree.boundSessionReplying") : t("fileTree.boundSession")}
-                  title={isRootPending ? t("fileTree.boundSessionReplying") : t("fileTree.boundSession")}
-                  style={{
-                    width: "8px",
-                    height: "8px",
-                    borderRadius: "999px",
-                    flexShrink: 0,
-                    boxSizing: "border-box",
-                    border: "1.5px solid #2563eb",
-                    background: isRootPending ? "#2563eb" : "transparent",
-                    animation: isRootPending ? "mindfs-bound-pulse 2.2s ease-in-out infinite" : "none",
-                    boxShadow: isRootPending
-                      ? "0 0 0 1.5px rgba(37,99,235,0.14)"
-                      : "0 0 0 1px rgba(37,99,235,0.10)",
-                  }}
-                />
-              ) : null}
-              {hasSessionLink && (
-                <span style={{ fontSize: "10px", color: isFromActiveSession ? "#3b82f6" : "#9ca3af" }}>
-                  {isFromActiveSession ? "◆" : "◇"}
-                </span>
-              )}
-            </button>
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2" /><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" /></svg>
+              </button>
+            </div>
             {entry.is_dir && isOpen && shouldRenderChildren && children.length > 0 ? renderEntries(children, depth + 1, entryRoot) : null}
             {entry.is_dir && isOpen && rootExtraContent ? (
               <div style={{ padding: `2px 4px 8px ${PROJECT_TREE_INDENT}px` }}>
@@ -2956,6 +3317,10 @@ export function FileTree({
               apiProviderName={agentAPIProviderName}
               apiProviderBaseURL={agentAPIProviderBaseURL}
               apiProviderAPIKey={agentAPIProviderAPIKey}
+              apiProviderModelsBody={agentAPIProviderModelsBody}
+              editingProviderID={editingAgentAPIProviderID}
+              reapplyPrompt={agentConfigReapplyPrompt}
+              reapplyRequired={pendingProviderReapplyRequired}
               backups={agentConfigBackups}
               apiProviders={agentAPIProviders}
               selectedBackupID={selectedAgentConfigID}
@@ -2974,8 +3339,10 @@ export function FileTree({
               onAPIProviderNameChange={setAgentAPIProviderName}
               onAPIProviderBaseURLChange={setAgentAPIProviderBaseURL}
               onAPIProviderAPIKeyChange={setAgentAPIProviderAPIKey}
+              onAPIProviderModelsBodyChange={setAgentAPIProviderModelsBody}
               onSelectedBackupChange={selectAgentConfigBackup}
               onSelectedAPIProviderChange={selectAgentAPIProvider}
+              onEditAPIProvider={beginEditAgentAPIProvider}
               onDeleteBackup={(id) => {
                 void deleteSelectedAgentConfigBackup(id);
               }}
@@ -2989,6 +3356,12 @@ export function FileTree({
                 }
                 void saveAgentConfigBackup();
               }}
+              onSaveProviderEdit={() => {
+                void saveEditedAgentAPIProvider();
+              }}
+              onReprobeProvider={() => {
+                void saveEditedAgentAPIProvider({ reprobe: true });
+              }}
               onSwitch={() => {
                 void runAgentConfigSwitch(false);
               }}
@@ -2999,7 +3372,33 @@ export function FileTree({
                 }
                 void runAgentConfigSwitch(true);
               }}
-              onCancel={closeAgentConfigFlow}
+              onConfirmReapply={() => {
+                void saveEditedAgentAPIProvider({ reapply: true });
+              }}
+              onCancelReapply={() => {
+                // Name/URL/key changes desync multi-provider runtime config if not re-applied.
+                if (pendingProviderReapplyRequired) {
+                  void saveEditedAgentAPIProvider({ reapply: true });
+                  return;
+                }
+                // Saved already; still refresh so overlay model list updates without re-apply.
+                setAgentConfigReapplyPrompt(false);
+                setPendingProviderReapplyID("");
+                bumpAgentsAfterProviderChange();
+                closeAgentConfigFlow();
+              }}
+              onCancel={() => {
+                if (agentConfigReapplyPrompt && pendingProviderReapplyRequired) {
+                  void saveEditedAgentAPIProvider({ reapply: true });
+                  return;
+                }
+                if (agentConfigReapplyPrompt) {
+                  setAgentConfigReapplyPrompt(false);
+                  setPendingProviderReapplyID("");
+                  bumpAgentsAfterProviderChange();
+                }
+                closeAgentConfigFlow();
+              }}
             />
           </div>
         ) : null}

@@ -28,6 +28,7 @@ type OpenOptions struct {
 	Command          string
 	Args             []string
 	Env              map[string]string
+	RuntimeKey       string
 	ResumeSessionID  string
 	ForkSessionID    string
 	CodexUserOrdinal *int
@@ -147,26 +148,43 @@ func (r *Runtime) CloseAll() {
 
 func (r *Runtime) Close(agentName string) error {
 	r.mu.Lock()
-	client, ok := r.clients[agentName]
-	if ok {
-		delete(r.clients, agentName)
+	clients := make([]*codexsdk.Codex, 0)
+	for key, client := range r.clients {
+		if key != agentName && !strings.HasPrefix(key, agentName+":") {
+			continue
+		}
+		delete(r.clients, key)
+		if client != nil {
+			clients = append(clients, client)
+		}
 	}
 	r.mu.Unlock()
 
-	if !ok || client == nil {
-		return nil
+	var firstErr error
+	for _, client := range clients {
+		if err := client.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
 	}
-	return client.Close()
+	return firstErr
+}
+
+func (r *Runtime) clientKey(opts OpenOptions) string {
+	if key := strings.TrimSpace(opts.RuntimeKey); key != "" {
+		return key
+	}
+	return strings.TrimSpace(opts.AgentName)
 }
 
 func (r *Runtime) getOrCreateClient(opts OpenOptions) *codexsdk.Codex {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if client, ok := r.clients[opts.AgentName]; ok {
+	key := r.clientKey(opts)
+	if client, ok := r.clients[key]; ok {
 		return client
 	}
 	client := newClient(opts)
-	r.clients[opts.AgentName] = client
+	r.clients[key] = client
 	return client
 }
 
@@ -714,18 +732,7 @@ func (s *session) ListModels(ctx context.Context) (types.ModelList, error) {
 	currentModelID := ""
 	defaults, _ := s.RuntimeDefaults(ctx)
 	for _, model := range resp.Data {
-		name := strings.TrimSpace(model.DisplayName)
-		if name == "" {
-			name = strings.TrimSpace(model.Model)
-		}
-		models = append(models, types.ModelInfo{
-			ID:            model.Model,
-			Name:          name,
-			Description:   model.Description,
-			Hidden:        model.Hidden,
-			SupportEffort: true,
-			Efforts:       codexModelEfforts(model.SupportedReasoningEfforts),
-		})
+		models = append(models, mapCodexModel(model))
 		if model.IsDefault && currentModelID == "" {
 			currentModelID = model.Model
 		}
@@ -744,11 +751,17 @@ func codexListModelsParams() codexsdk.ModelListParams {
 	return codexsdk.ModelListParams{IncludeHidden: &includeHidden}
 }
 
-func codexModelEfforts(options []codexsdk.ReasoningEffortOption) []string {
-	efforts := make([]string, 0, len(options))
-	seen := make(map[string]struct{}, len(options))
-	for _, option := range options {
-		effort := strings.TrimSpace(string(option.ReasoningEffort))
+func mapCodexModel(model codexsdk.Model) types.ModelInfo {
+	name := strings.TrimSpace(model.DisplayName)
+	if name == "" {
+		name = strings.TrimSpace(model.Model)
+	}
+
+	// app-server 已按模型返回完整能力；原样保序透传，兼容 max、ultra 及未来新增等级。
+	efforts := make([]string, 0, len(model.SupportedReasoningEfforts))
+	seen := make(map[string]struct{}, len(model.SupportedReasoningEfforts))
+	for _, option := range model.SupportedReasoningEfforts {
+		effort := strings.ToLower(strings.TrimSpace(string(option.ReasoningEffort)))
 		if effort == "" || effort == "none" {
 			continue
 		}
@@ -758,7 +771,17 @@ func codexModelEfforts(options []codexsdk.ReasoningEffortOption) []string {
 		seen[effort] = struct{}{}
 		efforts = append(efforts, effort)
 	}
-	return efforts
+
+	return types.ModelInfo{
+		ID:          model.Model,
+		Name:        name,
+		Description: model.Description,
+		Hidden:      model.Hidden,
+		// 旧版 app-server 省略该字段时沿用原有能力回退；显式空数组则表示模型不支持。
+		SupportEffort: model.SupportedReasoningEfforts == nil || len(efforts) > 0,
+		Efforts:       efforts,
+		DefaultEffort: strings.ToLower(strings.TrimSpace(string(model.DefaultReasoningEffort))),
+	}
 }
 
 func (s *session) RuntimeDefaults(ctx context.Context) (types.RuntimeDefaults, error) {
@@ -868,7 +891,18 @@ func (s *session) ContextWindow(_ context.Context) (types.ContextWindow, error) 
 	return s.contextWindow, nil
 }
 
-func (s *session) Close() error { return nil }
+func (s *session) Close() error {
+	if s == nil {
+		return nil
+	}
+	s.cancelPendingQuestions(errors.New("session closed"))
+	s.turn.Cancel()
+	s.mu.Lock()
+	s.thread = nil
+	s.onUpdate = nil
+	s.mu.Unlock()
+	return nil
+}
 
 func (s *session) updateThreadIDFromThread() {
 	if s == nil || s.thread == nil {

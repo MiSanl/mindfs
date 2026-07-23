@@ -44,6 +44,7 @@ type Task struct {
 	TaskCron           string     `json:"task_cron"`
 	Agent              string     `json:"agent"`
 	Model              string     `json:"model,omitempty"`
+	ProviderID         string     `json:"provider_id,omitempty"`
 	Mode               string     `json:"mode,omitempty"`
 	Effort             string     `json:"effort,omitempty"`
 	FastService        string     `json:"fast_service,omitempty"`
@@ -167,6 +168,7 @@ type SaveInput struct {
 	TaskCron       string `json:"task_cron"`
 	Agent          string `json:"agent"`
 	Model          string `json:"model"`
+	ProviderID     string `json:"provider_id"`
 	Mode           string `json:"mode"`
 	Effort         string `json:"effort"`
 	FastService    string `json:"fast_service"`
@@ -195,6 +197,7 @@ func (s *Service) Create(ctx context.Context, in SaveInput) (Task, error) {
 		TaskCron:       strings.TrimSpace(in.TaskCron),
 		Agent:          strings.TrimSpace(in.Agent),
 		Model:          strings.TrimSpace(in.Model),
+		ProviderID:     strings.TrimSpace(in.ProviderID),
 		Mode:           strings.TrimSpace(in.Mode),
 		Effort:         strings.TrimSpace(in.Effort),
 		FastService:    strings.TrimSpace(in.FastService),
@@ -238,6 +241,7 @@ func (s *Service) Update(ctx context.Context, in SaveInput) (Task, error) {
 		tasks[i].TaskCron = strings.TrimSpace(in.TaskCron)
 		tasks[i].Agent = strings.TrimSpace(in.Agent)
 		tasks[i].Model = strings.TrimSpace(in.Model)
+		tasks[i].ProviderID = strings.TrimSpace(in.ProviderID)
 		tasks[i].Mode = strings.TrimSpace(in.Mode)
 		tasks[i].Effort = strings.TrimSpace(in.Effort)
 		tasks[i].FastService = strings.TrimSpace(in.FastService)
@@ -444,6 +448,7 @@ func (s *Service) runTask(ctx context.Context, task Task, force bool) error {
 		return err
 	}
 	sessionKey := strings.TrimSpace(current.SessionKey)
+	createdSession := false
 	if sessionKey != "" {
 		if _, err := manager.Get(ctx, sessionKey, 0); err != nil {
 			sessionKey = ""
@@ -466,6 +471,7 @@ func (s *Service) runTask(ctx context.Context, task Task, force bool) error {
 		}
 		broadcaster.BroadcastSessionMetaUpdated(current.RootID, created)
 		sessionKey = created.Key
+		createdSession = true
 		resetAt := time.Now().UTC()
 		current.SessionKey = sessionKey
 		current.LastSessionResetAt = &resetAt
@@ -478,15 +484,27 @@ func (s *Service) runTask(ctx context.Context, task Task, force bool) error {
 		}
 	}
 	sessionName := current.Name
+	allowProviderBind := createdSession
+	if !allowProviderBind && strings.TrimSpace(current.ProviderID) != "" {
+		if existing, getErr := manager.Get(ctx, sessionKey, 0); getErr == nil && existing != nil && len(existing.Exchanges) == 0 {
+			if binding, bindErr := manager.FindAgentBinding(ctx, sessionKey, current.Agent); bindErr == nil {
+				if binding == nil || strings.TrimSpace(binding.ProviderID) == "" {
+					allowProviderBind = true
+				}
+			}
+		}
+	}
 	err = s.usecase.SendMessage(ctx, usecase.SendMessageInput{
-		RootID:      current.RootID,
-		Key:         sessionKey,
-		Agent:       current.Agent,
-		Model:       current.Model,
-		Mode:        current.Mode,
-		Effort:      current.Effort,
-		FastService: current.FastService,
-		Content:     current.Prompt,
+		RootID:            current.RootID,
+		Key:               sessionKey,
+		Agent:             current.Agent,
+		Model:             current.Model,
+		ProviderID:        current.ProviderID,
+		AllowProviderBind: allowProviderBind,
+		Mode:              current.Mode,
+		Effort:            current.Effort,
+		FastService:       current.FastService,
+		Content:           current.Prompt,
 		ClientCtx: usecase.ClientContext{
 			CurrentRoot: current.RootID,
 		},

@@ -480,6 +480,19 @@ func (s *Service) ForkSession(ctx context.Context, in ForkSessionInput) (ForkSes
 		_ = manager.Delete(ctx, created.Key)
 		return ForkSessionOutput{}, err
 	}
+	var forkBinding *session.AgentBinding
+	var forkProvider *SessionProviderConfig
+	if strings.TrimSpace(binding.ProviderID) != "" {
+		forkBinding, forkProvider, err = s.resolveSessionProvider(ctx, manager, created, agentName, binding.ProviderID, true)
+		if err != nil {
+			_ = manager.Delete(ctx, created.Key)
+			return ForkSessionOutput{}, err
+		}
+		if err := s.validateAgentModelForProvider(agentName, resolveForkModel(current, target), forkProvider); err != nil {
+			_ = manager.Delete(ctx, created.Key)
+			return ForkSessionOutput{}, err
+		}
+	}
 	openCtx := pool.Context()
 	if openCtx == nil {
 		openCtx = ctx
@@ -488,8 +501,8 @@ func (s *Service) ForkSession(ctx context.Context, in ForkSessionInput) (ForkSes
 	if isACP {
 		agentCtxSeq = 0
 	}
-	sess, err := pool.GetOrCreate(openCtx, agenttypes.OpenSessionInput{
-		SessionKey:     agentPoolSessionKey(created.Key, agentName),
+	openInput := agenttypes.OpenSessionInput{
+		SessionKey:     agentPoolSessionKey(created.Key, agentName, in.RootID),
 		AgentName:      agentName,
 		Model:          resolveForkModel(current, target),
 		Mode:           strings.TrimSpace(target.Mode),
@@ -500,7 +513,14 @@ func (s *Service) ForkSession(ctx context.Context, in ForkSessionInput) (ForkSes
 		AgentSessionID: "",
 		AgentCtxSeq:    agentCtxSeq,
 		ForkPoint:      forkPoint,
-	})
+	}
+	if forkProvider != nil {
+		openInput.RuntimeEnv = cloneProviderRuntimeEnv(forkProvider.Env)
+		openInput.RuntimeArgs = append([]string{}, forkProvider.Args...)
+		openInput.RuntimeKey = agentName + ":" + forkProvider.ID + ":" + forkProvider.Revision
+	}
+	_ = forkBinding
+	sess, err := pool.GetOrCreate(openCtx, openInput)
 	if err != nil {
 		_ = manager.Delete(ctx, created.Key)
 		return ForkSessionOutput{}, err
@@ -525,6 +545,139 @@ func (s *Service) ForkSession(ctx context.Context, in ForkSessionInput) (ForkSes
 	}
 	log.Printf("[session/fork] done root=%s parent=%s child=%s agent=%s seq=%d turn=%d source_agent_session=%s fork_agent_session=%s", strings.TrimSpace(in.RootID), current.Key, out.Key, agentName, target.Seq, agentTurnIndex, binding.AgentSessionID, agentSessionID)
 	return ForkSessionOutput{Session: out}, nil
+}
+
+
+type MigrateSessionProviderInput struct {
+	RootID     string
+	Key        string
+	Agent      string
+	ProviderID string
+	Model      string
+}
+
+type MigrateSessionProviderOutput struct {
+	Session *session.Session
+}
+
+// MigrateSessionProvider creates a child MindFS session that copies visible history
+// and binds a new API provider. The child starts a fresh native agent session so a
+// changed/deleted provider endpoint does not silently reuse the old runtime.
+func (s *Service) MigrateSessionProvider(ctx context.Context, in MigrateSessionProviderInput) (MigrateSessionProviderOutput, error) {
+	if err := s.ensureRegistry(); err != nil {
+		return MigrateSessionProviderOutput{}, err
+	}
+	key := strings.TrimSpace(in.Key)
+	providerID := strings.TrimSpace(in.ProviderID)
+	if key == "" {
+		return MigrateSessionProviderOutput{}, errors.New("session key required")
+	}
+	if providerID == "" {
+		return MigrateSessionProviderOutput{}, errors.New("provider_id required")
+	}
+	manager, err := s.Registry.GetSessionManager(in.RootID)
+	if err != nil {
+		return MigrateSessionProviderOutput{}, err
+	}
+	current, err := manager.Get(ctx, key, 0)
+	if err != nil {
+		return MigrateSessionProviderOutput{}, err
+	}
+	agentName := strings.TrimSpace(in.Agent)
+	if agentName == "" {
+		agentName = strings.TrimSpace(session.InferAgentFromSession(current))
+	}
+	if agentName == "" {
+		return MigrateSessionProviderOutput{}, errors.New("agent required")
+	}
+	if !sessionProviderIsolationAgent(agentName) {
+		return MigrateSessionProviderOutput{}, errors.New("agent does not support session provider migration")
+	}
+	if SessionProviderResolver == nil {
+		return MigrateSessionProviderOutput{}, errors.New("session_provider_unavailable: provider resolver is unavailable")
+	}
+	providerConfig, err := SessionProviderResolver(agentName, providerID)
+	if err != nil {
+		return MigrateSessionProviderOutput{}, err
+	}
+	if providerConfig == nil || strings.TrimSpace(providerConfig.ID) == "" {
+		return MigrateSessionProviderOutput{}, errors.New("session_provider_unavailable: provider is unavailable")
+	}
+	model := strings.TrimSpace(in.Model)
+	if model == "" {
+		model = strings.TrimSpace(current.Model)
+	}
+	if model == "" {
+		for i := len(current.Exchanges) - 1; i >= 0; i-- {
+			if m := strings.TrimSpace(current.Exchanges[i].Model); m != "" {
+				model = m
+				break
+			}
+		}
+	}
+	if err := s.validateAgentModelForProvider(agentName, model, providerConfig); err != nil {
+		return MigrateSessionProviderOutput{}, err
+	}
+	maxSeq := 0
+	for _, exchange := range current.Exchanges {
+		if exchange.Seq > maxSeq {
+			maxSeq = exchange.Seq
+		}
+	}
+	sourceJSON, err := json.Marshal(map[string]any{
+		"type":        "provider_migrate",
+		"session_key": current.Key,
+		"agent":       agentName,
+		"provider_id": providerConfig.ID,
+		"seq":         maxSeq,
+	})
+	if err != nil {
+		return MigrateSessionProviderOutput{}, err
+	}
+	created, err := manager.Create(ctx, session.CreateInput{
+		Type:             session.TypeChat,
+		ParentSessionKey: current.Key,
+		Source:           string(sourceJSON),
+		Agent:            agentName,
+		Model:            model,
+		Name:             buildMigrateSessionName(current, providerConfig.ID),
+		PlanMode:         current.PlanMode,
+	})
+	if err != nil {
+		return MigrateSessionProviderOutput{}, err
+	}
+	if maxSeq > 0 {
+		if _, err := copyForkHistory(ctx, manager, current, created, maxSeq, agentName); err != nil {
+			_ = manager.Delete(ctx, created.Key)
+			return MigrateSessionProviderOutput{}, err
+		}
+	}
+	// Bind the target provider on the child only. Parent binding stays intact.
+	if _, _, err := s.resolveSessionProvider(ctx, manager, created, agentName, providerConfig.ID, true); err != nil {
+		_ = manager.Delete(ctx, created.Key)
+		return MigrateSessionProviderOutput{}, err
+	}
+	out, err := manager.Get(ctx, created.Key, 0)
+	if err != nil {
+		_ = manager.Delete(ctx, created.Key)
+		return MigrateSessionProviderOutput{}, err
+	}
+	log.Printf("[session/provider] migrate.done root=%s parent=%s child=%s agent=%s provider_id=%s model=%q exchanges=%d",
+		strings.TrimSpace(in.RootID), current.Key, out.Key, agentName, providerConfig.ID, model, len(out.Exchanges))
+	return MigrateSessionProviderOutput{Session: out}, nil
+}
+
+func buildMigrateSessionName(current *session.Session, providerID string) string {
+	base := "Migrated"
+	if current != nil && strings.TrimSpace(current.Name) != "" {
+		base = strings.TrimSpace(current.Name)
+	}
+	name := fmt.Sprintf("%s@%s", base, strings.TrimSpace(providerID))
+	runes := []rune(name)
+	if len(runes) > 80 {
+		name = string(runes[:80])
+	}
+	return name
 }
 
 func isACPAgent(pool *agent.Pool, agentName string) bool {
@@ -744,7 +897,7 @@ func (s *Service) GetSessionContextWindow(ctx context.Context, in GetSessionCont
 	if agentName == "" {
 		return agenttypes.ContextWindow{}, nil
 	}
-	sess, ok := pool.Get(agentPoolSessionKey(in.Key, agentName))
+	sess, ok := pool.Get(agentPoolSessionKey(in.Key, agentName, in.RootID))
 	if !ok || sess == nil {
 		return agenttypes.ContextWindow{}, nil
 	}
@@ -867,7 +1020,8 @@ func (s *Service) CloseSession(ctx context.Context, in CloseSessionInput) (*sess
 	}
 	if pool := s.Registry.GetAgentPool(); pool != nil && closed != nil {
 		for agentName := range closed.AgentCtxSeq {
-			pool.Close(agentPoolSessionKey(closed.Key, agentName))
+			pool.Close(agentPoolSessionKey(closed.Key, agentName, in.RootID))
+			notifyRuntimeState(in.RootID, closed.Key, agentName, "disconnected", "", "")
 		}
 	}
 	s.Registry.ReleaseFileWatcher(in.RootID, in.Key)
@@ -1038,6 +1192,9 @@ type SendMessageInput struct {
 	Key                    string
 	Agent                  string
 	Model                  string
+	ProviderID             string
+	AllowProviderBind      bool
+	UseGlobalAgentConfig   bool
 	Mode                   string
 	Effort                 string
 	FastService            string
@@ -1053,11 +1210,39 @@ type SendMessageInput struct {
 	OnAgentDefaultsChanged func(agentName string)
 }
 
+type SessionProviderConfig struct {
+	ID               string
+	Revision         string
+	EndpointRevision string
+	Protocol         string
+	Models           []string
+	Env              map[string]string
+	Args             []string
+}
+
+// SessionProviderResolver resolves a provider only at the server boundary. The
+// returned environment is used in memory to open Claude/Codex and is never
+// persisted to session metadata or exposed through WebSocket responses.
+var SessionProviderResolver func(agentName, providerID string) (*SessionProviderConfig, error)
+var ProviderSelectionValidator func(agentName, model, providerID string) error
+
+// RuntimeStateNotifier optionally surfaces per-session agent runtime open/close state.
+// Wired by the API layer to WebSocket clients.
+var RuntimeStateNotifier func(rootID, sessionKey, agentName, state, agentSessionID, message string)
+
+func notifyRuntimeState(rootID, sessionKey, agentName, state, agentSessionID, message string) {
+	if RuntimeStateNotifier == nil {
+		return
+	}
+	RuntimeStateNotifier(rootID, sessionKey, agentName, state, agentSessionID, message)
+}
+
 type RunTransientSlashCommandInput struct {
 	RootID      string
 	Key         string
 	Agent       string
 	Model       string
+	ProviderID  string
 	Mode        string
 	Effort      string
 	FastService string
@@ -1089,8 +1274,9 @@ const (
 	sessionNameTimeout       = 30 * time.Second
 	sessionNameMinMessageLen = 12
 	sessionRecoveryAttempts  = 3
-	sessionRecoveryDelay     = 30 * time.Second
 )
+
+var sessionRecoveryDelay = 30 * time.Second
 
 type SuggestSessionNameInput struct {
 	RootID       string
@@ -1104,20 +1290,27 @@ var (
 	sessionSendLocks   = make(map[string]*sync.Mutex)
 	activeTurnsMu      sync.Mutex
 	activeTurns        = make(map[string]*activeTurnState)
+	activeTurnSequence uint64
 )
 
 type activeTurnState struct {
-	cancel  context.CancelFunc
-	session agenttypes.Session
+	generation  uint64
+	cancel      context.CancelFunc
+	retryCancel context.CancelFunc
+	session     agenttypes.Session
 }
 
-func getSessionSendLock(sessionKey string) *sync.Mutex {
+func getSessionSendLock(rootID, sessionKey string) *sync.Mutex {
+	key := strings.TrimSpace(rootID) + "::" + strings.TrimSpace(sessionKey)
+	if strings.TrimSpace(sessionKey) == "" {
+		key = strings.TrimSpace(rootID)
+	}
 	sessionSendLocksMu.Lock()
 	defer sessionSendLocksMu.Unlock()
-	lock := sessionSendLocks[sessionKey]
+	lock := sessionSendLocks[key]
 	if lock == nil {
 		lock = &sync.Mutex{}
-		sessionSendLocks[sessionKey] = lock
+		sessionSendLocks[key] = lock
 	}
 	return lock
 }
@@ -1131,7 +1324,11 @@ func registerActiveTurn(rootID, sessionKey string, cancel context.CancelFunc) {
 		return
 	}
 	activeTurnsMu.Lock()
-	activeTurns[activeTurnKey(rootID, sessionKey)] = &activeTurnState{cancel: cancel}
+	activeTurnSequence++
+	activeTurns[activeTurnKey(rootID, sessionKey)] = &activeTurnState{
+		generation: activeTurnSequence,
+		cancel:     cancel,
+	}
 	activeTurnsMu.Unlock()
 }
 
@@ -1143,6 +1340,15 @@ func setActiveTurnSession(rootID, sessionKey string, sess agenttypes.Session) {
 	state := activeTurns[activeTurnKey(rootID, sessionKey)]
 	if state != nil {
 		state.session = sess
+	}
+	activeTurnsMu.Unlock()
+}
+
+func setActiveTurnRetryCancel(rootID, sessionKey string, cancel context.CancelFunc) {
+	activeTurnsMu.Lock()
+	state := activeTurns[activeTurnKey(rootID, sessionKey)]
+	if state != nil {
+		state.retryCancel = cancel
 	}
 	activeTurnsMu.Unlock()
 }
@@ -1162,10 +1368,42 @@ func getActiveTurn(rootID, sessionKey string) *activeTurnState {
 	return activeTurns[activeTurnKey(rootID, sessionKey)]
 }
 
-func agentPoolSessionKey(sessionKey, agentName string) string {
+// HasActiveSessionTurn reports whether a live SendMessage call still owns this
+// session. Queue cancellation uses it to avoid freezing an already-idle queue.
+func HasActiveSessionTurn(rootID, sessionKey string) bool {
+	return getActiveTurn(rootID, sessionKey) != nil
+}
+
+// ActiveSessionTurnGeneration identifies the current turn so delayed cancel
+// cleanup cannot terminate a turn started after the original cancel request.
+func ActiveSessionTurnGeneration(rootID, sessionKey string) (uint64, bool) {
+	active := getActiveTurn(rootID, sessionKey)
+	if active == nil {
+		return 0, false
+	}
+	return active.generation, true
+}
+
+func IsActiveSessionTurnGeneration(rootID, sessionKey string, generation uint64) bool {
+	if generation == 0 {
+		return false
+	}
+	active := getActiveTurn(rootID, sessionKey)
+	return active != nil && active.generation == generation
+}
+
+func agentPoolSessionKey(sessionKey, agentName string, rootID ...string) string {
 	trimmedSessionKey := strings.TrimSpace(sessionKey)
 	if trimmedSessionKey == "" {
 		return ""
+	}
+	root := ""
+	if len(rootID) > 0 {
+		root = strings.TrimSpace(rootID[0])
+	}
+	if root != "" {
+		// Isolate concurrent managed roots that may share session key material.
+		trimmedSessionKey = root + "::" + trimmedSessionKey
 	}
 	trimmedAgent := strings.TrimSpace(agentName)
 	if trimmedAgent == "" {
@@ -1227,7 +1465,7 @@ func sessionNameRunner(ctx context.Context, pool *agent.Pool, rootAbs string, in
 		return "", err
 	}
 
-	sessionKey := agentPoolSessionKey("name-"+in.SessionKey, agentName)
+	sessionKey := agentPoolSessionKey("name-"+in.SessionKey, agentName, in.RootID)
 	sess, err := pool.GetOrCreate(ctx, agenttypes.OpenSessionInput{
 		SessionKey: sessionKey,
 		AgentName:  agentName,
@@ -1404,8 +1642,113 @@ func isCanceledTurnError(err error) bool {
 	return strings.Contains(value, "context canceled") ||
 		strings.Contains(value, "context cancelled") ||
 		strings.Contains(value, "turn canceled") ||
-		strings.Contains(value, "turn cancelled") ||
-		strings.Contains(value, "cancelled")
+		strings.Contains(value, "turn cancelled")
+}
+
+func isContextOverflowAgentError(err error) bool {
+	if err == nil {
+		return false
+	}
+	value := strings.ToLower(strings.TrimSpace(err.Error()))
+	if value == "" {
+		return false
+	}
+	needles := []string{
+		"context length",
+		"context_length",
+		"context window",
+		"maximum context",
+		"max context",
+		"prompt is too long",
+		"prompt too long",
+		"request too large",
+		"tokens exceed",
+		"exceeds the context",
+		"exceeded the context",
+		"too many tokens",
+		"token limit",
+		"model context",
+		"input is too long",
+		"message is too long",
+		"remote compaction failed",
+		"compact_remote",
+	}
+	for _, needle := range needles {
+		if strings.Contains(value, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func supportsPromptCompactRetry(agentName string) bool {
+	// Only agents known to accept a prompt compact (/compact or equivalent).
+	// Unknown names must not get a blind compact+retry loop.
+	switch strings.ToLower(strings.TrimSpace(agentName)) {
+	case "opencode", "claude", "codex", "qwen", "gemini", "goose", "crush", "kilocode", "iflow", "pi", "hermes", "openclaw", "omp":
+		return true
+	default:
+		return false
+	}
+}
+
+const autoCompactPrompt = "/compact\nPlease compact this conversation to free context window, keep critical decisions and file paths, drop verbose tool logs."
+
+// shouldAttemptContextOverflowCompact is the gate used by SendMessage before
+// entering the one-shot compact→retry path.
+//
+// Mid-turn overflow (after some assistant chunks) is allowed: partial output is
+// already in pending aux/responseText, and retry continues the turn after compact.
+// Callers may still pass sawAssistantChunk for logging/metrics; it no longer blocks.
+func shouldAttemptContextOverflowCompact(sendErr error, agentName string, _sawAssistantChunk bool) bool {
+	return sendErr != nil &&
+		!isCanceledTurnError(sendErr) &&
+		isContextOverflowAgentError(sendErr) &&
+		supportsPromptCompactRetry(agentName)
+}
+
+// runContextOverflowCompactRetry performs reopen + /compact + original-prompt retry.
+// emitCompact is called for durable/UI notices (auto start and complete).
+// reopen must replace the live runtime so compact runs on a clean stream.
+func runContextOverflowCompactRetry(
+	turnCtx context.Context,
+	prompt string,
+	reopen func() error,
+	sendCompact func(ctx context.Context, compactPrompt string) error,
+	sendRetry func(ctx context.Context, prompt string) error,
+	emitCompact func(notice agenttypes.CompactNotice),
+) error {
+	if emitCompact != nil {
+		emitCompact(agenttypes.CompactNotice{
+			ID:      "auto-compact-" + randomHex(6),
+			Status:  "auto",
+			Summary: "Context overflow detected; requesting compact and retrying this turn.",
+		})
+	}
+	if reopen != nil {
+		if err := reopen(); err != nil {
+			return fmt.Errorf("context overflow and compact reopen failed: %v", err)
+		}
+	}
+	if sendCompact != nil {
+		if compactErr := sendCompact(turnCtx, autoCompactPrompt); compactErr != nil && !isCanceledTurnError(compactErr) {
+			// Still try resending original prompt after reopen; some agents compact on resume.
+			log.Printf("[session] compact.prompt.failed err=%v", compactErr)
+		} else if emitCompact != nil {
+			emitCompact(agenttypes.CompactNotice{
+				ID:      "auto-compact-done-" + randomHex(4),
+				Status:  "complete",
+				Summary: "Compact request finished; retrying the original turn.",
+			})
+		}
+	}
+	if sendRetry == nil {
+		return errors.New("context overflow compact retry missing send function")
+	}
+	if retryErr := sendRetry(turnCtx, prompt); retryErr != nil {
+		return fmt.Errorf("context overflow persists after compact retry: %v", retryErr)
+	}
+	return nil
 }
 
 func isNonRecoverableAgentError(err error) bool {
@@ -1427,6 +1770,23 @@ func isNonRecoverableAgentError(err error) bool {
 		"remote compaction failed",
 		"compact_remote",
 		"responsetoomanyfailedattempts",
+		// Context overflow / auto-compact failures (OpenCode/Claude/provider).
+		"context length",
+		"context_length",
+		"context window",
+		"maximum context",
+		"max context",
+		"prompt is too long",
+		"prompt too long",
+		"request too large",
+		"tokens exceed",
+		"exceeds the context",
+		"exceeded the context",
+		"too many tokens",
+		"token limit",
+		"model context",
+		"input is too long",
+		"message is too long",
 	}
 	for _, needle := range needles {
 		if strings.Contains(value, needle) {
@@ -1436,23 +1796,47 @@ func isNonRecoverableAgentError(err error) bool {
 	return false
 }
 
-func cancelRuntimeAfterNonRecoverableError(sess agenttypes.Session, pool *agent.Pool, agentName string, cause error) {
+func isRecoverableTransportError(err error) bool {
+	if err == nil {
+		return false
+	}
+	value := strings.ToLower(strings.TrimSpace(err.Error()))
+	needles := []string{
+		"peer disconnected",
+		"stream disconnected",
+		"upstream connection error",
+		"connection closed",
+		"connection reset",
+		"broken pipe",
+		"unexpected eof",
+		"websocket: close",
+	}
+	for _, needle := range needles {
+		if strings.Contains(value, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func cancelRuntimeAfterNonRecoverableError(sess agenttypes.Session, pool *agent.Pool, rootID, mindfsSessionKey, agentName string, cause error) {
 	agentName = strings.TrimSpace(agentName)
+	mindfsSessionKey = strings.TrimSpace(mindfsSessionKey)
 	if sess != nil {
 		if err := sess.CancelCurrentTurn(); err != nil {
 			log.Printf("[session] turn.cancel_after_non_recoverable.error agent=%s cause=%v err=%v", agentName, cause, err)
 		}
 	}
-	if pool != nil && agentName != "" {
-		if _, ok := pool.KillAgentProcess(agentName, 0); ok {
-			log.Printf("[session] runtime.kill_after_non_recoverable.done agent=%s cause=%v", agentName, cause)
-			return
-		}
-	}
+	// Close only this runtime session and drop its pool entry so the next turn
+	// cannot reuse a dead handle. Do not kill the whole agent process.
 	if sess != nil {
 		if err := sess.Close(); err != nil {
 			log.Printf("[session] runtime.close_after_non_recoverable.error agent=%s cause=%v err=%v", agentName, cause, err)
 		}
+	}
+	if pool != nil && mindfsSessionKey != "" && agentName != "" {
+		pool.Close(agentPoolSessionKey(mindfsSessionKey, agentName, rootID))
+		log.Printf("[session] runtime.pool_close_after_non_recoverable.done session=%s agent=%s cause=%v", mindfsSessionKey, agentName, cause)
 	}
 }
 
@@ -1657,16 +2041,41 @@ func (s *Service) ensureAgentSession(
 	pool *agent.Pool,
 	manager *session.Manager,
 	current *session.Session,
+	rootID string,
 	agentName string,
 	model string,
 	mode string,
 	effort string,
 	fastService string,
 	rootAbs string,
+	binding *session.AgentBinding,
+	providerConfig *SessionProviderConfig,
 ) (agenttypes.Session, *int, error) {
-	poolSessionKey := agentPoolSessionKey(current.Key, agentName)
-	nextModel := resolveRuntimeModel(current, nil, model)
-	nextMode := resolveRuntimeMode(current, mode)
+	poolSessionKey := agentPoolSessionKey(current.Key, agentName, rootID)
+	mindfsKey := ""
+	if current != nil {
+		mindfsKey = strings.TrimSpace(current.Key)
+	}
+	notifyOpen := func(sess agenttypes.Session, state string, err error) {
+		if mindfsKey == "" || strings.TrimSpace(agentName) == "" {
+			return
+		}
+		sid := ""
+		if sess != nil {
+			sid = strings.TrimSpace(sess.SessionID())
+		}
+		msg := ""
+		if err != nil {
+			msg = err.Error()
+		}
+		notifyRuntimeState(rootID, mindfsKey, agentName, state, sid, msg)
+	}
+	providerRuntimeKey := ""
+	if providerConfig != nil {
+		providerRuntimeKey = agentName + ":" + providerConfig.ID + ":" + providerConfig.Revision
+	}
+	nextModel := resolveRuntimeModel(agentName, current, nil, model)
+	nextMode := resolveRuntimeMode(agentName, current, mode)
 	nextEffort := resolveRuntimeEffort(agentName, current, effort)
 	nextFastService := resolveRuntimeFastService(agentName, current, fastService)
 	nextPlanMode := current != nil && current.PlanMode
@@ -1676,16 +2085,16 @@ func (s *Service) ensureAgentSession(
 	currentFastService := ""
 	currentPlanMode := false
 	if current != nil {
-		currentModel = resolveSessionExchangeModel(current)
-		if currentModel == "" {
+		currentModel = resolveSessionExchangeModelForAgent(current, agentName)
+		if currentModel == "" && strings.TrimSpace(session.InferAgentFromSession(current)) == strings.TrimSpace(agentName) {
 			currentModel = strings.TrimSpace(current.Model)
 		}
-		currentMode = resolveSessionExchangeMode(current)
-		currentEffort = session.InferEffortFromSession(current)
-		currentFastService = inferFastServiceFromSession(current)
+		currentMode = resolveRuntimeMode(agentName, current, mode)
+		currentEffort = resolveSessionExchangeEffortForAgent(current, agentName)
+		currentFastService = resolveSessionExchangeFastServiceForAgent(current, agentName)
 		currentPlanMode = current.PlanMode
 	}
-	if existing, ok := pool.Get(poolSessionKey); ok {
+	if existing, ok := pool.Get(poolSessionKey); ok && (providerRuntimeKey == "" || pool.RuntimeKey(poolSessionKey) == providerRuntimeKey) {
 		if !shouldReopenSessionForSetting(pool, agentName, currentEffort, nextEffort) &&
 			currentFastService == nextFastService {
 			if current != nil && currentModel != nextModel {
@@ -1696,6 +2105,16 @@ func (s *Service) ensureAgentSession(
 					}
 					log.Printf("[session/model] switch.error session=%s agent=%s model=%q pool_session=%s err=%v", current.Key, agentName, nextModel, poolSessionKey, err)
 					return nil, nil, err
+				}
+				// Persist immediately after the runtime accepts the model. A later
+				// message failure must not leave the session metadata on the old model.
+				if manager != nil {
+					if err := manager.UpdateModel(ctx, current, nextModel); err != nil {
+						if rollbackErr := existing.SetModel(ctx, currentModel); rollbackErr != nil {
+							log.Printf("[session/model] switch.rollback.error session=%s agent=%s model=%q err=%v", current.Key, agentName, currentModel, rollbackErr)
+						}
+						return nil, nil, err
+					}
 				}
 				log.Printf("[session/model] switch.done session=%s agent=%s model=%q pool_session=%s", current.Key, agentName, nextModel, poolSessionKey)
 			}
@@ -1726,10 +2145,13 @@ func (s *Service) ensureAgentSession(
 				last := current.AgentCtxSeq[agentName]
 				currentSeq = &last
 			}
+			// Reusing an already-open runtime: do not re-broadcast "connected"
+			// (would spam toasts on every message).
 			return existing, currentSeq, nil
 		}
 		log.Printf("[session/settings] reopen.detected session=%s agent=%s effort_from=%q effort_to=%q fast_service_from=%q fast_service_to=%q action=resume_runtime_session", current.Key, agentName, currentEffort, nextEffort, currentFastService, nextFastService)
 		pool.Close(poolSessionKey)
+		notifyOpen(nil, "disconnected", nil)
 	}
 
 	openCtx := pool.Context()
@@ -1737,8 +2159,7 @@ func (s *Service) ensureAgentSession(
 		openCtx = ctx
 	}
 
-	var binding *session.AgentBinding
-	if manager != nil {
+	if binding == nil && manager != nil {
 		var err error
 		binding, err = manager.FindAgentBinding(ctx, current.Key, agentName)
 		if err != nil {
@@ -1768,15 +2189,23 @@ func (s *Service) ensureAgentSession(
 			return binding.AgentCtxSeq
 		}(),
 	}
+	if providerConfig != nil {
+		openInput.RuntimeEnv = cloneProviderRuntimeEnv(providerConfig.Env)
+		openInput.RuntimeArgs = append([]string{}, providerConfig.Args...)
+		openInput.RuntimeKey = providerRuntimeKey
+	}
 	if openInput.AgentSessionID != "" {
 		log.Printf("[session/model] open session=%s agent=%s model=%q mode=%q effort=%q fast_service=%q pool_session=%s action=resume_runtime_session agent_session_id=%s agent_ctx_seq=%d", current.Key, agentName, nextModel, nextMode, nextEffort, nextFastService, poolSessionKey, openInput.AgentSessionID, openInput.AgentCtxSeq)
 	} else {
 		log.Printf("[session/model] open session=%s agent=%s model=%q mode=%q effort=%q fast_service=%q pool_session=%s action=open_new_runtime_session", current.Key, agentName, nextModel, nextMode, nextEffort, nextFastService, poolSessionKey)
 	}
+	notifyOpen(nil, "opening", nil)
 	sess, err := pool.GetOrCreate(openCtx, openInput)
 	var ctxSeqOverride *int
 	if err != nil {
-		if openInput.AgentSessionID != "" {
+		if openInput.AgentSessionID != "" && binding != nil && strings.TrimSpace(binding.ProviderID) != "" {
+			log.Printf("[session/provider] resume.error session=%s agent=%s provider_id=%s model=%q action=fail_without_fallback err=%v", current.Key, agentName, binding.ProviderID, nextModel, err)
+		} else if openInput.AgentSessionID != "" {
 			log.Printf("[session/model] resume.error session=%s agent=%s model=%q mode=%q effort=%q fast_service=%q pool_session=%s agent_session_id=%s err=%v fallback=open_new_runtime_session", current.Key, agentName, nextModel, nextMode, nextEffort, nextFastService, poolSessionKey, openInput.AgentSessionID, err)
 			openInput.AgentSessionID = ""
 			openInput.AgentCtxSeq = 0
@@ -1792,14 +2221,133 @@ func (s *Service) ensureAgentSession(
 			prober.ReportRuntimeFailure(agentName, err)
 		}
 		log.Printf("[session/model] open.error session=%s agent=%s model=%q mode=%q effort=%q fast_service=%q pool_session=%s err=%v", current.Key, agentName, nextModel, nextMode, nextEffort, nextFastService, poolSessionKey, err)
+		notifyOpen(nil, "error", err)
 		return nil, nil, err
 	}
 	if ctxSeqOverride == nil && binding != nil && openInput.AgentSessionID != "" {
 		last := binding.AgentCtxSeq
 		ctxSeqOverride = &last
 	}
+	if current != nil && currentModel != nextModel && manager != nil {
+		if err := manager.UpdateModel(ctx, current, nextModel); err != nil {
+			pool.Close(poolSessionKey)
+			return nil, nil, err
+		}
+	}
 	log.Printf("[session/model] open.done session=%s agent=%s model=%q mode=%q effort=%q fast_service=%q pool_session=%s", current.Key, agentName, nextModel, nextMode, nextEffort, nextFastService, poolSessionKey)
+	notifyOpen(sess, "connected", nil)
 	return sess, ctxSeqOverride, nil
+}
+
+func (s *Service) resolveSessionProvider(ctx context.Context, manager *session.Manager, current *session.Session, agentName, requestedProviderID string, allowBind bool) (*session.AgentBinding, *SessionProviderConfig, error) {
+	if manager == nil || current == nil || !sessionProviderIsolationAgent(agentName) {
+		return nil, nil, nil
+	}
+	binding, err := manager.FindAgentBinding(ctx, current.Key, agentName)
+	if err != nil {
+		return nil, nil, err
+	}
+	requestedProviderID = strings.TrimSpace(requestedProviderID)
+	if binding != nil && strings.TrimSpace(binding.ProviderID) != "" {
+		if requestedProviderID != "" && requestedProviderID != binding.ProviderID {
+			return nil, nil, fmt.Errorf("session_provider_mismatch: session is bound to provider %q", binding.ProviderID)
+		}
+		if SessionProviderResolver == nil {
+			return nil, nil, errors.New("session_provider_unavailable: provider resolver is unavailable")
+		}
+		config, err := SessionProviderResolver(agentName, binding.ProviderID)
+		if err != nil {
+			return nil, nil, err
+		}
+		if config == nil || config.ID != binding.ProviderID {
+			return nil, nil, errors.New("session_provider_unavailable: bound provider is unavailable")
+		}
+		if strings.TrimSpace(binding.AgentSessionID) != "" {
+			// Endpoint/protocol identity is sticky once a native agent session exists.
+			// Empty historical endpoint revision still blocks when the live config has a
+			// non-empty revision (treat as changed rather than silently rebinding).
+			boundEndpoint := strings.TrimSpace(binding.ProviderEndpointRevision)
+			liveEndpoint := strings.TrimSpace(config.EndpointRevision)
+			if liveEndpoint != "" && boundEndpoint != liveEndpoint {
+				return nil, nil, errors.New("session_provider_changed: bound provider endpoint or protocol changed; migrate the session to continue")
+			}
+		}
+		if binding.ProviderRevision != config.Revision || binding.ProviderProtocol != config.Protocol || binding.ProviderState != "available" {
+			if err := manager.UpdateBoundProvider(ctx, session.AgentBinding{
+				SessionKey:               current.Key,
+				Agent:                    agentName,
+				ProviderID:               binding.ProviderID,
+				ProviderRevision:         config.Revision,
+				ProviderEndpointRevision: config.EndpointRevision,
+				ProviderProtocol:         config.Protocol,
+				ProviderState:            "available",
+			}); err != nil {
+				return nil, nil, err
+			}
+			binding.ProviderRevision = config.Revision
+			binding.ProviderEndpointRevision = config.EndpointRevision
+			binding.ProviderProtocol = config.Protocol
+			binding.ProviderState = "available"
+		}
+		return binding, config, nil
+	}
+	if requestedProviderID == "" {
+		return binding, nil, nil
+	}
+	if !allowBind {
+		return nil, nil, errors.New("session_provider_mismatch: existing sessions cannot acquire a provider binding")
+	}
+	if SessionProviderResolver == nil {
+		return nil, nil, errors.New("session_provider_unavailable: provider resolver is unavailable")
+	}
+	config, err := SessionProviderResolver(agentName, requestedProviderID)
+	if err != nil {
+		return nil, nil, err
+	}
+	if config == nil || strings.TrimSpace(config.ID) == "" {
+		return nil, nil, errors.New("session_provider_unavailable: provider is unavailable")
+	}
+	binding, err = manager.BindProviderIfUnbound(ctx, session.AgentBinding{
+		SessionKey:               current.Key,
+		Agent:                    agentName,
+		ProviderID:               config.ID,
+		ProviderRevision:         config.Revision,
+		ProviderEndpointRevision: config.EndpointRevision,
+		ProviderProtocol:         config.Protocol,
+		ProviderState:            "available",
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	if binding.ProviderID != config.ID {
+		return nil, nil, fmt.Errorf("session_provider_mismatch: session is bound to provider %q", binding.ProviderID)
+	}
+	return binding, config, nil
+}
+
+// SessionProviderIsolationAgent reports whether agent uses session-scoped providers.
+func SessionProviderIsolationAgent(agentName string) bool {
+	return sessionProviderIsolationAgent(agentName)
+}
+
+func sessionProviderIsolationAgent(agentName string) bool {
+	switch strings.ToLower(strings.TrimSpace(agentName)) {
+	case "claude", "codex":
+		return true
+	default:
+		return false
+	}
+}
+
+func cloneProviderRuntimeEnv(env map[string]string) map[string]string {
+	if len(env) == 0 {
+		return nil
+	}
+	cloned := make(map[string]string, len(env))
+	for key, value := range env {
+		cloned[key] = value
+	}
+	return cloned
 }
 
 func shouldReopenSessionForSetting(pool *agent.Pool, agentName, currentValue, nextValue string) bool {
@@ -1822,7 +2370,7 @@ func shouldReopenSessionForSetting(pool *agent.Pool, agentName, currentValue, ne
 	return protocol == agent.ProtocolCodexSDK || protocol == agent.ProtocolClaudeSDK
 }
 
-func resolveRuntimeModel(current *session.Session, runtime agenttypes.Session, requested string) string {
+func resolveRuntimeModel(agentName string, current *session.Session, runtime agenttypes.Session, requested string) string {
 	if model := strings.TrimSpace(requested); model != "" {
 		return model
 	}
@@ -1831,10 +2379,10 @@ func resolveRuntimeModel(current *session.Session, runtime agenttypes.Session, r
 			return model
 		}
 	}
-	if model := resolveSessionExchangeModel(current); model != "" {
+	if model := resolveSessionExchangeModelForAgent(current, agentName); model != "" {
 		return model
 	}
-	if current == nil {
+	if current == nil || strings.TrimSpace(session.InferAgentFromSession(current)) != strings.TrimSpace(agentName) {
 		return ""
 	}
 	return strings.TrimSpace(current.Model)
@@ -1862,11 +2410,11 @@ func (s *Service) resolveExchangeModelDisplayName(agentName, model string) strin
 	return ""
 }
 
-func resolveRuntimeEffort(_ string, current *session.Session, requested string) string {
+func resolveRuntimeEffort(agentName string, current *session.Session, requested string) string {
 	if effort := strings.TrimSpace(requested); effort != "" {
 		return effort
 	}
-	if effort := session.InferEffortFromSession(current); effort != "" {
+	if effort := resolveSessionExchangeEffortForAgent(current, agentName); effort != "" {
 		return effort
 	}
 	return ""
@@ -1879,28 +2427,36 @@ func resolveRuntimeFastService(agentName string, current *session.Session, reque
 	if value := strings.TrimSpace(requested); value != "" {
 		return value
 	}
-	return inferFastServiceFromSession(current)
+	return resolveSessionExchangeFastServiceForAgent(current, agentName)
 }
 
 func inferFastServiceFromSession(current *session.Session) string {
 	return session.InferFastServiceFromSession(current)
 }
 
-func resolveRuntimeMode(current *session.Session, requested string) string {
+func resolveRuntimeMode(agentName string, current *session.Session, requested string) string {
 	if mode := strings.TrimSpace(requested); mode != "" {
 		return mode
 	}
-	if mode := resolveSessionExchangeMode(current); mode != "" {
+	if mode := resolveSessionExchangeModeForAgent(current, agentName); mode != "" {
 		return mode
 	}
 	return ""
 }
 
 func resolveSessionExchangeModel(current *session.Session) string {
+	return resolveSessionExchangeModelForAgent(current, "")
+}
+
+func resolveSessionExchangeModelForAgent(current *session.Session, agentName string) string {
 	if current == nil || len(current.Exchanges) == 0 {
 		return ""
 	}
+	agentName = strings.TrimSpace(agentName)
 	for i := len(current.Exchanges) - 1; i >= 0; i-- {
+		if agentName != "" && strings.TrimSpace(current.Exchanges[i].Agent) != agentName {
+			continue
+		}
 		model := strings.TrimSpace(current.Exchanges[i].Model)
 		if model != "" {
 			return model
@@ -1910,13 +2466,53 @@ func resolveSessionExchangeModel(current *session.Session) string {
 }
 
 func resolveSessionExchangeMode(current *session.Session) string {
+	return resolveSessionExchangeModeForAgent(current, "")
+}
+
+func resolveSessionExchangeModeForAgent(current *session.Session, agentName string) string {
 	if current == nil || len(current.Exchanges) == 0 {
 		return ""
 	}
+	agentName = strings.TrimSpace(agentName)
 	for i := len(current.Exchanges) - 1; i >= 0; i-- {
+		if agentName != "" && strings.TrimSpace(current.Exchanges[i].Agent) != agentName {
+			continue
+		}
 		mode := strings.TrimSpace(current.Exchanges[i].Mode)
 		if mode != "" {
 			return mode
+		}
+	}
+	return ""
+}
+
+func resolveSessionExchangeEffortForAgent(current *session.Session, agentName string) string {
+	if current == nil || len(current.Exchanges) == 0 {
+		return ""
+	}
+	agentName = strings.TrimSpace(agentName)
+	for i := len(current.Exchanges) - 1; i >= 0; i-- {
+		if agentName != "" && strings.TrimSpace(current.Exchanges[i].Agent) != agentName {
+			continue
+		}
+		if effort := strings.TrimSpace(current.Exchanges[i].Effort); effort != "" {
+			return effort
+		}
+	}
+	return ""
+}
+
+func resolveSessionExchangeFastServiceForAgent(current *session.Session, agentName string) string {
+	if current == nil || len(current.Exchanges) == 0 {
+		return ""
+	}
+	agentName = strings.TrimSpace(agentName)
+	for i := len(current.Exchanges) - 1; i >= 0; i-- {
+		if agentName != "" && strings.TrimSpace(current.Exchanges[i].Agent) != agentName {
+			continue
+		}
+		if fastService := strings.TrimSpace(current.Exchanges[i].FastService); fastService != "" {
+			return fastService
 		}
 	}
 	return ""
@@ -1926,7 +2522,7 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 	if err := s.ensureRegistry(); err != nil {
 		return err
 	}
-	sendLock := getSessionSendLock(in.Key)
+	sendLock := getSessionSendLock(in.RootID, in.Key)
 	sendLock.Lock()
 	defer sendLock.Unlock()
 	turnCtx, turnCancel := context.WithCancel(ctx)
@@ -1951,14 +2547,36 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 	if current.Type == session.TypeCommand {
 		return s.sendCommandMessage(turnCtx, in, manager, current)
 	}
-	if err := s.validateAgentModel(in.Agent, in.Model); err != nil {
+	if strings.TrimSpace(in.ProviderID) != "" && ProviderSelectionValidator != nil {
+		if err := ProviderSelectionValidator(in.Agent, in.Model, in.ProviderID); err != nil {
+			return err
+		}
+	}
+	var binding *session.AgentBinding
+	var providerConfig *SessionProviderConfig
+	if in.UseGlobalAgentConfig {
+		binding, err = manager.FindAgentBinding(ctx, current.Key, in.Agent)
+		if err != nil {
+			return err
+		}
+		if binding != nil && strings.TrimSpace(binding.ProviderID) != "" {
+			return errors.New("session_provider_mismatch: session is provider-bound and cannot run with the global agent configuration; use a session that has system global provider or create a new kanban-bound session")
+		}
+	} else {
+		binding, providerConfig, err = s.resolveSessionProvider(ctx, manager, current, in.Agent, in.ProviderID, in.AllowProviderBind)
+	}
+	if err != nil {
+		return err
+	}
+	resolvedRequestedModel := resolveRuntimeModel(in.Agent, current, nil, in.Model)
+	if err := s.validateAgentModelForProvider(in.Agent, resolvedRequestedModel, providerConfig); err != nil {
 		log.Printf("[session/model] validate.error root=%s session=%s agent=%s model=%q err=%v", in.RootID, in.Key, strings.TrimSpace(in.Agent), strings.TrimSpace(in.Model), err)
 		return err
 	}
 	isInitial := len(current.Exchanges) == 0
 	agentPool := s.Registry.GetAgentPool()
 	if agentPool == nil {
-		return nil
+		return errors.New("agent pool not configured")
 	}
 	watcher, _ := s.Registry.GetFileWatcher(in.RootID, manager)
 	if watcher != nil {
@@ -1972,7 +2590,7 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 		rootAbs = filepath.Clean(runtimeRootPath)
 	}
 	planMode := current != nil && current.PlanMode
-	sess, agentCtxSeq, err := s.ensureAgentSession(turnCtx, agentPool, manager, current, in.Agent, in.Model, in.Mode, in.Effort, in.FastService, rootAbs)
+	sess, agentCtxSeq, err := s.ensureAgentSession(turnCtx, agentPool, manager, current, in.RootID, in.Agent, in.Model, in.Mode, in.Effort, in.FastService, rootAbs, binding, providerConfig)
 	if err != nil {
 		return err
 	}
@@ -1988,11 +2606,29 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 		RuntimeRootAbs: rootAbs,
 		IsInitial:      isInitial,
 	})
+	resolvedMode := resolveRuntimeMode(in.Agent, current, in.Mode)
+	resolvedModel := resolveRuntimeModel(in.Agent, current, sess, in.Model)
+	resolvedEffort := resolveRuntimeEffort(in.Agent, current, in.Effort)
+	resolvedFastService := resolveRuntimeFastService(in.Agent, current, in.FastService)
+	modelDisplayName := s.resolveExchangeModelDisplayName(in.Agent, resolvedModel)
+	turnStartedAt := time.Now().UTC()
+	if err := manager.StartPendingTurn(ctx, current,
+		session.Exchange{Seq: len(current.Exchanges) + 1, Role: "user", Agent: in.Agent, Model: resolvedModel, ModelDisplayName: modelDisplayName, Mode: resolvedMode, Effort: resolvedEffort, FastService: resolvedFastService, Content: in.Content, Timestamp: turnStartedAt},
+		session.Exchange{Seq: len(current.Exchanges) + 2, Role: "agent", Agent: in.Agent, Model: resolvedModel, ModelDisplayName: modelDisplayName, Mode: resolvedMode, Effort: resolvedEffort, FastService: resolvedFastService, Timestamp: turnStartedAt},
+	); err != nil {
+		return err
+	}
 	var responseText string
 	sawAssistantChunk := false
 	plannedAssistantSeq := len(current.Exchanges) + 2
 	auxBuffer := make([]session.ExchangeAux, 0, 8)
 	defer manager.ClearPendingExchangeAux(context.Background(), current.Key)
+	defer manager.ReleasePendingTurn(context.Background(), current.Key)
+	updatePending := func() {
+		if err := manager.UpdatePendingTurn(context.Background(), current.Key, responseText, auxBuffer); err != nil {
+			log.Printf("[session] pending.update.error root=%s session=%s err=%v", in.RootID, current.Key, err)
+		}
+	}
 	var thoughtBuffer strings.Builder
 	currentThoughtID := ""
 	flushThought := func() {
@@ -2011,20 +2647,23 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 			Thought:   thought,
 			ThoughtID: thoughtID,
 		})
+		updatePending()
 	}
 	lastResponseUpdateType := ""
 	claudeSubagents := newClaudeSubagentRouter(subagentSessionInput{
-		RootID:      in.RootID,
-		Parent:      current,
-		Agent:       in.Agent,
-		Model:       in.Model,
-		Mode:        in.Mode,
-		Effort:      in.Effort,
-		FastService: in.FastService,
-		RootAbs:     rootAbs,
-		Manager:     manager,
-		OnCreated:   in.OnSubSessionCreated,
-		OnUpdate:    in.OnSubSessionUpdate,
+		RootID:         in.RootID,
+		Parent:         current,
+		Agent:          in.Agent,
+		Model:          in.Model,
+		Mode:           in.Mode,
+		Effort:         in.Effort,
+		FastService:    in.FastService,
+		RootAbs:        rootAbs,
+		Manager:        manager,
+		Binding:        binding,
+		ProviderConfig: providerConfig,
+		OnCreated:      in.OnSubSessionCreated,
+		OnUpdate:       in.OnSubSessionUpdate,
 	})
 	attachSessionUpdates := func(runtime agenttypes.Session) {
 		runtime.OnUpdate(func(update agenttypes.Event) {
@@ -2071,8 +2710,10 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 						Effort:      in.Effort,
 						FastService: in.FastService,
 						RootAbs:     rootAbs,
-						Pool:        agentPool,
-						Manager:     manager,
+						Pool:           agentPool,
+						Binding:        binding,
+						ProviderConfig: providerConfig,
+						Manager:        manager,
 						ToolCall:    toolCall,
 						OnCreated:   in.OnSubSessionCreated,
 						OnUpdate:    in.OnSubSessionUpdate,
@@ -2123,6 +2764,7 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 					sawAssistantChunk = true
 					responseText = appendResponseChunk(responseText, lastResponseUpdateType, chunk.Content)
 					lastResponseUpdateType = string(update.Type)
+					updatePending()
 				}
 			} else if update.Type == agenttypes.EventTypeThoughtChunk ||
 				update.Type == agenttypes.EventTypeToolCall ||
@@ -2132,6 +2774,9 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 				update.Type == agenttypes.EventTypeCompact {
 				lastResponseUpdateType = string(update.Type)
 			}
+			if update.Type != agenttypes.EventTypeMessageChunk {
+				updatePending()
+			}
 			if watcher != nil {
 				watcher.MarkSessionActive(current.Key)
 			}
@@ -2140,46 +2785,106 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 			}
 		})
 	}
-	sendWithAttachedUpdates := func(runtime agenttypes.Session, content string) error {
+	sendWithAttachedUpdates := func(sendCtx context.Context, runtime agenttypes.Session, content string) error {
 		attachSessionUpdates(runtime)
-		return runtime.SendMessage(turnCtx, content)
+		return runtime.SendMessage(sendCtx, content)
 	}
-	sendErr := sendWithAttachedUpdates(sess, prompt)
+	sendErr := sendWithAttachedUpdates(turnCtx, sess, prompt)
 	if sendErr != nil && !isCanceledTurnError(sendErr) {
-		if isNonRecoverableAgentError(sendErr) {
-			log.Printf("[session] turn.send.non_recoverable root=%s session=%s agent=%s action=fail_without_recovery err=%v", in.RootID, current.Key, in.Agent, sendErr)
-			cancelRuntimeAfterNonRecoverableError(sess, agentPool, in.Agent, sendErr)
-		} else if !sawAssistantChunk {
-			log.Printf("[session] turn.send.no_response root=%s session=%s agent=%s action=fail_without_recovery", in.RootID, current.Key, in.Agent)
-		} else {
-			if in.OnUpdate != nil {
-				in.OnUpdate(agenttypes.Event{
-					Type: agenttypes.EventTypeRecovery,
-					Data: agenttypes.RecoveryStatus{Message: "遇到错误，重试中..."},
+		// One-shot context overflow recovery: ask the agent to compact, then resend.
+		if shouldAttemptContextOverflowCompact(sendErr, in.Agent, sawAssistantChunk) {
+			log.Printf("[session] turn.send.context_overflow root=%s session=%s agent=%s action=compact_and_retry err=%v", in.RootID, current.Key, in.Agent, sendErr)
+			// Persist compact notices into pending aux so refresh mid-turn still
+			// shows auto-compact progress (not only a transient WS event).
+			emitDurableCompact := func(notice agenttypes.CompactNotice) {
+				compactCopy := notice
+				auxBuffer = append(auxBuffer, session.ExchangeAux{
+					Seq:     plannedAssistantSeq,
+					Line:    currentAssistantLine(responseText),
+					Compact: &compactCopy,
 				})
+				updatePending()
+				if in.OnUpdate != nil {
+					in.OnUpdate(agenttypes.Event{
+						Type: agenttypes.EventTypeCompact,
+						Data: notice,
+					})
+				}
 			}
-			recoveredSess, recoveredErr := s.recoverAgentTurn(turnCtx, SendRecoveryInput{
-				RootID:             in.RootID,
-				SessionKey:         current.Key,
-				Manager:            manager,
-				Current:            current,
-				AgentName:          in.Agent,
-				Model:              in.Model,
-				Mode:               in.Mode,
-				Effort:             in.Effort,
-				FastService:        in.FastService,
-				PlanMode:           planMode,
-				RootAbs:            rootAbs,
-				CurrentSession:     sess,
-				Prompt:             prompt,
-				SawAssistantChunk:  sawAssistantChunk,
-				SendWithAttachment: sendWithAttachedUpdates,
-			})
-			if recoveredErr != nil {
-				sendErr = recoveredErr
-			} else {
-				sess = recoveredSess
+			// Close and reopen runtime so compact is applied on a clean stream.
+			cancelRuntimeAfterNonRecoverableError(sess, agentPool, in.RootID, current.Key, in.Agent, sendErr)
+			compactErr := runContextOverflowCompactRetry(
+				turnCtx,
+				prompt,
+				func() error {
+					reopened, _, reopenErr := s.ensureAgentSession(turnCtx, agentPool, manager, current, in.RootID, in.Agent, in.Model, in.Mode, in.Effort, in.FastService, rootAbs, binding, providerConfig)
+					if reopenErr != nil {
+						log.Printf("[session] compact.reopen.failed root=%s session=%s agent=%s err=%v", in.RootID, current.Key, in.Agent, reopenErr)
+						return reopenErr
+					}
+					sess = reopened
+					setActiveTurnSession(in.RootID, current.Key, sess)
+					return nil
+				},
+				// Compact without attaching stream updates into the user-visible pending turn text.
+				func(ctx context.Context, compactPrompt string) error {
+					return sess.SendMessage(ctx, compactPrompt)
+				},
+				func(ctx context.Context, retryPrompt string) error {
+					return sendWithAttachedUpdates(ctx, sess, retryPrompt)
+				},
+				emitDurableCompact,
+			)
+			if compactErr == nil {
+				log.Printf("[session] compact.retry.ok root=%s session=%s agent=%s", in.RootID, current.Key, in.Agent)
 				sendErr = nil
+			} else {
+				log.Printf("[session] compact.retry.failed root=%s session=%s agent=%s err=%v", in.RootID, current.Key, in.Agent, compactErr)
+				sendErr = compactErr
+				cancelRuntimeAfterNonRecoverableError(sess, agentPool, in.RootID, current.Key, in.Agent, sendErr)
+			}
+		}
+		// Only enter failure/recovery paths when the turn is still failing.
+		if sendErr != nil {
+			// Overflow / compact-failed turns stay terminal (never transport-recover).
+			lowerSendErr := strings.ToLower(sendErr.Error())
+			if isContextOverflowAgentError(sendErr) || strings.Contains(lowerSendErr, "context overflow") || isNonRecoverableAgentError(sendErr) {
+				log.Printf("[session] turn.send.non_recoverable root=%s session=%s agent=%s action=fail_without_recovery err=%v", in.RootID, current.Key, in.Agent, sendErr)
+				cancelRuntimeAfterNonRecoverableError(sess, agentPool, in.RootID, current.Key, in.Agent, sendErr)
+			} else if !sawAssistantChunk && !isRecoverableTransportError(sendErr) {
+				log.Printf("[session] turn.send.no_response root=%s session=%s agent=%s action=fail_without_recovery", in.RootID, current.Key, in.Agent)
+			} else {
+				recoveryCtx, cancelRecovery := context.WithCancel(turnCtx)
+				setActiveTurnRetryCancel(in.RootID, current.Key, cancelRecovery)
+				recoveredSess, recoveredErr := s.recoverAgentTurn(recoveryCtx, SendRecoveryInput{
+					RootID:             in.RootID,
+					SessionKey:         current.Key,
+					Manager:            manager,
+					Current:            current,
+					AgentName:          in.Agent,
+					Model:              in.Model,
+					Mode:               in.Mode,
+					Effort:             in.Effort,
+					FastService:        in.FastService,
+					PlanMode:           planMode,
+					RootAbs:            rootAbs,
+					Pool:               agentPool,
+					Binding:            binding,
+					ProviderConfig:     providerConfig,
+					CurrentSession:     sess,
+					Prompt:             prompt,
+					SawAssistantChunk:  sawAssistantChunk,
+					SendWithAttachment: sendWithAttachedUpdates,
+					OnUpdate:           in.OnUpdate,
+				})
+				setActiveTurnRetryCancel(in.RootID, current.Key, nil)
+				cancelRecovery()
+				if recoveredErr != nil {
+					sendErr = recoveredErr
+				} else {
+					sess = recoveredSess
+					sendErr = nil
+				}
 			}
 		}
 	}
@@ -2188,9 +2893,6 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 	if sendErr != nil && !isCanceledTurnError(sendErr) {
 		log.Printf("[session] turn.send.error root=%s session=%s agent=%s err=%v", in.RootID, current.Key, in.Agent, sendErr)
 	}
-	resolvedModel := resolveRuntimeModel(current, sess, in.Model)
-	resolvedEffort := resolveRuntimeEffort(in.Agent, current, in.Effort)
-	resolvedFastService := resolveRuntimeFastService(in.Agent, current, in.FastService)
 	if prefs := s.Registry.GetPreferences(); prefs != nil {
 		if changed, err := prefs.UpdateAgentDefaultsIfChanged(in.Agent, resolvedModel, resolvedEffort, resolvedFastService); err != nil {
 			log.Printf("[preferences] agent_defaults.update.error agent=%s err=%v", strings.TrimSpace(in.Agent), err)
@@ -2204,34 +2906,50 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 	if err := manager.UpdateModel(ctx, current, resolvedModel); err != nil {
 		return err
 	}
-	resolvedMode := resolveRuntimeMode(current, in.Mode)
-	modelDisplayName := s.resolveExchangeModelDisplayName(in.Agent, resolvedModel)
-	exchangeCtx := session.WithExchangeModelDisplayName(ctx, modelDisplayName)
-	if err := manager.AddExchangeForAgent(exchangeCtx, current, "user", in.Content, in.Agent, resolvedMode, resolvedEffort, resolvedFastService); err != nil {
-		log.Printf("[session] persist.user.error root=%s session=%s agent=%s err=%v", in.RootID, current.Key, in.Agent, err)
-		return err
-	}
-	if err := manager.AddExchangeForAgent(exchangeCtx, current, "agent", responseText, in.Agent, resolvedMode, resolvedEffort, resolvedFastService); err != nil {
-		log.Printf("[session] persist.agent.error root=%s session=%s agent=%s err=%v", in.RootID, current.Key, in.Agent, err)
-		return err
-	}
-	for _, aux := range dedupeExchangeAuxBuffer(auxBuffer) {
-		aux = hydratePendingToolCallAux(ctx, manager, current.Key, aux)
-		if err := manager.AddExchangeAux(ctx, current.Key, aux); err != nil {
-			return err
+	if sendErr != nil {
+		updatePending()
+		if isCanceledTurnError(sendErr) {
+			_ = manager.DiscardPendingTurn(ctx, current.Key)
+		} else if sawAssistantChunk || strings.TrimSpace(responseText) != "" || len(auxBuffer) > 0 {
+			// Persist partial goal/agent output before surfacing the terminal error so
+			// MindFS history does not lose in-progress work when provider fails mid-turn.
+			for i := range auxBuffer {
+				auxBuffer[i] = hydratePendingToolCallAux(ctx, manager, current.Key, auxBuffer[i])
+			}
+			updatePending()
+			if err := manager.CompletePendingTurn(ctx, current.Key); err != nil {
+				log.Printf("[session] pending.complete_on_error.error root=%s session=%s err=%v", in.RootID, current.Key, err)
+			}
+		} else {
+			// No assistant output: keep the user message and an error marker so the
+			// failed turn is visible in MindFS history (empty agent content would be discarded).
+			marker := "Error: " + strings.TrimSpace(sendErr.Error())
+			if marker == "Error:" {
+				marker = "Error: agent turn failed"
+			}
+			_ = manager.UpdatePendingTurn(ctx, current.Key, marker, nil)
+			if err := manager.CompletePendingTurn(ctx, current.Key); err != nil {
+				log.Printf("[session] pending.complete_error_marker.error root=%s session=%s err=%v", in.RootID, current.Key, err)
+			}
 		}
+		if prober := s.Registry.GetProber(); prober != nil && !isCanceledTurnError(sendErr) {
+			prober.ReportRuntimeFailure(in.Agent, sendErr)
+		}
+		return sendErr
+	}
+	for i := range auxBuffer {
+		auxBuffer[i] = hydratePendingToolCallAux(ctx, manager, current.Key, auxBuffer[i])
+	}
+	updatePending()
+	if err := manager.CompletePendingTurn(ctx, current.Key); err != nil {
+		return err
 	}
 	if err := manager.UpdateAgentState(ctx, current, in.Agent, contextLineCount(current.Exchanges), sess.SessionID()); err != nil {
 		return err
 	}
 
 	prober := s.Registry.GetProber()
-	if sendErr != nil && !isCanceledTurnError(sendErr) {
-		if prober != nil {
-			prober.ReportRuntimeFailure(in.Agent, sendErr)
-		}
-		return sendErr
-	} else if prober != nil {
+	if prober != nil {
 		prober.ReportSuccess(in.Agent)
 	}
 	return nil
@@ -2250,7 +2968,7 @@ func (s *Service) RunTransientSlashCommand(ctx context.Context, in RunTransientS
 	if key == "" {
 		key = fmt.Sprintf("transient-%s-%d", command, time.Now().UnixNano())
 	}
-	sendLock := getSessionSendLock(key)
+	sendLock := getSessionSendLock(in.RootID, key)
 	sendLock.Lock()
 	defer sendLock.Unlock()
 
@@ -2281,16 +2999,46 @@ func (s *Service) RunTransientSlashCommand(ctx context.Context, in RunTransientS
 			return errors.New("slash command agent does not match session agent")
 		}
 	}
-	if err := s.validateAgentModel(agentName, in.Model); err != nil {
-		return err
-	}
 	agentPool := s.Registry.GetAgentPool()
 	if agentPool == nil {
 		return errors.New("agent pool not configured")
 	}
 	root := manager.Root()
 	rootAbs, _ := root.RootDir()
-	sess, _, err := s.ensureAgentSession(turnCtx, agentPool, manager, current, agentName, in.Model, in.Mode, in.Effort, in.FastService, rootAbs)
+	var binding *session.AgentBinding
+	var providerConfig *SessionProviderConfig
+	if command == "login" {
+		if strings.TrimSpace(in.ProviderID) != "" {
+			return errors.New("codex login is only available with the global agent configuration")
+		}
+		binding, err = manager.FindAgentBinding(ctx, current.Key, agentName)
+		if err != nil {
+			return err
+		}
+		if binding != nil && strings.TrimSpace(binding.ProviderID) != "" {
+			return errors.New("codex login is unavailable for an API-provider-bound session")
+		}
+	} else {
+		// Transient /status may run against a pre-created empty session or a pure
+		// transient key. Allow the first bind from the UI-selected provider so the
+		// diagnostic hits the same endpoint as normal session turns.
+		allowBind := false
+		if strings.TrimSpace(in.ProviderID) != "" {
+			if strings.HasPrefix(current.Key, "transient-") || len(current.Exchanges) == 0 {
+				allowBind = true
+			} else if binding, bindErr := manager.FindAgentBinding(ctx, current.Key, agentName); bindErr == nil {
+				allowBind = binding == nil || strings.TrimSpace(binding.ProviderID) == ""
+			}
+		}
+		binding, providerConfig, err = s.resolveSessionProvider(ctx, manager, current, agentName, in.ProviderID, allowBind)
+		if err != nil {
+			return err
+		}
+	}
+	if err := s.validateAgentModelForProvider(agentName, in.Model, providerConfig); err != nil {
+		return err
+	}
+	sess, _, err := s.ensureAgentSession(turnCtx, agentPool, manager, current, in.RootID, agentName, in.Model, in.Mode, in.Effort, in.FastService, rootAbs, binding, providerConfig)
 	if err != nil {
 		return err
 	}
@@ -2323,19 +3071,21 @@ func (s *Service) RunTransientSlashCommand(ctx context.Context, in RunTransientS
 }
 
 type subagentSessionInput struct {
-	RootID      string
-	Parent      *session.Session
-	Agent       string
-	Model       string
-	Mode        string
-	Effort      string
-	FastService string
-	RootAbs     string
-	Pool        *agent.Pool
-	Manager     *session.Manager
-	ToolCall    agenttypes.ToolCall
-	OnCreated   func(*session.Session)
-	OnUpdate    func(sessionKey string, update agenttypes.Event)
+	RootID         string
+	Parent         *session.Session
+	Agent          string
+	Model          string
+	Mode           string
+	Effort         string
+	FastService    string
+	RootAbs        string
+	Pool           *agent.Pool
+	Manager        *session.Manager
+	Binding        *session.AgentBinding
+	ProviderConfig *SessionProviderConfig
+	ToolCall       agenttypes.ToolCall
+	OnCreated      func(*session.Session)
+	OnUpdate       func(sessionKey string, update agenttypes.Event)
 }
 
 type claudeSubagentRouter struct {
@@ -2493,11 +3243,25 @@ func (r *claudeSubagentRouter) ensure(ctx context.Context, ref claudeSubagentRef
 	if err != nil {
 		return nil, err
 	}
-	if err := r.in.Manager.UpsertAgentBinding(ctx, session.AgentBinding{
+	childBinding := session.AgentBinding{
 		SessionKey:     child.Key,
 		Agent:          r.in.Agent,
 		AgentSessionID: "claude-subagent:" + primary,
-	}); err != nil {
+	}
+	if r.in.Binding != nil && strings.TrimSpace(r.in.Binding.ProviderID) != "" {
+		childBinding.ProviderID = r.in.Binding.ProviderID
+		childBinding.ProviderRevision = r.in.Binding.ProviderRevision
+		childBinding.ProviderEndpointRevision = r.in.Binding.ProviderEndpointRevision
+		childBinding.ProviderProtocol = r.in.Binding.ProviderProtocol
+		childBinding.ProviderState = r.in.Binding.ProviderState
+	} else if r.in.ProviderConfig != nil {
+		childBinding.ProviderID = r.in.ProviderConfig.ID
+		childBinding.ProviderRevision = r.in.ProviderConfig.Revision
+		childBinding.ProviderEndpointRevision = r.in.ProviderConfig.EndpointRevision
+		childBinding.ProviderProtocol = r.in.ProviderConfig.Protocol
+		childBinding.ProviderState = "available"
+	}
+	if err := r.in.Manager.UpsertAgentBinding(ctx, childBinding); err != nil {
 		return nil, err
 	}
 	attached := r.attach(child, ref)
@@ -2723,11 +3487,25 @@ func (s *Service) ensureSubagentSession(ctx context.Context, in subagentSessionI
 	if err != nil {
 		return nil, err
 	}
-	if err := in.Manager.UpsertAgentBinding(ctx, session.AgentBinding{
+	childBinding := session.AgentBinding{
 		SessionKey:     child.Key,
 		Agent:          in.Agent,
 		AgentSessionID: receiverThreadID,
-	}); err != nil {
+	}
+	if in.Binding != nil && strings.TrimSpace(in.Binding.ProviderID) != "" {
+		childBinding.ProviderID = in.Binding.ProviderID
+		childBinding.ProviderRevision = in.Binding.ProviderRevision
+		childBinding.ProviderEndpointRevision = in.Binding.ProviderEndpointRevision
+		childBinding.ProviderProtocol = in.Binding.ProviderProtocol
+		childBinding.ProviderState = in.Binding.ProviderState
+	} else if in.ProviderConfig != nil {
+		childBinding.ProviderID = in.ProviderConfig.ID
+		childBinding.ProviderRevision = in.ProviderConfig.Revision
+		childBinding.ProviderEndpointRevision = in.ProviderConfig.EndpointRevision
+		childBinding.ProviderProtocol = in.ProviderConfig.Protocol
+		childBinding.ProviderState = "available"
+	}
+	if err := in.Manager.UpsertAgentBinding(ctx, childBinding); err != nil {
 		return nil, err
 	}
 	if in.OnCreated != nil {
@@ -2746,8 +3524,8 @@ func (s *Service) startSubagentSubscription(in subagentSessionInput, child *sess
 		ctx, cancel := context.WithCancel(in.Pool.Context())
 		registerActiveTurn(in.RootID, child.Key, cancel)
 		defer unregisterActiveTurn(in.RootID, child.Key)
-		runtime, err := in.Pool.GetOrCreate(ctx, agenttypes.OpenSessionInput{
-			SessionKey:     agentPoolSessionKey(child.Key, in.Agent),
+		openInput := agenttypes.OpenSessionInput{
+			SessionKey:     agentPoolSessionKey(child.Key, in.Agent, in.RootID),
 			AgentName:      in.Agent,
 			Model:          firstNonEmptyString(stringMeta(in.ToolCall.Meta, "model"), in.Model),
 			Mode:           in.Mode,
@@ -2757,7 +3535,13 @@ func (s *Service) startSubagentSubscription(in subagentSessionInput, child *sess
 			RootPath:       in.RootAbs,
 			AgentSessionID: receiverThreadID,
 			AgentCtxSeq:    child.AgentCtxSeq[in.Agent],
-		})
+		}
+		if in.ProviderConfig != nil {
+			openInput.RuntimeEnv = cloneProviderRuntimeEnv(in.ProviderConfig.Env)
+			openInput.RuntimeArgs = append([]string{}, in.ProviderConfig.Args...)
+			openInput.RuntimeKey = in.Agent + ":" + in.ProviderConfig.ID + ":" + in.ProviderConfig.Revision
+		}
+		runtime, err := in.Pool.GetOrCreate(ctx, openInput)
 		if err != nil {
 			log.Printf("[subagent] subscription.open.error root=%s session=%s receiver=%s err=%v", in.RootID, child.Key, receiverThreadID, err)
 			return
@@ -3175,10 +3959,14 @@ type SendRecoveryInput struct {
 	FastService        string
 	PlanMode           bool
 	RootAbs            string
+	Pool               *agent.Pool
+	Binding            *session.AgentBinding
+	ProviderConfig     *SessionProviderConfig
 	CurrentSession     agenttypes.Session
 	Prompt             string
 	SawAssistantChunk  bool
-	SendWithAttachment func(agenttypes.Session, string) error
+	SendWithAttachment func(context.Context, agenttypes.Session, string) error
+	OnUpdate           func(agenttypes.Event)
 }
 
 func (s *Service) recoverAgentTurn(ctx context.Context, in SendRecoveryInput) (agenttypes.Session, error) {
@@ -3201,9 +3989,30 @@ func (s *Service) recoverAgentTurn(ctx context.Context, in SendRecoveryInput) (a
 	var lastErr error
 	for attempt := 1; attempt <= sessionRecoveryAttempts; attempt++ {
 		if attempt > 1 {
+			emitRecoveryStatus(in.OnUpdate, fmt.Sprintf("Connection interrupted. Retrying %d/%d in %s: %s", attempt, sessionRecoveryAttempts, sessionRecoveryDelay, recoveryErrorSummary(lastErr)))
 			log.Printf("[session/recovery] wait root=%s session=%s agent=%s attempt=%d/%d delay=%s", in.RootID, in.SessionKey, in.AgentName, attempt, sessionRecoveryAttempts, sessionRecoveryDelay)
 			if err := waitForRecoveryDelay(ctx, sessionRecoveryDelay); err != nil {
 				return nil, err
+			}
+			// Close the dead handle, drop the pool entry, and reopen with the same
+			// provider binding before retrying. Resending on a broken stream never
+			// recovers peer disconnects.
+			if in.CurrentSession != nil {
+				_ = in.CurrentSession.Close()
+			}
+			if in.Pool != nil {
+				in.Pool.Close(agentPoolSessionKey(in.SessionKey, in.AgentName, in.RootID))
+			}
+			if in.Pool != nil && in.Manager != nil && in.Current != nil {
+				reopened, _, reopenErr := s.ensureAgentSession(ctx, in.Pool, in.Manager, in.Current, in.RootID, in.AgentName, in.Model, in.Mode, in.Effort, in.FastService, in.RootAbs, in.Binding, in.ProviderConfig)
+				if reopenErr != nil {
+					lastErr = reopenErr
+					log.Printf("[session/recovery] reopen.failed root=%s session=%s agent=%s attempt=%d/%d err=%v", in.RootID, in.SessionKey, in.AgentName, attempt, sessionRecoveryAttempts, reopenErr)
+					continue
+				}
+				in.CurrentSession = reopened
+				setActiveTurnSession(in.RootID, in.SessionKey, reopened)
+				log.Printf("[session/recovery] reopen.done root=%s session=%s agent=%s attempt=%d/%d", in.RootID, in.SessionKey, in.AgentName, attempt, sessionRecoveryAttempts)
 			}
 		}
 
@@ -3214,8 +4023,9 @@ func (s *Service) recoverAgentTurn(ctx context.Context, in SendRecoveryInput) (a
 			recoveryMessage = "continue"
 			recoveryAction = "continue"
 		}
+		emitRecoveryStatus(in.OnUpdate, fmt.Sprintf("Retrying connection %d/%d: %s", attempt, sessionRecoveryAttempts, recoveryErrorSummary(lastErr)))
 		log.Printf("[session/recovery] send.start root=%s session=%s agent=%s attempt=%d/%d action=%s", in.RootID, in.SessionKey, in.AgentName, attempt, sessionRecoveryAttempts, recoveryAction)
-		if err := in.SendWithAttachment(sess, recoveryMessage); err != nil {
+		if err := in.SendWithAttachment(ctx, sess, recoveryMessage); err != nil {
 			if isCanceledTurnError(err) || ctx.Err() != nil {
 				return nil, err
 			}
@@ -3234,6 +4044,23 @@ func (s *Service) recoverAgentTurn(ctx context.Context, in SendRecoveryInput) (a
 		lastErr = errors.New("agent recovery failed")
 	}
 	return nil, lastErr
+}
+
+func emitRecoveryStatus(onUpdate func(agenttypes.Event), message string) {
+	if onUpdate != nil {
+		onUpdate(agenttypes.Event{Type: agenttypes.EventTypeRecovery, Data: agenttypes.RecoveryStatus{Message: message}})
+	}
+}
+
+func recoveryErrorSummary(err error) string {
+	if err == nil {
+		return "resuming the interrupted turn"
+	}
+	message := strings.TrimSpace(err.Error())
+	if len(message) > 160 {
+		return message[:157] + "..."
+	}
+	return message
 }
 
 func waitForRecoveryDelay(ctx context.Context, delay time.Duration) error {
@@ -3277,7 +4104,7 @@ func (s *Service) AnswerQuestion(ctx context.Context, in AnswerQuestionInput) er
 	if pool == nil {
 		return errors.New("agent pool unavailable")
 	}
-	sess, ok := pool.Get(agentPoolSessionKey(sessionKey, agentName))
+	sess, ok := pool.Get(agentPoolSessionKey(sessionKey, agentName, in.RootID))
 	if !ok {
 		return errors.New("agent session not found")
 	}
@@ -3660,16 +4487,88 @@ func (s *Service) validateAgentModel(agentName, model string) error {
 		return nil
 	}
 	status, ok := prober.GetStatus(agentName)
-	if !ok || len(status.Models) == 0 {
+	if !ok {
 		return nil
 	}
-	for _, item := range status.Models {
-		if strings.TrimSpace(item.ID) == model {
-			return nil
+	// Preferences attach last_config_selection; probe cache alone may still hold
+	// the previous provider's native catalog after an API-provider switch.
+	if prefs := s.Registry.GetPreferences(); prefs != nil {
+		statuses := prefs.ApplyAgentDefaults([]agent.Status{status})
+		if len(statuses) > 0 {
+			status = statuses[0]
 		}
+	}
+	if modelIDInCatalog(status.Models, model) {
+		return nil
+	}
+	// Custom API providers (e.g. grok-4.5 via OpenAI-compatible base URL) are
+	// stored in api-providers.json and overlaid on GET /api/agents, but the
+	// probe ListModels catalog often lags or never lists those IDs. Allow the
+	// active provider catalog so send/resume is not blocked incorrectly.
+	if AgentAPIProviderModelAllowed != nil && AgentAPIProviderModelAllowed(agentName, model, status.LastConfigSelection) {
+		return nil
+	}
+	// Empty probe catalog: do not hard-fail (legacy behavior).
+	if len(status.Models) == 0 {
+		return nil
 	}
 	return fmt.Errorf("model %q is not supported by agent %q", model, agentName)
 }
+
+func (s *Service) validateAgentModelForProvider(agentName, model string, provider *SessionProviderConfig) error {
+	if provider == nil {
+		return s.validateAgentModel(agentName, model)
+	}
+	model = strings.TrimSpace(model)
+	if model == "" {
+		// Bound sessions must choose an explicit model so empty ActionBar state
+		// cannot silently fall through to a provider-incompatible default.
+		return fmt.Errorf("model is required for bound provider %q", provider.ID)
+	}
+	if len(provider.Models) == 0 {
+		// Provider catalog not curated yet; keep compatibility with open catalogs.
+		return nil
+	}
+	for _, candidate := range provider.Models {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == model || strings.HasSuffix(candidate, "/"+model) || strings.HasSuffix(model, "/"+candidate) {
+			return nil
+		}
+	}
+	return fmt.Errorf("model %q is not supported by bound provider %q", model, provider.ID)
+}
+
+func modelIDInCatalog(models []agenttypes.ModelInfo, model string) bool {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return false
+	}
+	for _, item := range models {
+		id := strings.TrimSpace(item.ID)
+		if id == "" {
+			continue
+		}
+		if id == model {
+			return true
+		}
+		// provider/model vs bare model (opencode-style catalogs)
+		if strings.HasSuffix(id, "/"+model) || strings.HasSuffix(model, "/"+id) {
+			return true
+		}
+		if i := strings.LastIndex(id, "/"); i >= 0 && id[i+1:] == model {
+			return true
+		}
+		if i := strings.LastIndex(model, "/"); i >= 0 && model[i+1:] == id {
+			return true
+		}
+	}
+	return false
+}
+
+// AgentAPIProviderModelAllowed is set by package api (init) to check models
+// against the active provider catalog without a circular import.
+// Signature: (agentName, model, lastConfigSelection) -> allowed
+var AgentAPIProviderModelAllowed func(agentName, model string, lastConfig any) bool
 
 func (s *Service) CancelSessionTurn(ctx context.Context, in CancelSessionTurnInput) error {
 	if err := s.ensureRegistry(); err != nil {
@@ -3704,6 +4603,9 @@ func (s *Service) CancelSessionTurn(ctx context.Context, in CancelSessionTurnInp
 	if active == nil {
 		return nil
 	}
+	if active.retryCancel != nil {
+		active.retryCancel()
+	}
 	if active.session != nil {
 		// Let the runtime emit its own turn boundary after interrupt. Canceling
 		// turnCtx first can dequeue the current waiter, so a late ResultMessage
@@ -3717,4 +4619,36 @@ func (s *Service) CancelSessionTurn(ctx context.Context, in CancelSessionTurnInp
 	}
 	active.cancel()
 	return nil
+}
+
+// ForceCancelSessionTurn cancels the Go turn context after the runtime cancel
+// grace period has elapsed. It is only used by the queue recovery watchdog.
+func (s *Service) ForceCancelSessionTurn(ctx context.Context, in CancelSessionTurnInput) error {
+	if err := s.CancelSessionTurn(ctx, in); err != nil {
+		return err
+	}
+	active := getActiveTurn(in.RootID, strings.TrimSpace(in.Key))
+	if active != nil {
+		active.cancel()
+	}
+	return nil
+}
+
+// ForceCancelSessionTurnIfCurrent ends only the turn generation that requested
+// watchdog recovery. A delayed watchdog must never cancel a later user turn.
+func (s *Service) ForceCancelSessionTurnIfCurrent(_ context.Context, in CancelSessionTurnInput, generation uint64) bool {
+	active := getActiveTurn(in.RootID, strings.TrimSpace(in.Key))
+	if active == nil || active.generation != generation {
+		return false
+	}
+	if active.retryCancel != nil {
+		active.retryCancel()
+	}
+	if active.session != nil {
+		if err := active.session.CancelCurrentTurn(); err != nil {
+			log.Printf("[session] turn.force_cancel.error root=%s session=%s err=%v", in.RootID, in.Key, err)
+		}
+	}
+	active.cancel()
+	return true
 }

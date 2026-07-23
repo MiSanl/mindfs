@@ -215,7 +215,7 @@ func TestInstallLayoutPortable(t *testing.T) {
 
 func TestSafeArchiveTargetRejectsTraversal(t *testing.T) {
 	root := t.TempDir()
-	cases := []string{"../escape", "/tmp/escape", ".."}
+	cases := []string{"../escape", filepath.Join(root, "escape"), ".."}
 	for _, name := range cases {
 		if _, err := safeArchiveTarget(root, name); err == nil {
 			t.Fatalf("safeArchiveTarget(%q) error = nil, want error", name)

@@ -31,6 +31,11 @@ const (
 	sessionDBLinkExt = ".link"
 	exchangeFileTpl  = "sessions/%s.jsonl"
 	auxFileTpl       = "sessions/%s.aux.jsonl"
+	errorFileTpl     = "sessions/errors/%s.jsonl"
+	pendingFileTpl   = "sessions/pending/%s.json"
+	// maxSessionErrorsKept caps durable per-session error logs returned to the UI
+	// and rewritten on disk after append, so GET session stays bounded.
+	maxSessionErrorsKept = 100
 	selectSessionSQL = `
 	SELECT key, type, parent_session_key, parent_tool_call_id, source, task_id, model, shell, plan_mode, name, related_files_json, related_worktree_json, created_at, updated_at, closed_at
 	FROM sessions`
@@ -83,6 +88,11 @@ CREATE TABLE IF NOT EXISTS session_agent_bindings (
 	agent TEXT NOT NULL,
 	agent_session_id TEXT NOT NULL,
 	agent_ctx_seq INTEGER NOT NULL DEFAULT 0,
+	provider_id TEXT NOT NULL DEFAULT '',
+	provider_revision TEXT NOT NULL DEFAULT '',
+	provider_endpoint_revision TEXT NOT NULL DEFAULT '',
+	provider_protocol TEXT NOT NULL DEFAULT '',
+	provider_state TEXT NOT NULL DEFAULT 'legacy_unbound',
 	PRIMARY KEY (session_key, agent)
 );`
 	upsertAgentBindingSQL = `
@@ -92,16 +102,30 @@ INSERT INTO session_agent_bindings (
 ON CONFLICT(session_key, agent) DO UPDATE SET
 	agent_session_id = excluded.agent_session_id,
 	agent_ctx_seq = excluded.agent_ctx_seq`
+	bindProviderIfUnboundSQL = `
+INSERT INTO session_agent_bindings (
+	session_key, agent, agent_session_id, agent_ctx_seq, provider_id, provider_revision, provider_endpoint_revision, provider_protocol, provider_state
+) VALUES (?, ?, '', 0, ?, ?, ?, ?, ?)
+ON CONFLICT(session_key, agent) DO UPDATE SET
+	provider_id = CASE WHEN session_agent_bindings.provider_id = '' THEN excluded.provider_id ELSE session_agent_bindings.provider_id END,
+	provider_revision = CASE WHEN session_agent_bindings.provider_id = '' THEN excluded.provider_revision ELSE session_agent_bindings.provider_revision END,
+	provider_endpoint_revision = CASE WHEN session_agent_bindings.provider_id = '' THEN excluded.provider_endpoint_revision ELSE session_agent_bindings.provider_endpoint_revision END,
+	provider_protocol = CASE WHEN session_agent_bindings.provider_id = '' THEN excluded.provider_protocol ELSE session_agent_bindings.provider_protocol END,
+	provider_state = CASE WHEN session_agent_bindings.provider_id = '' THEN excluded.provider_state ELSE session_agent_bindings.provider_state END`
+	updateProviderBindingSQL = `
+UPDATE session_agent_bindings
+SET provider_revision = ?, provider_endpoint_revision = ?, provider_protocol = ?, provider_state = ?
+WHERE session_key = ? AND agent = ? AND provider_id = ?`
 	selectAgentBindingSQL = `
-SELECT session_key, agent, agent_session_id, agent_ctx_seq
+SELECT session_key, agent, agent_session_id, agent_ctx_seq, provider_id, provider_revision, provider_endpoint_revision, provider_protocol, provider_state
 FROM session_agent_bindings
 WHERE session_key = ? AND agent = ?`
 	selectAgentBindingsBySessionSQL = `
-SELECT session_key, agent, agent_session_id, agent_ctx_seq
+SELECT session_key, agent, agent_session_id, agent_ctx_seq, provider_id, provider_revision, provider_endpoint_revision, provider_protocol, provider_state
 FROM session_agent_bindings
 WHERE session_key = ?`
 	selectBindingByAgentSessionSQL = `
-SELECT session_key, agent, agent_session_id, agent_ctx_seq
+SELECT session_key, agent, agent_session_id, agent_ctx_seq, provider_id, provider_revision, provider_endpoint_revision, provider_protocol, provider_state
 FROM session_agent_bindings
 WHERE agent = ? AND agent_session_id = ?
 LIMIT 1`
@@ -120,6 +144,7 @@ type Manager struct {
 	db               *sql.DB
 	sessions         map[string]*Session
 	pendingToolCalls map[string]map[string]agenttypes.ToolCall
+	activePending    map[string]bool
 	now              func() time.Time
 	idleInterval     time.Duration
 	idleFor          time.Duration
@@ -142,11 +167,26 @@ type CreateInput struct {
 }
 
 type AgentBinding struct {
-	SessionKey     string `json:"session_key"`
-	Agent          string `json:"agent"`
-	AgentSessionID string `json:"agent_session_id"`
-	AgentCtxSeq    int    `json:"agent_ctx_seq"`
+	SessionKey               string `json:"session_key"`
+	Agent                    string `json:"agent"`
+	AgentSessionID           string `json:"agent_session_id"`
+	AgentCtxSeq              int    `json:"agent_ctx_seq"`
+	ProviderID               string `json:"provider_id,omitempty"`
+	ProviderRevision         string `json:"provider_revision,omitempty"`
+	ProviderEndpointRevision string `json:"provider_endpoint_revision,omitempty"`
+	ProviderProtocol         string `json:"provider_protocol,omitempty"`
+	ProviderState            string `json:"provider_state"`
 }
+
+// PendingTurn is an atomic snapshot of a streamed turn that has not yet been
+// promoted to the regular exchange logs.
+type PendingTurn struct {
+	User  Exchange      `json:"user"`
+	Agent Exchange      `json:"agent"`
+	Aux   []ExchangeAux `json:"aux,omitempty"`
+}
+
+const ProviderStateLegacyUnbound = "legacy_unbound"
 
 type ListOptions struct {
 	BeforeTime       time.Time
@@ -161,6 +201,7 @@ func NewManager(root fs.RootInfo, opts ...Option) *Manager {
 		root:             root,
 		sessions:         make(map[string]*Session),
 		pendingToolCalls: make(map[string]map[string]agenttypes.ToolCall),
+		activePending:    make(map[string]bool),
 		now:              time.Now,
 		idleInterval:     1 * time.Minute,
 		idleFor:          10 * time.Minute,
@@ -246,7 +287,203 @@ func (m *Manager) Create(_ context.Context, input CreateInput) (*Session, error)
 func (m *Manager) Get(_ context.Context, key string, afterSeq int) (*Session, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if !m.activePending[key] {
+		if err := m.recoverPendingTurnUnsafe(key); err != nil {
+			return nil, err
+		}
+	}
 	return m.getSessionUnsafe(key, afterSeq)
+}
+
+func (m *Manager) StartPendingTurn(_ context.Context, session *Session, user, agent Exchange) error {
+	if session == nil || strings.TrimSpace(session.Key) == "" {
+		return errors.New("session required")
+	}
+	if user.Seq <= 0 || agent.Seq != user.Seq+1 {
+		return errors.New("invalid pending turn sequence")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.activePending[session.Key] {
+		return errors.New("pending turn already active")
+	}
+	if err := m.writePendingTurnUnsafe(session.Key, PendingTurn{User: user, Agent: agent}); err != nil {
+		return err
+	}
+	m.activePending[session.Key] = true
+	return nil
+}
+
+func (m *Manager) UpdatePendingTurn(_ context.Context, sessionKey, agentContent string, aux []ExchangeAux) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	pending, err := m.readPendingTurnUnsafe(sessionKey)
+	if err != nil || pending == nil {
+		return err
+	}
+	pending.Agent.Content = agentContent
+	pending.Agent.Timestamp = m.now().UTC()
+	pending.Aux = append([]ExchangeAux(nil), aux...)
+	return m.writePendingTurnUnsafe(sessionKey, *pending)
+}
+
+func (m *Manager) CompletePendingTurn(_ context.Context, sessionKey string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	err := m.recoverPendingTurnUnsafe(sessionKey)
+	delete(m.activePending, sessionKey)
+	return err
+}
+
+// ReleasePendingTurn ends a live pending turn without forcing recovery.
+// Empty/canceled agent content is discarded; partial assistant output remains
+// for the next session access to recover.
+func (m *Manager) ReleasePendingTurn(_ context.Context, sessionKey string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.activePending, sessionKey)
+	pending, err := m.readPendingTurnUnsafe(sessionKey)
+	if err != nil || pending == nil {
+		return
+	}
+	if strings.TrimSpace(pending.Agent.Content) == "" && len(pending.Aux) == 0 {
+		_ = m.removePendingTurnUnsafe(sessionKey)
+	}
+}
+
+// DiscardPendingTurn drops an in-flight pending snapshot without writing history.
+func (m *Manager) DiscardPendingTurn(_ context.Context, sessionKey string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.activePending, sessionKey)
+	return m.removePendingTurnUnsafe(sessionKey)
+}
+
+// PeekPendingTurn returns the live/durable pending turn snapshot without completing it.
+// Used by session GET so goal/kanban mid-turn progress can refresh into the UI.
+func (m *Manager) PeekPendingTurn(_ context.Context, sessionKey string) (*PendingTurn, error) {
+	sessionKey = strings.TrimSpace(sessionKey)
+	if sessionKey == "" {
+		return nil, errors.New("session key required")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.readPendingTurnUnsafe(sessionKey)
+}
+
+// AppendSessionError appends a durable error record under sessions/errors/<key>.jsonl.
+// The on-disk log is trimmed to the newest maxSessionErrorsKept entries.
+func (m *Manager) AppendSessionError(_ context.Context, sessionKey string, entry SessionError) error {
+	sessionKey = strings.TrimSpace(sessionKey)
+	if sessionKey == "" {
+		return errors.New("session key required")
+	}
+	if strings.TrimSpace(entry.Message) == "" {
+		return errors.New("error message required")
+	}
+	if strings.TrimSpace(entry.ID) == "" {
+		entry.ID = "err-" + randomHex(8)
+	}
+	entry.SessionKey = sessionKey
+	if entry.Timestamp.IsZero() {
+		entry.Timestamp = m.now().UTC()
+	} else {
+		entry.Timestamp = entry.Timestamp.UTC()
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	path, err := m.errorPath(sessionKey)
+	if err != nil {
+		return err
+	}
+	existing, err := m.readSessionErrorsUnsafe(path)
+	if err != nil {
+		return err
+	}
+	items := append(existing, entry)
+	if len(items) > maxSessionErrorsKept {
+		items = items[len(items)-maxSessionErrorsKept:]
+	}
+	return m.writeSessionErrorsUnsafe(path, items)
+}
+
+// ListSessionErrors returns durable session errors for UI replay (newest-capped).
+func (m *Manager) ListSessionErrors(_ context.Context, sessionKey string) ([]SessionError, error) {
+	sessionKey = strings.TrimSpace(sessionKey)
+	if sessionKey == "" {
+		return nil, errors.New("session key required")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	path, err := m.errorPath(sessionKey)
+	if err != nil {
+		return nil, err
+	}
+	items, err := m.readSessionErrorsUnsafe(path)
+	if err != nil {
+		return nil, err
+	}
+	if items == nil {
+		return []SessionError{}, nil
+	}
+	if len(items) > maxSessionErrorsKept {
+		items = items[len(items)-maxSessionErrorsKept:]
+	}
+	return items, nil
+}
+
+func (m *Manager) readSessionErrorsUnsafe(path string) ([]SessionError, error) {
+	payload, err := m.root.ReadMetaFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return []SessionError{}, nil
+		}
+		return nil, err
+	}
+	items := make([]SessionError, 0)
+	scanner := jsonlScanner(payload)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var entry SessionError
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			continue
+		}
+		if strings.TrimSpace(entry.Message) == "" {
+			continue
+		}
+		items = append(items, entry)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+func (m *Manager) writeSessionErrorsUnsafe(path string, items []SessionError) error {
+	if len(items) == 0 {
+		metaDir, err := m.root.EnsureMetaDir()
+		if err != nil {
+			return err
+		}
+		full := filepath.Join(metaDir, filepath.FromSlash(path))
+		if err := os.Remove(full); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	}
+	var b strings.Builder
+	for _, entry := range items {
+		payload, err := json.Marshal(entry)
+		if err != nil {
+			return err
+		}
+		b.Write(payload)
+		b.WriteByte('\n')
+	}
+	return m.root.WriteMetaFile(path, []byte(b.String()))
 }
 
 func (m *Manager) GetExchangeAux(_ context.Context, key string, afterSeq int) (map[int][]ExchangeAux, error) {
@@ -737,7 +974,7 @@ func (m *Manager) UpdateAgentState(_ context.Context, session *Session, agent st
 	if strings.TrimSpace(agentSessionID) == "" {
 		return nil
 	}
-	return m.upsertAgentBindingUnsafe(AgentBinding{
+	return m.updateAgentRuntimeStateUnsafe(AgentBinding{
 		SessionKey:     strings.TrimSpace(session.Key),
 		Agent:          strings.TrimSpace(agent),
 		AgentSessionID: strings.TrimSpace(agentSessionID),
@@ -757,7 +994,74 @@ func (m *Manager) UpsertAgentBinding(_ context.Context, binding AgentBinding) er
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.upsertAgentBindingUnsafe(binding)
+	return m.updateAgentRuntimeStateUnsafe(binding)
+}
+
+// BindProviderIfUnbound stores a provider identity before a native runtime is opened.
+// Runtime state updates deliberately cannot overwrite this provider metadata.
+func (m *Manager) BindProviderIfUnbound(_ context.Context, binding AgentBinding) (*AgentBinding, error) {
+	if strings.TrimSpace(binding.SessionKey) == "" {
+		return nil, errors.New("session key required")
+	}
+	if strings.TrimSpace(binding.Agent) == "" {
+		return nil, errors.New("agent required")
+	}
+	if strings.TrimSpace(binding.ProviderID) == "" {
+		return nil, errors.New("provider id required")
+	}
+	if strings.TrimSpace(binding.ProviderState) == "" {
+		binding.ProviderState = "available"
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	db, err := m.ensureSessionMetaDBUnsafe()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := db.Exec(bindProviderIfUnboundSQL,
+		strings.TrimSpace(binding.SessionKey),
+		strings.TrimSpace(binding.Agent),
+		strings.TrimSpace(binding.ProviderID),
+		strings.TrimSpace(binding.ProviderRevision),
+		strings.TrimSpace(binding.ProviderEndpointRevision),
+		strings.TrimSpace(binding.ProviderProtocol),
+		strings.TrimSpace(binding.ProviderState),
+	); err != nil {
+		return nil, err
+	}
+	return m.getAgentBindingUnsafe(binding.SessionKey, binding.Agent)
+}
+
+func (m *Manager) UpdateBoundProvider(_ context.Context, binding AgentBinding) error {
+	if strings.TrimSpace(binding.SessionKey) == "" || strings.TrimSpace(binding.Agent) == "" || strings.TrimSpace(binding.ProviderID) == "" {
+		return errors.New("session key, agent and provider id required")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	db, err := m.ensureSessionMetaDBUnsafe()
+	if err != nil {
+		return err
+	}
+	result, err := db.Exec(updateProviderBindingSQL,
+		strings.TrimSpace(binding.ProviderRevision),
+		strings.TrimSpace(binding.ProviderEndpointRevision),
+		strings.TrimSpace(binding.ProviderProtocol),
+		strings.TrimSpace(binding.ProviderState),
+		strings.TrimSpace(binding.SessionKey),
+		strings.TrimSpace(binding.Agent),
+		strings.TrimSpace(binding.ProviderID),
+	)
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed == 0 {
+		return errSessionNotFound
+	}
+	return nil
 }
 
 func (m *Manager) GetAgentBinding(_ context.Context, sessionKey, agent string) (*AgentBinding, error) {
@@ -769,19 +1073,7 @@ func (m *Manager) GetAgentBinding(_ context.Context, sessionKey, agent string) (
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	db, err := m.ensureSessionMetaDBUnsafe()
-	if err != nil {
-		return nil, err
-	}
-	row := db.QueryRow(selectAgentBindingSQL, strings.TrimSpace(sessionKey), strings.TrimSpace(agent))
-	var binding AgentBinding
-	if err := row.Scan(&binding.SessionKey, &binding.Agent, &binding.AgentSessionID, &binding.AgentCtxSeq); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, errSessionNotFound
-		}
-		return nil, err
-	}
-	return &binding, nil
+	return m.getAgentBindingUnsafe(sessionKey, agent)
 }
 
 func (m *Manager) FindAgentBinding(ctx context.Context, sessionKey, agent string) (*AgentBinding, error) {
@@ -790,6 +1082,33 @@ func (m *Manager) FindAgentBinding(ctx context.Context, sessionKey, agent string
 		return nil, nil
 	}
 	return binding, err
+}
+
+func (m *Manager) ListAgentBindings(_ context.Context, sessionKey string) ([]AgentBinding, error) {
+	if strings.TrimSpace(sessionKey) == "" {
+		return nil, errors.New("session key required")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.listAgentBindingsUnsafe(sessionKey)
+}
+
+func (m *Manager) CountProviderBindings(_ context.Context, providerID string) (int, error) {
+	providerID = strings.TrimSpace(providerID)
+	if providerID == "" {
+		return 0, errors.New("provider id required")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.db == nil {
+		return 0, nil
+	}
+	db := m.db
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM session_agent_bindings WHERE provider_id = ?`, providerID).Scan(&count); err != nil {
+		return 0, err
+	}
+	return count, nil
 }
 
 func (m *Manager) FindAgentBindingByAgentSession(_ context.Context, agent, agentSessionID string) (*AgentBinding, error) {
@@ -810,7 +1129,7 @@ func (m *Manager) FindAgentBindingByAgentSession(_ context.Context, agent, agent
 		selectBindingByAgentSessionSQL,
 		strings.TrimSpace(agent),
 		strings.TrimSpace(agentSessionID),
-	).Scan(&binding.SessionKey, &binding.Agent, &binding.AgentSessionID, &binding.AgentCtxSeq)
+	).Scan(&binding.SessionKey, &binding.Agent, &binding.AgentSessionID, &binding.AgentCtxSeq, &binding.ProviderID, &binding.ProviderRevision, &binding.ProviderEndpointRevision, &binding.ProviderProtocol, &binding.ProviderState)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -842,7 +1161,7 @@ func (m *Manager) listAgentBindingsUnsafe(sessionKey string) ([]AgentBinding, er
 	bindings := make([]AgentBinding, 0)
 	for rows.Next() {
 		var binding AgentBinding
-		if err := rows.Scan(&binding.SessionKey, &binding.Agent, &binding.AgentSessionID, &binding.AgentCtxSeq); err != nil {
+		if err := rows.Scan(&binding.SessionKey, &binding.Agent, &binding.AgentSessionID, &binding.AgentCtxSeq, &binding.ProviderID, &binding.ProviderRevision, &binding.ProviderEndpointRevision, &binding.ProviderProtocol, &binding.ProviderState); err != nil {
 			return nil, err
 		}
 		bindings = append(bindings, binding)
@@ -853,23 +1172,46 @@ func (m *Manager) listAgentBindingsUnsafe(sessionKey string) ([]AgentBinding, er
 	return bindings, nil
 }
 
-func (m *Manager) upsertAgentBindingUnsafe(binding AgentBinding) error {
+func (m *Manager) getAgentBindingUnsafe(sessionKey, agent string) (*AgentBinding, error) {
 	db, err := m.ensureSessionMetaDBUnsafe()
 	if err != nil {
-		return err
+		return nil, err
 	}
+	var binding AgentBinding
+	if err := db.QueryRow(selectAgentBindingSQL, strings.TrimSpace(sessionKey), strings.TrimSpace(agent)).Scan(
+		&binding.SessionKey,
+		&binding.Agent,
+		&binding.AgentSessionID,
+		&binding.AgentCtxSeq,
+		&binding.ProviderID,
+		&binding.ProviderRevision,
+		&binding.ProviderEndpointRevision,
+		&binding.ProviderProtocol,
+		&binding.ProviderState,
+	); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, errSessionNotFound
+		}
+		return nil, err
+	}
+	return &binding, nil
+}
+
+func (m *Manager) updateAgentRuntimeStateUnsafe(binding AgentBinding) error {
 	agentCtxSeq := 0
 	if binding.AgentCtxSeq > 0 {
 		agentCtxSeq = binding.AgentCtxSeq
 	}
-	_, err = db.Exec(
-		upsertAgentBindingSQL,
-		strings.TrimSpace(binding.SessionKey),
-		strings.TrimSpace(binding.Agent),
-		strings.TrimSpace(binding.AgentSessionID),
-		agentCtxSeq,
-	)
-	return err
+	return m.retrySessionMetaWriteUnsafe(func(db *sql.DB) error {
+		_, err := db.Exec(
+			upsertAgentBindingSQL,
+			strings.TrimSpace(binding.SessionKey),
+			strings.TrimSpace(binding.Agent),
+			strings.TrimSpace(binding.AgentSessionID),
+			agentCtxSeq,
+		)
+		return err
+	})
 }
 
 func (m *Manager) Close(ctx context.Context, key string) (*Session, error) {
@@ -1024,6 +1366,17 @@ func (m *Manager) deleteSessionUnsafe(key string) error {
 	if err := os.Remove(filepath.Join(metaDir, filepath.FromSlash(auxPath))); err != nil && !os.IsNotExist(err) {
 		return err
 	}
+	if errorPath, err := m.errorPath(key); err == nil {
+		if err := os.Remove(filepath.Join(metaDir, filepath.FromSlash(errorPath))); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	if pendingPath, err := m.pendingPath(key); err == nil {
+		if err := os.Remove(filepath.Join(metaDir, filepath.FromSlash(pendingPath))); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	delete(m.activePending, key)
 	return nil
 }
 
@@ -1316,10 +1669,6 @@ func (m *Manager) loadSessionUnsafe(key string, afterSeq int) (*Session, error) 
 }
 
 func (m *Manager) upsertSessionMetaUnsafe(session *Session) error {
-	db, err := m.ensureSessionMetaDBUnsafe()
-	if err != nil {
-		return err
-	}
 	if session == nil {
 		return errors.New("session required")
 	}
@@ -1328,11 +1677,10 @@ func (m *Manager) upsertSessionMetaUnsafe(session *Session) error {
 	if err != nil {
 		return err
 	}
-	_, err = db.Exec(upsertSessionMetaSQL, args...)
-	if err != nil {
+	return m.retrySessionMetaWriteUnsafe(func(db *sql.DB) error {
+		_, err := db.Exec(upsertSessionMetaSQL, args...)
 		return err
-	}
-	return nil
+	})
 }
 
 func (m *Manager) loadExchanges(key string, afterSeq int) ([]Exchange, int, error) {
@@ -1394,6 +1742,159 @@ func (m *Manager) appendExchange(key string, exchange Exchange) error {
 		return err
 	}
 	return nil
+}
+
+func (m *Manager) pendingPath(key string) (string, error) {
+	if _, err := m.exchangePath(key); err != nil {
+		return "", err
+	}
+	return filepath.ToSlash(fmt.Sprintf(pendingFileTpl, key)), nil
+}
+
+func (m *Manager) readPendingTurnUnsafe(key string) (*PendingTurn, error) {
+	path, err := m.pendingPath(key)
+	if err != nil {
+		return nil, err
+	}
+	payload, err := m.root.ReadMetaFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var pending PendingTurn
+	if err := json.Unmarshal(payload, &pending); err != nil {
+		return nil, err
+	}
+	if pending.User.Seq <= 0 || pending.Agent.Seq != pending.User.Seq+1 {
+		return nil, errors.New("invalid pending turn")
+	}
+	return &pending, nil
+}
+
+func (m *Manager) writePendingTurnUnsafe(key string, pending PendingTurn) error {
+	path, err := m.pendingPath(key)
+	if err != nil {
+		return err
+	}
+	payload, err := json.Marshal(pending)
+	if err != nil {
+		return err
+	}
+	return m.root.WriteMetaFile(path, payload)
+}
+
+func (m *Manager) removePendingTurnUnsafe(key string) error {
+	path, err := m.pendingPath(key)
+	if err != nil {
+		return err
+	}
+	metaDir, err := m.root.EnsureMetaDir()
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(filepath.Join(metaDir, filepath.FromSlash(path))); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+func (m *Manager) recoverPendingTurnUnsafe(key string) error {
+	pending, err := m.readPendingTurnUnsafe(key)
+	if err != nil || pending == nil {
+		return err
+	}
+	current, err := m.getSessionUnsafe(key, 0)
+	if err != nil {
+		return err
+	}
+	if len(current.Exchanges) > pending.Agent.Seq {
+		return m.removePendingTurnUnsafe(key)
+	}
+	if len(current.Exchanges) < pending.User.Seq {
+		if len(current.Exchanges)+1 != pending.User.Seq {
+			return errors.New("pending turn sequence does not match session")
+		}
+		if err := m.appendExchange(key, pending.User); err != nil {
+			return err
+		}
+		current.Exchanges = append(current.Exchanges, pending.User)
+	}
+	if len(current.Exchanges) < pending.Agent.Seq {
+		if len(current.Exchanges)+1 != pending.Agent.Seq {
+			return errors.New("pending agent sequence does not match session")
+		}
+		// Never materialize an empty canceled/failed agent turn into history.
+		if strings.TrimSpace(pending.Agent.Content) == "" && len(pending.Aux) == 0 {
+			return m.removePendingTurnUnsafe(key)
+		}
+		if err := m.appendExchange(key, pending.Agent); err != nil {
+			return err
+		}
+		current.Exchanges = append(current.Exchanges, pending.Agent)
+	}
+	if !pending.Agent.Timestamp.IsZero() {
+		current.UpdatedAt = pending.Agent.Timestamp
+		if err := m.upsertSessionMetaUnsafe(current); err != nil {
+			return err
+		}
+	}
+	existingAux, err := m.loadExchangeAuxEntries(key, 0)
+	if err != nil {
+		return err
+	}
+	existing := make(map[string]struct{}, len(existingAux))
+	for _, aux := range existingAux {
+		existing[pendingAuxKey(aux)] = struct{}{}
+	}
+	for _, aux := range dedupePendingAux(pending.Aux) {
+		if aux.Seq == 0 {
+			aux.Seq = pending.Agent.Seq
+		}
+		auxKey := pendingAuxKey(aux)
+		if _, ok := existing[auxKey]; ok {
+			continue
+		}
+		if err := m.appendExchangeAux(key, aux); err != nil {
+			return err
+		}
+		existing[auxKey] = struct{}{}
+	}
+	return m.removePendingTurnUnsafe(key)
+}
+
+func dedupePendingAux(items []ExchangeAux) []ExchangeAux {
+	seen := make(map[string]struct{}, len(items))
+	out := make([]ExchangeAux, 0, len(items))
+	for _, item := range items {
+		key := pendingAuxKey(item)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, item)
+	}
+	return out
+}
+
+func pendingAuxKey(item ExchangeAux) string {
+	if item.ToolCall != nil {
+		return fmt.Sprintf("tool:%d:%s:%s", item.Seq, item.ToolCall.CallID, item.ToolCall.Status)
+	}
+	if item.Todo != nil {
+		payload, _ := json.Marshal(item.Todo)
+		return fmt.Sprintf("todo:%d:%s", item.Seq, payload)
+	}
+	if item.Plan != nil {
+		payload, _ := json.Marshal(item.Plan)
+		return fmt.Sprintf("plan:%d:%s", item.Seq, payload)
+	}
+	if item.Compact != nil {
+		payload, _ := json.Marshal(item.Compact)
+		return fmt.Sprintf("compact:%d:%s", item.Seq, payload)
+	}
+	return fmt.Sprintf("thought:%d:%d:%s:%s", item.Seq, item.Line, item.ThoughtID, item.Thought)
 }
 
 func (m *Manager) loadExchangeAux(key string, afterSeq int) (map[int][]ExchangeAux, error) {
@@ -1565,6 +2066,19 @@ func (m *Manager) auxPath(key string) (string, error) {
 	return filepath.ToSlash(fmt.Sprintf(auxFileTpl, key)), nil
 }
 
+func (m *Manager) errorPath(key string) (string, error) {
+	if strings.TrimSpace(m.root.MetaDir()) == "" {
+		return "", errors.New("managed dir required")
+	}
+	if key == "" {
+		return "", errors.New("session key required")
+	}
+	if strings.Contains(key, "..") || strings.ContainsRune(key, filepath.Separator) || strings.Contains(key, "/") {
+		return "", fmt.Errorf("invalid session key: %s", key)
+	}
+	return filepath.ToSlash(fmt.Sprintf(errorFileTpl, key)), nil
+}
+
 func (m *Manager) ensureSessionMetaDBUnsafe() (*sql.DB, error) {
 	if m.db != nil {
 		return m.db, nil
@@ -1610,6 +2124,33 @@ func (m *Manager) ensureSessionMetaDBUnsafe() (*sql.DB, error) {
 	return m.db, nil
 }
 
+func (m *Manager) retrySessionMetaWriteUnsafe(write func(*sql.DB) error) error {
+	db, err := m.ensureSessionMetaDBUnsafe()
+	if err != nil {
+		return err
+	}
+	if err := write(db); !isSQLiteDatabaseMovedError(err) {
+		return err
+	}
+	if closeErr := db.Close(); closeErr != nil {
+		return fmt.Errorf("close moved session db: %w", closeErr)
+	}
+	m.db = nil
+	db, err = m.ensureSessionMetaDBUnsafe()
+	if err != nil {
+		return fmt.Errorf("reopen moved session db: %w", err)
+	}
+	return write(db)
+}
+
+func isSQLiteDatabaseMovedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "readonly database") && strings.Contains(message, "1032")
+}
+
 func openSessionMetaDB(dbFile string) (db *sql.DB, err error) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -1632,6 +2173,10 @@ func openSessionMetaDB(dbFile string) (db *sql.DB, err error) {
 		return nil, err
 	}
 	if _, err := db.Exec(agentBindingTableSchema); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if err := migrateAgentBindingTable(db); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -1660,6 +2205,56 @@ func openSessionMetaDB(dbFile string) (db *sql.DB, err error) {
 		}
 	}
 	return db, nil
+}
+
+func migrateAgentBindingTable(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	rows, err := tx.Query(`PRAGMA table_info(session_agent_bindings)`)
+	if err != nil {
+		return err
+	}
+	columns := map[string]bool{}
+	for rows.Next() {
+		var cid int
+		var name, columnType string
+		var notNull, primaryKey int
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			rows.Close()
+			return err
+		}
+		columns[strings.ToLower(name)] = true
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	for _, migration := range []struct {
+		column string
+		stmt   string
+	}{
+		{"provider_id", `ALTER TABLE session_agent_bindings ADD COLUMN provider_id TEXT NOT NULL DEFAULT ''`},
+		{"provider_revision", `ALTER TABLE session_agent_bindings ADD COLUMN provider_revision TEXT NOT NULL DEFAULT ''`},
+		{"provider_endpoint_revision", `ALTER TABLE session_agent_bindings ADD COLUMN provider_endpoint_revision TEXT NOT NULL DEFAULT ''`},
+		{"provider_protocol", `ALTER TABLE session_agent_bindings ADD COLUMN provider_protocol TEXT NOT NULL DEFAULT ''`},
+		{"provider_state", `ALTER TABLE session_agent_bindings ADD COLUMN provider_state TEXT NOT NULL DEFAULT 'legacy_unbound'`},
+	} {
+		if columns[migration.column] {
+			continue
+		}
+		if _, err := tx.Exec(migration.stmt); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func readSessionDBLink(linkFile string) (string, bool, error) {
@@ -2067,6 +2662,17 @@ func buildSearchSnippet(content string, matchRunes, queryRunes int) string {
 		snippet += "..."
 	}
 	return snippet
+}
+
+func randomHex(n int) string {
+	if n <= 0 {
+		n = 8
+	}
+	buf := make([]byte, n)
+	if _, err := rand.Read(buf); err != nil {
+		return fmt.Sprintf("%d", time.Now().UTC().UnixNano())
+	}
+	return hex.EncodeToString(buf)
 }
 
 func generateKey() string {

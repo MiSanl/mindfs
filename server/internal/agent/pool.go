@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -31,7 +32,18 @@ type sessionEntry struct {
 	agentName  string
 	sessionKey string
 	protocol   Protocol
+	runtimeKey string
 	session    agenttypes.Session
+}
+
+// RuntimeSessionInfo is a lightweight view of a live pool session.
+type RuntimeSessionInfo struct {
+	PoolKey      string
+	AgentName    string
+	SessionKey   string
+	RuntimeKey   string
+	Protocol     Protocol
+	AgentSession string
 }
 
 // NewPool creates a new agent pool.
@@ -49,6 +61,11 @@ func NewPool(cfg Config) *Pool {
 	}
 }
 
+// OpenSessionHook, when set, replaces openSession for GetOrCreate. Tests use this
+// to inject fake agent sessions and exercise SendMessage paths without real agents.
+// Production code must leave this nil.
+var OpenSessionHook func(ctx context.Context, in agenttypes.OpenSessionInput) (agenttypes.Session, error)
+
 // GetOrCreate returns an existing session handle or creates a new one.
 func (p *Pool) GetOrCreate(ctx context.Context, in agenttypes.OpenSessionInput) (agenttypes.Session, error) {
 	if in.SessionKey == "" {
@@ -60,9 +77,15 @@ func (p *Pool) GetOrCreate(ctx context.Context, in agenttypes.OpenSessionInput) 
 		p.mu.Unlock()
 		return nil, errors.New("agent pool closed")
 	}
-	if entry, ok := p.sessions[in.SessionKey]; ok {
+	if entry, ok := p.sessions[in.SessionKey]; ok && (in.RuntimeKey == "" || entry.runtimeKey == in.RuntimeKey) {
 		p.mu.Unlock()
 		return entry.session, nil
+	}
+	if entry, ok := p.sessions[in.SessionKey]; ok {
+		delete(p.sessions, in.SessionKey)
+		p.mu.Unlock()
+		_ = entry.session.Close()
+		p.mu.Lock()
 	}
 	def, ok := p.cfg.GetAgent(in.AgentName)
 	if !ok {
@@ -76,7 +99,13 @@ func (p *Pool) GetOrCreate(ctx context.Context, in agenttypes.OpenSessionInput) 
 	p.mu.Unlock()
 
 	// openSession starts subprocesses and can be slow, so keep it outside the pool lock.
-	sess, err := p.openSession(ctx, protocol, def, in)
+	var sess agenttypes.Session
+	var err error
+	if OpenSessionHook != nil {
+		sess, err = OpenSessionHook(ctx, in)
+	} else {
+		sess, err = p.openSession(ctx, protocol, def, in)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -88,7 +117,7 @@ func (p *Pool) GetOrCreate(ctx context.Context, in agenttypes.OpenSessionInput) 
 		return nil, errors.New("agent pool closed")
 	}
 	// Another goroutine may have created the same session while the lock was released.
-	if entry, ok := p.sessions[in.SessionKey]; ok {
+	if entry, ok := p.sessions[in.SessionKey]; ok && (in.RuntimeKey == "" || entry.runtimeKey == in.RuntimeKey) {
 		existing := entry.session
 		p.mu.Unlock()
 		if protocol != ProtocolACP {
@@ -96,17 +125,32 @@ func (p *Pool) GetOrCreate(ctx context.Context, in agenttypes.OpenSessionInput) 
 		}
 		return existing, nil
 	}
+	var replaced *sessionEntry
+	if entry, ok := p.sessions[in.SessionKey]; ok {
+		replaced = entry
+		delete(p.sessions, in.SessionKey)
+	}
 	p.sessions[in.SessionKey] = &sessionEntry{
 		agentName:  in.AgentName,
 		sessionKey: in.SessionKey,
 		protocol:   protocol,
+		runtimeKey: in.RuntimeKey,
 		session:    sess,
 	}
 	p.mu.Unlock()
+	if replaced != nil && replaced.session != nil {
+		_ = replaced.session.Close()
+	}
 	return sess, nil
 }
 
 func (p *Pool) openSession(ctx context.Context, protocol Protocol, def Definition, in agenttypes.OpenSessionInput) (agenttypes.Session, error) {
+	env := cloneEnv(def.Env)
+	if in.RuntimeEnv != nil {
+		env = cloneEnv(in.RuntimeEnv)
+	}
+	args := append([]string{}, def.Args...)
+	args = append(args, in.RuntimeArgs...)
 	switch protocol {
 	case ProtocolClaudeSDK:
 		return p.claude.OpenSession(ctx, claude.OpenOptions{
@@ -117,8 +161,8 @@ func (p *Pool) openSession(ctx context.Context, protocol Protocol, def Definitio
 			PlanMode:        in.PlanMode,
 			RootPath:        in.RootPath,
 			Command:         def.Command,
-			Args:            append([]string{}, def.Args...),
-			Env:             cloneEnv(def.Env),
+			Args:            args,
+			Env:             env,
 			ResumeSessionID: in.AgentSessionID,
 			ForkSessionID:   in.ForkPoint.AgentSessionID,
 			ResumeMessageID: in.ForkPoint.ClaudeMessageUUID,
@@ -139,8 +183,9 @@ func (p *Pool) openSession(ctx context.Context, protocol Protocol, def Definitio
 			Probe:            in.Probe,
 			RootPath:         in.RootPath,
 			Command:          def.Command,
-			Args:             append([]string{}, def.Args...),
-			Env:              cloneEnv(def.Env),
+			Args:             args,
+			Env:              env,
+			RuntimeKey:       in.RuntimeKey,
 			ResumeSessionID:  in.AgentSessionID,
 			ForkSessionID:    in.ForkPoint.AgentSessionID,
 			CodexUserOrdinal: codexUserOrdinal,
@@ -156,8 +201,8 @@ func (p *Pool) openSession(ctx context.Context, protocol Protocol, def Definitio
 			Effort:          in.Effort,
 			RootPath:        in.RootPath,
 			Command:         def.Command,
-			Args:            def.BuildArgs(in.RootPath),
-			Env:             cloneEnv(def.Env),
+			Args:            append(def.BuildArgs(in.RootPath), in.RuntimeArgs...),
+			Env:             env,
 			Cwd:             def.ResolveCwd(in.RootPath),
 			ResumeSessionID: in.AgentSessionID,
 		})
@@ -220,8 +265,21 @@ func cloneEnv(env map[string]string) map[string]string {
 
 // Close closes a session (not the underlying runtime pool).
 func (p *Pool) Close(sessionKey string) {
+	sessionKey = strings.TrimSpace(sessionKey)
+	if sessionKey == "" {
+		return
+	}
 	entries := p.takeSessions(func(entry *sessionEntry) bool {
-		return entry.sessionKey == sessionKey
+		if entry == nil {
+			return false
+		}
+		// Callers may pass either the pool key ("agent-mindfsKey") or the raw
+		// MindFS session key depending on protocol path.
+		if entry.sessionKey == sessionKey {
+			return true
+		}
+		agent := strings.ToLower(strings.TrimSpace(entry.agentName))
+		return agent != "" && entry.sessionKey == agent+"-"+sessionKey
 	})
 	if len(entries) == 0 {
 		return
@@ -229,7 +287,8 @@ func (p *Pool) Close(sessionKey string) {
 	p.closeSessions(entries)
 	for _, entry := range entries {
 		if entry.protocol == ProtocolACP {
-			p.acp.CloseSession(sessionKey)
+			// ACP maps use the pool/session key stored on the entry.
+			p.acp.CloseSession(entry.sessionKey)
 		}
 	}
 }
@@ -313,6 +372,98 @@ func (p *Pool) Get(sessionKey string) (agenttypes.Session, bool) {
 		return nil, false
 	}
 	return entry.session, true
+}
+
+// GetRuntimeInfo returns metadata for a live pool session if present.
+func (p *Pool) GetRuntimeInfo(sessionKey string) (RuntimeSessionInfo, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	entry, ok := p.sessions[sessionKey]
+	if !ok || entry == nil || entry.session == nil {
+		return RuntimeSessionInfo{}, false
+	}
+	info := RuntimeSessionInfo{
+		PoolKey:    sessionKey,
+		AgentName:  entry.agentName,
+		SessionKey: entry.sessionKey,
+		RuntimeKey: entry.runtimeKey,
+		Protocol:   entry.protocol,
+	}
+	if sid := strings.TrimSpace(entry.session.SessionID()); sid != "" {
+		info.AgentSession = sid
+	}
+	return info, true
+}
+
+// ListRuntimeInfoForMindFSSession returns live runtimes for a MindFS session key.
+func (p *Pool) ListRuntimeInfoForMindFSSession(mindfsSessionKey string, rootID ...string) []RuntimeSessionInfo {
+	mindfsSessionKey = strings.TrimSpace(mindfsSessionKey)
+	if mindfsSessionKey == "" {
+		return nil
+	}
+	root := ""
+	if len(rootID) > 0 {
+		root = strings.TrimSpace(rootID[0])
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]RuntimeSessionInfo, 0)
+	for poolKey, entry := range p.sessions {
+		if entry == nil || entry.session == nil {
+			continue
+		}
+		agent := strings.ToLower(strings.TrimSpace(entry.agentName))
+		matched := false
+		if root != "" {
+			// Strict forms only:
+			//   agent-root::session
+			//   root::session
+			//   agent-session (legacy bare, only when entry has no root segment)
+			scoped := root + "::" + mindfsSessionKey
+			if poolKey == scoped || (agent != "" && poolKey == agent+"-"+scoped) {
+				matched = true
+			} else if !strings.Contains(poolKey, "::") && agent != "" && poolKey == agent+"-"+mindfsSessionKey {
+				matched = true
+			} else if !strings.Contains(poolKey, "::") && poolKey == mindfsSessionKey {
+				matched = true
+			}
+		} else {
+			// No root: exact mindfs key, agent-session, or unique agent-root::session suffix.
+			if poolKey == mindfsSessionKey || strings.TrimSpace(entry.sessionKey) == mindfsSessionKey {
+				matched = true
+			} else if agent != "" && poolKey == agent+"-"+mindfsSessionKey {
+				matched = true
+			} else if strings.HasSuffix(poolKey, "::"+mindfsSessionKey) {
+				matched = true
+			} else if agent != "" && strings.HasSuffix(poolKey, "-"+mindfsSessionKey) && !strings.Contains(poolKey, "::") {
+				matched = true
+			}
+		}
+		if !matched {
+			continue
+		}
+		info := RuntimeSessionInfo{
+			PoolKey:    poolKey,
+			AgentName:  entry.agentName,
+			SessionKey: mindfsSessionKey,
+			RuntimeKey: entry.runtimeKey,
+			Protocol:   entry.protocol,
+		}
+		if sid := strings.TrimSpace(entry.session.SessionID()); sid != "" {
+			info.AgentSession = sid
+		}
+		out = append(out, info)
+	}
+	return out
+}
+
+func (p *Pool) RuntimeKey(sessionKey string) string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if entry := p.sessions[sessionKey]; entry != nil {
+		return entry.runtimeKey
+	}
+	return ""
 }
 
 // Context returns the pool lifecycle context (read-only).

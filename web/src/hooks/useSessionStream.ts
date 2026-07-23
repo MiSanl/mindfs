@@ -426,7 +426,8 @@ function applySessionContextWindow(
     0,
     Number(contextWindow?.modelContextWindow || 0),
   );
-  if (!totalTokens || !modelContextWindow) {
+  // Usage-only reports (window=0) are still useful for the badge.
+  if (!totalTokens) {
     return items;
   }
   for (let i = items.length - 1; i >= 0; i -= 1) {
@@ -434,11 +435,15 @@ function applySessionContextWindow(
     if (item.type !== "assistant_text") {
       continue;
     }
-    if (
-      item.contextWindow?.totalTokens &&
-      item.contextWindow?.modelContextWindow
-    ) {
-      return items;
+    if (item.contextWindow?.totalTokens) {
+      // Prefer existing stamp; upgrade window size if newly known.
+      if (
+        item.contextWindow.modelContextWindow ||
+        !modelContextWindow ||
+        item.contextWindow.modelContextWindow === modelContextWindow
+      ) {
+        return items;
+      }
     }
     const next = [...items];
     next[i] = {
