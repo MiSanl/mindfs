@@ -2385,8 +2385,9 @@ func TestContextOverflowRetryPrecedence(t *testing.T) {
 	if !shouldAttemptContextOverflowCompact(err, "opencode", false) {
 		t.Fatal("expected compact attempt for overflow on opencode")
 	}
-	if shouldAttemptContextOverflowCompact(err, "opencode", true) {
-		t.Fatal("must not compact-retry after assistant chunks already streamed")
+	// Mid-turn overflow (assistant chunks already streamed) still gets one compact retry.
+	if !shouldAttemptContextOverflowCompact(err, "opencode", true) {
+		t.Fatal("expected compact attempt even after assistant chunks")
 	}
 	if shouldAttemptContextOverflowCompact(err, "unknown-agent-xyz", false) {
 		t.Fatal("unknown agent must not compact-retry")

@@ -171,6 +171,101 @@ func TestSendMessageContextOverflowCompactRetryLivePath(t *testing.T) {
 	}
 }
 
+// Mid-turn overflow: assistant already streamed some text, then the send fails
+// with a context overflow. Compact→retry must still run and finish the turn.
+func TestSendMessageMidTurnOverflowCompactRetry(t *testing.T) {
+	rootDir := t.TempDir()
+	root := rootfs.NewRootInfo("overflow-mid", "overflow-mid", rootDir)
+	manager := newTestSessionManager(t, root)
+	created, err := manager.Create(context.Background(), session.CreateInput{
+		Type: session.TypeChat,
+		Name: "overflow-mid-turn",
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	pool := agent.NewPool(agent.Config{
+		Agents: []agent.Definition{{Name: "opencode", Command: "opencode"}},
+	})
+	t.Cleanup(func() {
+		agent.OpenSessionHook = nil
+		pool.CloseAll()
+	})
+
+	var (
+		mu        sync.Mutex
+		sendCalls []string
+		n         int
+	)
+	agent.OpenSessionHook = func(_ context.Context, _ agenttypes.OpenSessionInput) (agenttypes.Session, error) {
+		mu.Lock()
+		n++
+		id := fmt.Sprintf("mid-%d", n)
+		mu.Unlock()
+		return &scriptedOverflowSession{
+			id: id,
+			send: func(ctx context.Context, content string, s *scriptedOverflowSession) error {
+				mu.Lock()
+				sendCalls = append(sendCalls, content)
+				call := len(sendCalls)
+				mu.Unlock()
+				if call == 1 && !strings.HasPrefix(strings.TrimSpace(content), "/compact") {
+					// Stream partial assistant text, then fail with overflow.
+					s.emit(agenttypes.Event{
+						Type: agenttypes.EventTypeMessageChunk,
+						Data: agenttypes.MessageChunk{Content: "PARTIAL_"},
+					})
+					return errors.New("prompt is too long for the model context window")
+				}
+				if strings.HasPrefix(strings.TrimSpace(content), "/compact") {
+					return nil
+				}
+				s.emit(agenttypes.Event{
+					Type: agenttypes.EventTypeMessageChunk,
+					Data: agenttypes.MessageChunk{Content: "AFTER_COMPACT"},
+				})
+				s.emit(agenttypes.Event{Type: agenttypes.EventTypeMessageDone, Data: agenttypes.MessageDone{}})
+				return nil
+			},
+		}, nil
+	}
+
+	service := Service{Registry: &commandTestRegistry{root: root, manager: manager, pool: pool}}
+	if err := service.SendMessage(context.Background(), SendMessageInput{
+		RootID:  root.ID,
+		Key:     created.Key,
+		Agent:   "opencode",
+		Content: "mid-turn overflow please",
+	}); err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+	mu.Lock()
+	calls := append([]string{}, sendCalls...)
+	opens := n
+	mu.Unlock()
+	if opens < 2 {
+		t.Fatalf("expected reopen, opens=%d", opens)
+	}
+	if len(calls) < 3 {
+		t.Fatalf("calls=%#v", calls)
+	}
+	if !strings.HasPrefix(strings.TrimSpace(calls[1]), "/compact") {
+		t.Fatalf("expected compact as second call, got %q", calls[1])
+	}
+	got, err := manager.Get(context.Background(), created.Key, 0)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	joined := ""
+	for _, ex := range got.Exchanges {
+		joined += ex.Content
+	}
+	// Partial pre-overflow text should be retained with post-compact retry text.
+	if !strings.Contains(joined, "PARTIAL_") || !strings.Contains(joined, "AFTER_COMPACT") {
+		t.Fatalf("history missing partial+retry content: %q", joined)
+	}
+}
+
 // scriptedOverflowSession is a fake agenttypes.Session for overflow compact e2e.
 type scriptedOverflowSession struct {
 	id       string

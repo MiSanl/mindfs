@@ -127,11 +127,25 @@ export function AgentModelSelector({
 
   const handleAgentSelect = useCallback(
     (nextAgent: string) => {
-      // Preview only — commit when the user picks a model (or re-picks same agent model).
+      // Preview on hover/click; if the agent has no model catalog, commit with defaults.
       setHoverAgent(nextAgent);
       setErrorAgent(null);
+      const target = agents.find((item) => item.name === nextAgent);
+      const catalog = target?.models ?? [];
+      if (catalog.length === 0) {
+        const fallback =
+          target?.default_model_id || target?.current_model_id || model || "";
+        if (onAgentModelChange) {
+          onAgentModelChange(nextAgent, fallback);
+        } else {
+          if (nextAgent !== agent) onAgentChange(nextAgent);
+          if (fallback) onModelChange(fallback);
+        }
+        setIsOpen(false);
+        setHoverAgent("");
+      }
     },
-    [],
+    [agent, agents, model, onAgentChange, onAgentModelChange, onModelChange],
   );
 
   const handleModelSelect = useCallback(
@@ -362,7 +376,11 @@ export function AgentModelSelector({
             </div>
             {models.length === 0 ? (
               <div style={{ padding: "10px 12px", fontSize: "12px", color: "var(--text-secondary)" }}>
-                {previewAgent?.available === false ? "Agent 不可用" : "暂无模型"}
+                {previewAgent?.available === false
+                  ? "Agent 不可用"
+                  : previewAgentName && previewAgentName !== agent
+                    ? "暂无模型列表 · 点击左侧 Agent 名称即可切换"
+                    : "暂无模型"}
               </div>
             ) : (
               models.map((item, index) => {

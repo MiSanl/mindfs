@@ -170,6 +170,45 @@ function isTopLevelSessionItem(session: SessionItem): boolean {
   return !String(session?.parent_session_key || "").trim();
 }
 
+
+function mergeSessionErrorLists(
+  serverErrors: any[] | null | undefined,
+  localErrors: any[] | null | undefined,
+  options?: { hasInFlightTurn?: boolean },
+): any[] {
+  // null/undefined server = fetch failed: keep local only.
+  if (serverErrors == null) {
+    return Array.isArray(localErrors) ? [...localErrors].slice(-100) : [];
+  }
+  const server = Array.isArray(serverErrors) ? [...serverErrors] : [];
+  const local = Array.isArray(localErrors) ? [...localErrors] : [];
+  // Authoritative empty server list: drop stale optimistic noise unless a turn
+  // is still in-flight (race: durable append not visible yet).
+  if (server.length === 0) {
+    if (options?.hasInFlightTurn) {
+      return local.slice(-100);
+    }
+    return [];
+  }
+  const merged = [...server];
+  for (const opt of local) {
+    const optId = String(opt?.id || "");
+    const optReq = String(opt?.request_id || "");
+    const exists = merged.some((e) => {
+      const id = String(e?.id || "");
+      const req = String(e?.request_id || "");
+      return (
+        (optId && id && optId === id) ||
+        (optReq && req && optReq === req) ||
+        (String(e?.message || "") === String(opt?.message || "") &&
+          String(e?.timestamp || "") === String(opt?.timestamp || ""))
+      );
+    });
+    if (!exists) merged.push(opt);
+  }
+  return merged.slice(-100);
+}
+
 function isCanceledSessionError(message: string): boolean {
   const normalized = message.trim().toLowerCase();
   return (
@@ -5297,28 +5336,10 @@ export function App({ onGoHome }: AppProps) {
                   (selectedSessionRef.current as any)?.session_key === key)
               ? ([...((selectedSessionRef.current as any).errors as any[])] as any[])
               : [];
-          // Merge like the WS error path: prefer server, keep optimistic rows not yet persisted.
-          let merged = [...serverErrors];
-          if (merged.length === 0) {
-            merged = prevErrors;
-          } else {
-            for (const opt of prevErrors) {
-              const optId = String(opt?.id || "");
-              const optReq = String(opt?.request_id || "");
-              const exists = merged.some((e) => {
-                const id = String(e?.id || "");
-                const req = String(e?.request_id || "");
-                return (
-                  (optId && id && optId === id) ||
-                  (optReq && req && optReq === req) ||
-                  (String(e?.message || "") === String(opt?.message || "") &&
-                    String(e?.timestamp || "") === String(opt?.timestamp || ""))
-                );
-              });
-              if (!exists) merged.push(opt);
-            }
-            merged = merged.slice(-100);
-          }
+          const hasInFlightTurn = !!pendingBySessionRef.current[cacheKey];
+          const merged = mergeSessionErrorLists(serverErrors, prevErrors, {
+            hasInFlightTurn,
+          });
           if (existing && typeof existing === "object") {
             sessionCacheRef.current[cacheKey] = {
               ...(existing as any),
@@ -9910,31 +9931,14 @@ export function App({ onGoHome }: AppProps) {
               });
               bumpCacheVersion();
               void sessionService.getSessionErrors(errRoot, errKey).then((serverErrors) => {
-                // Prefer server list, but keep optimistic rows the server has not
-                // persisted yet (race: GET can return older history only).
-                // null = fetch failed: keep optimistic only.
+                // Prefer server list; keep optimistic only while a turn may still
+                // be racing durable append. Empty server list is authoritative when
+                // no in-flight turn remains.
                 if (serverErrors == null) return;
-                let merged = Array.isArray(serverErrors) ? [...serverErrors] : [];
-                if (merged.length === 0) {
-                  merged = nextErrors;
-                } else {
-                  for (const opt of nextErrors) {
-                    const optId = String(opt?.id || "");
-                    const optReq = String(opt?.request_id || "");
-                    const exists = merged.some((e) => {
-                      const id = String(e?.id || "");
-                      const req = String(e?.request_id || "");
-                      return (
-                        (optId && id && optId === id) ||
-                        (optReq && req && optReq === req) ||
-                        (String(e?.message || "") === String(opt?.message || "") &&
-                          String(e?.timestamp || "") === String(opt?.timestamp || ""))
-                      );
-                    });
-                    if (!exists) merged.push(opt);
-                  }
-                  merged = merged.slice(-100);
-                }
+                const hasInFlightTurn = !!pendingBySessionRef.current[cacheKey];
+                const merged = mergeSessionErrorLists(serverErrors, nextErrors, {
+                  hasInFlightTurn,
+                });
                 if (sessionCacheRef.current[cacheKey]) {
                   sessionCacheRef.current[cacheKey] = {
                     ...(sessionCacheRef.current[cacheKey] as any),

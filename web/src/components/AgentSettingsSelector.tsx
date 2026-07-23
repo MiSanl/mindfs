@@ -152,6 +152,7 @@ export function AgentSettingsSelector({
                   title={item.description || item.id}
                   onClick={() => {
                     onModeChange?.(item.id);
+                    setIsOpen(false);
                   }}
                 >
                   <span style={{ fontSize: "13px", fontWeight: 600 }}>{item.name || item.id}</span>
@@ -171,6 +172,7 @@ export function AgentSettingsSelector({
                   selected={item.toLowerCase() === String(displayedEffort).toLowerCase()}
                   onClick={() => {
                     onEffortChange?.(item);
+                    setIsOpen(false);
                   }}
                 >
                   <span
@@ -191,13 +193,19 @@ export function AgentSettingsSelector({
             <Section title="Fast" withTopBorder={modes.length > 0 || supportsEffort}>
               <OptionButton
                 selected={fastModeEnabled}
-                onClick={() => onFastServiceChange?.("on")}
+                onClick={() => {
+                  onFastServiceChange?.("on");
+                  setIsOpen(false);
+                }}
               >
                 <span style={{ fontSize: "13px", fontWeight: 600 }}>On</span>
               </OptionButton>
               <OptionButton
                 selected={!fastModeEnabled}
-                onClick={() => onFastServiceChange?.("off")}
+                onClick={() => {
+                  onFastServiceChange?.("off");
+                  setIsOpen(false);
+                }}
               >
                 <span style={{ fontSize: "13px", fontWeight: 600 }}>Off</span>
               </OptionButton>

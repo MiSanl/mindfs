@@ -1696,12 +1696,15 @@ const autoCompactPrompt = "/compact\nPlease compact this conversation to free co
 
 // shouldAttemptContextOverflowCompact is the gate used by SendMessage before
 // entering the one-shot compact→retry path.
-func shouldAttemptContextOverflowCompact(sendErr error, agentName string, sawAssistantChunk bool) bool {
+//
+// Mid-turn overflow (after some assistant chunks) is allowed: partial output is
+// already in pending aux/responseText, and retry continues the turn after compact.
+// Callers may still pass sawAssistantChunk for logging/metrics; it no longer blocks.
+func shouldAttemptContextOverflowCompact(sendErr error, agentName string, _sawAssistantChunk bool) bool {
 	return sendErr != nil &&
 		!isCanceledTurnError(sendErr) &&
 		isContextOverflowAgentError(sendErr) &&
-		supportsPromptCompactRetry(agentName) &&
-		!sawAssistantChunk
+		supportsPromptCompactRetry(agentName)
 }
 
 // runContextOverflowCompactRetry performs reopen + /compact + original-prompt retry.
