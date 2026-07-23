@@ -833,26 +833,32 @@ func (h *HTTPHandler) handleSessionGet(w http.ResponseWriter, r *http.Request) {
 	if h.AppContext != nil {
 		if manager, mErr := h.AppContext.GetSessionManager(rootID); mErr == nil && manager != nil {
 			if pending, pErr := manager.PeekPendingTurn(r.Context(), key); pErr == nil && pending != nil {
-				if pendingUser == nil && strings.TrimSpace(pending.User.Content) != "" {
-					userCopy := pending.User
-					pendingUser = &userCopy
+				// Preserve chronological order: user then agent. Do not use the
+				// pendingUser helper for disk pending (it forces Seq=0 and appends last).
+				alreadyUser := false
+				alreadyAgent := false
+				for _, ex := range out.Exchanges {
+					if ex.Seq == pending.User.Seq && strings.EqualFold(ex.Role, "user") {
+						alreadyUser = true
+					}
+					if ex.Seq == pending.Agent.Seq && strings.EqualFold(ex.Role, "agent") {
+						alreadyAgent = true
+					}
 				}
-				if strings.TrimSpace(pending.Agent.Content) != "" || len(pending.Aux) > 0 {
+				if !alreadyUser && (strings.TrimSpace(pending.User.Content) != "" || pending.User.Seq > 0) {
+					userCopy := pending.User
+					out.Exchanges = append(append([]session.Exchange{}, out.Exchanges...), userCopy)
+				}
+				if !alreadyAgent && (strings.TrimSpace(pending.Agent.Content) != "" || len(pending.Aux) > 0) {
 					agentCopy := pending.Agent
-					// Avoid duplicating if already recovered into exchanges.
-					already := false
-					for _, ex := range out.Exchanges {
-						if ex.Seq == agentCopy.Seq && strings.EqualFold(ex.Role, "agent") {
-							already = true
-							break
-						}
+					out.Exchanges = append(append([]session.Exchange{}, out.Exchanges...), agentCopy)
+					if len(pending.Aux) > 0 {
+						exchangeAux[agentCopy.Seq] = append([]session.ExchangeAux{}, pending.Aux...)
 					}
-					if !already {
-						out.Exchanges = append(append([]session.Exchange{}, out.Exchanges...), agentCopy)
-						if len(pending.Aux) > 0 {
-							exchangeAux[agentCopy.Seq] = append([]session.ExchangeAux{}, pending.Aux...)
-						}
-					}
+				}
+				// Avoid duplicating stream-hub pending user when disk pending has the user.
+				if pendingUser != nil && (strings.TrimSpace(pending.User.Content) != "" || pending.User.Seq > 0) {
+					pendingUser = nil
 				}
 			}
 		}

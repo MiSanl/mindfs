@@ -1209,10 +1209,10 @@ class SessionService {
     }
   }
 
-async getSessionErrors(
+  async getSessionErrors(
     rootId: string,
     sessionKey: string,
-  ): Promise<SessionErrorRecord[]> {
+  ): Promise<SessionErrorRecord[] | null> {
     try {
       const params = new URLSearchParams({ root: rootId });
       const data = await protectedJSON<{ errors?: SessionErrorRecord[] }>(
@@ -1221,7 +1221,8 @@ async getSessionErrors(
       return Array.isArray(data?.errors) ? data.errors : [];
     } catch (err) {
       console.error("[Session] Failed to get session errors:", err);
-      return [];
+      // null = request failed; callers must not treat this as an empty log.
+      return null;
     }
   }
 

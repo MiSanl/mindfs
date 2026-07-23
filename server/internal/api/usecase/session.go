@@ -1667,7 +1667,6 @@ func isContextOverflowAgentError(err error) bool {
 		"exceeded the context",
 		"too many tokens",
 		"token limit",
-		"max_tokens",
 		"model context",
 		"input is too long",
 		"message is too long",
@@ -1724,7 +1723,6 @@ func isNonRecoverableAgentError(err error) bool {
 		"exceeded the context",
 		"too many tokens",
 		"token limit",
-		"max_tokens",
 		"model context",
 		"input is too long",
 		"message is too long",
@@ -2782,7 +2780,9 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 		}
 		// Only enter failure/recovery paths when the turn is still failing.
 		if sendErr != nil {
-			if isNonRecoverableAgentError(sendErr) {
+			// Overflow / compact-failed turns stay terminal (never transport-recover).
+			lowerSendErr := strings.ToLower(sendErr.Error())
+			if isContextOverflowAgentError(sendErr) || strings.Contains(lowerSendErr, "context overflow") || isNonRecoverableAgentError(sendErr) {
 				log.Printf("[session] turn.send.non_recoverable root=%s session=%s agent=%s action=fail_without_recovery err=%v", in.RootID, current.Key, in.Agent, sendErr)
 				cancelRuntimeAfterNonRecoverableError(sess, agentPool, in.RootID, current.Key, in.Agent, sendErr)
 			} else if !sawAssistantChunk && !isRecoverableTransportError(sendErr) {

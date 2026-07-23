@@ -5238,12 +5238,16 @@ export function App({ onGoHome }: AppProps) {
           typeof (fullSession as any)?.pending === "boolean"
             ? !!(fullSession as any).pending
             : undefined;
-        // A session fetch can race an active local turn. Server snapshots do
-        // not include the in-memory turn, so a false server value must not
-        // hide the cancel control or discard the optimistic pending state.
+        // Live local pending wins while a turn is in-flight, but authoritative
+        // server pending=false must clear sticky local generating state.
+        const localPending = resolvePendingForSession(targetRoot, key, preservePending);
+        if (serverPending === false && localPending) {
+          delete pendingBySessionRef.current[cacheKey];
+        }
         const pending =
-          resolvePendingForSession(targetRoot, key, preservePending) ||
-          serverPending === true;
+          serverPending === false
+            ? false
+            : localPending || serverPending === true;
         const normalized = {
           ...(fullSession as any),
           key,
@@ -5279,7 +5283,8 @@ export function App({ onGoHome }: AppProps) {
       };
       const refreshSessionErrors = () => {
         void sessionService.getSessionErrors(targetRoot, key).then((serverErrors) => {
-          if (!Array.isArray(serverErrors)) return;
+          // null means fetch failed — keep existing optimistic/local errors.
+          if (serverErrors == null || !Array.isArray(serverErrors)) return;
           const existing = sessionCacheRef.current[cacheKey];
           if (existing && typeof existing === "object") {
             sessionCacheRef.current[cacheKey] = {
@@ -9848,6 +9853,8 @@ export function App({ onGoHome }: AppProps) {
               void sessionService.getSessionErrors(errRoot, errKey).then((serverErrors) => {
                 // Prefer server list, but keep optimistic rows the server has not
                 // persisted yet (race: GET can return older history only).
+                // null = fetch failed: keep optimistic only.
+                if (serverErrors == null) return;
                 let merged = Array.isArray(serverErrors) ? [...serverErrors] : [];
                 if (merged.length === 0) {
                   merged = nextErrors;
