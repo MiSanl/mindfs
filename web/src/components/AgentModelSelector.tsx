@@ -6,10 +6,16 @@ type AgentModelSelectorProps = {
   agent: string;
   agents: AgentStatus[];
   model?: string;
+  mode?: string;
+  effort?: string;
+  fastService?: "" | "on" | "off";
   onAgentChange: (agent: string) => void;
   onModelChange: (model: string) => void;
   /** Preferred: commit agent+model together so effort/fast defaults use the new agent. */
   onAgentModelChange?: (agent: string, model: string) => void;
+  onModeChange?: (mode?: string) => void;
+  onEffortChange?: (effort?: string) => void;
+  onFastServiceChange?: (fastService?: "" | "on" | "off") => void;
   onAgentRestart?: (agent: string) => void | Promise<void>;
   compact?: boolean;
   warnUnavailable?: boolean;
@@ -62,21 +68,27 @@ function parseAgentErrorDetails(error?: string): string[] {
 }
 
 /**
- * Combined Agent + Model control for the action bar.
- * One compact trigger (icon + model name); menu has agents on the left and models on the right.
+ * Combined Agent + Model + run-settings control for the action bar.
+ * One compact trigger; menu: agents | models | mode/effort/fast.
  */
 export function AgentModelSelector({
   agent,
   agents,
   model = "",
+  mode = "",
+  effort = "",
+  fastService = "",
   onAgentChange,
   onModelChange,
   onAgentModelChange,
+  onModeChange,
+  onEffortChange,
+  onFastServiceChange,
   onAgentRestart,
   compact = false,
   warnUnavailable = false,
   menuPlacement = "top",
-  maxButtonWidth = "min(36vw, 168px)",
+  maxButtonWidth = "min(42vw, 200px)",
 }: AgentModelSelectorProps) {
   const [isOpen, setIsOpen] = useState(false);
   const [errorAgent, setErrorAgent] = useState<string | null>(null);
@@ -100,6 +112,29 @@ export function AgentModelSelector({
     return (selectedAgent?.models ?? []).find((item) => item.id === target) ?? null;
   }, [selectedAgent, model]);
   const modelLabel = selectedModel?.name || selectedModel?.id || model || "模型";
+
+  // Run settings are always for the *committed* agent+model (not hover preview).
+  const modes = selectedAgent?.modes ?? [];
+  const displayedMode = mode || selectedAgent?.current_mode_id || "";
+  const currentMode = modes.find((item) => item.id === displayedMode);
+  const modeLabel = currentMode?.name || currentMode?.id || displayedMode || "";
+  const modelEfforts = selectedModel?.efforts ?? [];
+  const efforts = modelEfforts.length > 0 ? modelEfforts : selectedAgent?.efforts ?? [];
+  const supportsEffort = efforts.length > 0 && !!selectedModel?.supportEffort;
+  const displayedEffort =
+    effort || selectedModel?.default_effort || selectedAgent?.default_effort || "";
+  const supportsFastService = !!selectedAgent?.supports_fast_service;
+  const fastModeEnabled =
+    (fastService || selectedAgent?.default_fast_service || "") === "on";
+  const hasRunSettings =
+    modes.length > 0 || supportsEffort || supportsFastService;
+
+  const summaryParts = [modelLabel];
+  if (modeLabel) summaryParts.push(modeLabel);
+  if (supportsEffort && displayedEffort) summaryParts.push(displayedEffort);
+  if (supportsFastService && fastModeEnabled) summaryParts.push("Fast");
+  const summary = summaryParts.filter(Boolean).join(" · ");
+
   const errorAgentStatus = useMemo(
     () => agents.find((item) => item.name === errorAgent) ?? null,
     [agents, errorAgent],
@@ -127,7 +162,6 @@ export function AgentModelSelector({
 
   const handleAgentSelect = useCallback(
     (nextAgent: string) => {
-      // Preview on hover/click; if the agent has no model catalog, commit with defaults.
       setHoverAgent(nextAgent);
       setErrorAgent(null);
       const target = agents.find((item) => item.name === nextAgent);
@@ -141,7 +175,7 @@ export function AgentModelSelector({
           if (nextAgent !== agent) onAgentChange(nextAgent);
           if (fallback) onModelChange(fallback);
         }
-        setIsOpen(false);
+        // Keep menu open so user can still set mode/effort after switch when available.
         setHoverAgent("");
       }
     },
@@ -159,9 +193,9 @@ export function AgentModelSelector({
         }
         onModelChange(nextModel);
       }
-      setIsOpen(false);
       setErrorAgent(null);
       setHoverAgent("");
+      // Keep open if run settings exist for the new agent so user can adjust effort.
     },
     [agent, hoverAgent, onAgentChange, onAgentModelChange, onModelChange],
   );
@@ -196,9 +230,9 @@ export function AgentModelSelector({
         title={
           warnUnavailable
             ? `当前会话的 Agent（${agent}）不可用`
-            : `${agent || "Agent"} · ${modelLabel}`
+            : `${agent || "Agent"} · ${summary}`
         }
-        aria-label={`选择 Agent 与模型，当前为 ${agent || "未选择"} / ${modelLabel}`}
+        aria-label={`选择 Agent、模型与运行设置，当前为 ${agent || "未选择"} / ${summary}`}
         style={{
           display: "inline-flex",
           alignItems: "center",
@@ -225,9 +259,10 @@ export function AgentModelSelector({
             whiteSpace: "nowrap",
             fontSize: "12px",
             fontWeight: 600,
+            textTransform: "capitalize",
           }}
         >
-          {modelLabel}
+          {summary}
         </span>
         <SelectorChevron expanded={isOpen} />
         {warnUnavailable ? (
@@ -262,7 +297,7 @@ export function AgentModelSelector({
             right: 0,
             display: "flex",
             maxWidth: "calc(100vw - 16px)",
-            maxHeight: "380px",
+            maxHeight: "400px",
             padding: "0",
             border: "1px solid var(--menu-border)",
             borderRadius: "12px",
@@ -272,18 +307,8 @@ export function AgentModelSelector({
             overflow: "hidden",
           }}
         >
-          <div style={{ width: "min(42vw, 148px)", maxHeight: "380px", overflowY: "auto", padding: "8px 0" }}>
-            <div
-              style={{
-                padding: "6px 12px",
-                fontSize: "11px",
-                fontWeight: 700,
-                color: "var(--text-secondary)",
-                textTransform: "uppercase",
-              }}
-            >
-              Agent
-            </div>
+          <div style={{ width: "min(36vw, 136px)", maxHeight: "400px", overflowY: "auto", padding: "8px 0" }}>
+            <div style={sectionHeaderStyle}>Agent</div>
             {agents.map((item) => {
               const selected = item.name === agent;
               const preview = item.name === previewAgentName;
@@ -355,23 +380,15 @@ export function AgentModelSelector({
 
           <div
             style={{
-              width: "min(56vw, 220px)",
-              maxHeight: "380px",
+              width: "min(48vw, 200px)",
+              maxHeight: "400px",
               overflowY: "auto",
               padding: "8px 0",
               borderLeft: "1px solid var(--menu-divider)",
               boxSizing: "border-box",
             }}
           >
-            <div
-              style={{
-                padding: "6px 12px",
-                fontSize: "11px",
-                fontWeight: 700,
-                color: "var(--text-secondary)",
-                textTransform: "uppercase",
-              }}
-            >
+            <div style={sectionHeaderStyle}>
               {previewAgent?.name ? `Model · ${previewAgent.name}` : "Model"}
             </div>
             {models.length === 0 ? (
@@ -411,22 +428,96 @@ export function AgentModelSelector({
                   >
                     <span style={{ fontSize: "13px", fontWeight: 600 }}>{item.name || item.id}</span>
                     {item.description ? (
-                      <span
-                        style={{
-                          fontSize: "11px",
-                          color: "var(--text-secondary)",
-                          whiteSpace: "normal",
-                          overflowWrap: "anywhere",
-                        }}
-                      >
-                        {item.description}
-                      </span>
+                      <span style={descriptionStyle}>{item.description}</span>
                     ) : null}
                   </button>
                 );
               })
             )}
           </div>
+
+          {hasRunSettings ? (
+            <div
+              style={{
+                width: "min(40vw, 168px)",
+                maxHeight: "400px",
+                overflowY: "auto",
+                padding: "8px 0",
+                borderLeft: "1px solid var(--menu-divider)",
+                boxSizing: "border-box",
+              }}
+            >
+              <div style={sectionHeaderStyle}>
+                {selectedAgent?.name ? `设置 · ${selectedAgent.name}` : "设置"}
+              </div>
+              {modes.length > 0 ? (
+                <SettingsGroup title="Mode">
+                  {modes.map((item) => (
+                    <SettingsOption
+                      key={item.id}
+                      selected={item.id === displayedMode}
+                      title={item.description || item.id}
+                      onClick={() => {
+                        onModeChange?.(item.id);
+                        setIsOpen(false);
+                      }}
+                    >
+                      <span style={{ fontSize: "13px", fontWeight: 600 }}>{item.name || item.id}</span>
+                    </SettingsOption>
+                  ))}
+                </SettingsGroup>
+              ) : null}
+              {supportsEffort ? (
+                <SettingsGroup title="Effort" withTopBorder={modes.length > 0}>
+                  {efforts.map((item) => (
+                    <SettingsOption
+                      key={item}
+                      selected={item.toLowerCase() === String(displayedEffort).toLowerCase()}
+                      onClick={() => {
+                        onEffortChange?.(item);
+                        setIsOpen(false);
+                      }}
+                    >
+                      <span
+                        style={{
+                          fontSize: "13px",
+                          fontWeight: 600,
+                          textTransform: "capitalize",
+                        }}
+                      >
+                        {item}
+                      </span>
+                    </SettingsOption>
+                  ))}
+                </SettingsGroup>
+              ) : null}
+              {supportsFastService ? (
+                <SettingsGroup
+                  title="Fast"
+                  withTopBorder={modes.length > 0 || supportsEffort}
+                >
+                  <SettingsOption
+                    selected={fastModeEnabled}
+                    onClick={() => {
+                      onFastServiceChange?.("on");
+                      setIsOpen(false);
+                    }}
+                  >
+                    <span style={{ fontSize: "13px", fontWeight: 600 }}>On</span>
+                  </SettingsOption>
+                  <SettingsOption
+                    selected={!fastModeEnabled}
+                    onClick={() => {
+                      onFastServiceChange?.("off");
+                      setIsOpen(false);
+                    }}
+                  >
+                    <span style={{ fontSize: "13px", fontWeight: 600 }}>Off</span>
+                  </SettingsOption>
+                </SettingsGroup>
+              ) : null}
+            </div>
+          ) : null}
 
           {errorAgentStatus && parseAgentErrorMessage(errorAgentStatus.error) ? (
             <div
@@ -493,6 +584,90 @@ export function AgentModelSelector({
         </div>
       ) : null}
     </div>
+  );
+}
+
+const sectionHeaderStyle: React.CSSProperties = {
+  padding: "6px 12px",
+  fontSize: "11px",
+  fontWeight: 700,
+  color: "var(--text-secondary)",
+  textTransform: "uppercase",
+};
+
+const descriptionStyle: React.CSSProperties = {
+  fontSize: "11px",
+  color: "var(--text-secondary)",
+  whiteSpace: "normal",
+  overflowWrap: "anywhere",
+};
+
+function SettingsGroup({
+  title,
+  withTopBorder = false,
+  children,
+}: {
+  title: string;
+  withTopBorder?: boolean;
+  children: React.ReactNode;
+}) {
+  return (
+    <div
+      style={{
+        borderTop: withTopBorder ? "1px solid var(--menu-divider)" : "none",
+        paddingTop: withTopBorder ? 4 : 0,
+      }}
+    >
+      <div
+        style={{
+          padding: "4px 12px",
+          fontSize: "10px",
+          fontWeight: 700,
+          color: "var(--text-secondary)",
+          textTransform: "uppercase",
+          opacity: 0.85,
+        }}
+      >
+        {title}
+      </div>
+      {children}
+    </div>
+  );
+}
+
+function SettingsOption({
+  selected,
+  title,
+  onClick,
+  children,
+}: {
+  selected: boolean;
+  title?: string;
+  onClick: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      title={title}
+      onClick={onClick}
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "flex-start",
+        gap: "2px",
+        width: "100%",
+        minWidth: 0,
+        padding: "8px 12px",
+        border: "none",
+        background: selected ? "rgba(59,130,246,0.08)" : "transparent",
+        color: selected ? "#3b82f6" : "var(--text-primary)",
+        textAlign: "left",
+        cursor: "pointer",
+      }}
+    >
+      {children}
+    </button>
   );
 }
 
