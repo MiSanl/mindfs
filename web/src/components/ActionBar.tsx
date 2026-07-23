@@ -1,8 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { type SessionMode } from "./ModeSelector";
 import { ModeSelector } from "./ModeSelector";
-import { AgentSelector } from "./AgentSelector";
-import { ModelSelector } from "./ModelSelector";
+import { AgentModelSelector } from "./AgentModelSelector";
 import { AgentModeSelector } from "./AgentModeSelector";
 import { EffortSelector } from "./EffortSelector";
 import { FastServiceSelector } from "./FastServiceSelector";
@@ -1300,12 +1299,12 @@ export function ActionBar({
     : mode === "chat" && !isFocused
       ? t(blurPlaceholderKey)
       : t(modePlaceholderKeys[mode]);
-  // Agent 与模型拆成两个相邻控件后，单行编辑器需为右侧工具栏预留更多空间。
+  // Agent+Model 合并后右侧工具栏更窄；runtime 已移出输入框。
   const editorRightInset = isMultiLine
     ? 14
     : mode === "command"
       ? isMobile ? 92 : 116
-      : isMobile ? 224 : 280;
+      : isMobile ? 168 : 210;
   const editorBottomInset = isMultiLine ? 44 : 12;
   const editorMinHeight = 44;
   const mobileFileSidebarButton = isMobile ? (
@@ -1508,54 +1507,124 @@ export function ActionBar({
               display: "flex",
               flexDirection: "column",
               alignItems: "flex-start",
-              gap: planModeActive ? "4px" : 0,
+              gap: mode !== "command" ? "4px" : 0,
               minWidth: 0,
             }}
           >
-            {planModeActive ? (
+            {mode !== "command" ? (
               <div
                 style={{
-                  display: "inline-flex",
+                  display: "flex",
                   alignItems: "center",
-                  gap: "5px",
-                  height: "20px",
-                  padding: "0 5px 0 8px",
-                  borderRadius: "999px",
-                  border: "1px solid rgba(37, 99, 235, 0.22)",
-                  background: "rgba(37, 99, 235, 0.10)",
-                  color: "#2563eb",
-                  fontSize: "11px",
-                  fontWeight: 700,
-                  lineHeight: 1,
+                  gap: "6px",
+                  minHeight: "20px",
+                  width: "100%",
+                  minWidth: 0,
                 }}
               >
-                <span>Plan</span>
+                {planModeActive ? (
+                  <div
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: "5px",
+                      height: "20px",
+                      padding: "0 5px 0 8px",
+                      borderRadius: "999px",
+                      border: "1px solid rgba(37, 99, 235, 0.22)",
+                      background: "rgba(37, 99, 235, 0.10)",
+                      color: "#2563eb",
+                      fontSize: "11px",
+                      fontWeight: 700,
+                      lineHeight: 1,
+                    }}
+                  >
+                    <span>Plan</span>
+                    <button
+                      type="button"
+                      aria-label={t("action.closePlanMode")}
+                      title={t("action.closePlanMode")}
+                      onMouseDown={(event) => event.preventDefault()}
+                      onClick={() => void onSetPlanMode?.(false, planSessionKey, planRootId)}
+                      style={{
+                        width: "14px",
+                        height: "14px",
+                        border: "none",
+                        borderRadius: "999px",
+                        background: "transparent",
+                        color: "currentColor",
+                        display: "inline-flex",
+                        alignItems: "center",
+                        justifyContent: "center",
+                        cursor: "pointer",
+                        fontSize: "14px",
+                        lineHeight: 1,
+                        padding: 0,
+                      }}
+                    >
+                      <svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24" aria-hidden="true">
+                        <path d="M0 0h24v24H0z" fill="none" />
+                        <path fill="currentColor" fillRule="evenodd" d="M21 12a9 9 0 1 1-18 0a9 9 0 0 1 18 0M7.293 16.707a1 1 0 0 1 0-1.414L10.586 12L7.293 8.707a1 1 0 0 1 1.414-1.414L12 10.586l3.293-3.293a1 1 0 1 1 1.414 1.414L13.414 12l3.293 3.293a1 1 0 0 1-1.414 1.414L12 13.414l-3.293 3.293a1 1 0 0 1-1.414 0" clipRule="evenodd" />
+                      </svg>
+                    </button>
+                  </div>
+                ) : null}
                 <button
                   type="button"
-                  aria-label={t("action.closePlanMode")}
-                  title={t("action.closePlanMode")}
-                  onMouseDown={(event) => event.preventDefault()}
-                  onClick={() => void onSetPlanMode?.(false, planSessionKey, planRootId)}
+                  title={
+                    runtimeMeta.state === "connected"
+                      ? runtimeMeta.label
+                      : `${runtimeMeta.label} · ${t("session.runtime.reconnectHint")}`
+                  }
+                  aria-label={`${t("session.runtime.label")}: ${runtimeMeta.label}`}
+                  onClick={async () => {
+                    const target = String(runtimeMeta.agent || agent || "").trim();
+                    if (!target || runtimeMeta.state === "opening") return;
+                    try {
+                      if (onRuntimeReconnect) {
+                        await onRuntimeReconnect(target);
+                      } else {
+                        await restartAgent(target);
+                        const items = await fetchAgents(true);
+                        setAgents(items);
+                      }
+                    } catch (err) {
+                      console.warn("[runtime/reconnect] failed", err);
+                    }
+                  }}
                   style={{
-                    width: "14px",
-                    height: "14px",
-                    border: "none",
-                    borderRadius: "999px",
-                    background: "transparent",
-                    color: "currentColor",
                     display: "inline-flex",
                     alignItems: "center",
-                    justifyContent: "center",
-                    cursor: "pointer",
-                    fontSize: "14px",
-                    lineHeight: 1,
-                    padding: 0,
+                    gap: "5px",
+                    maxWidth: isMobile ? "min(52vw, 180px)" : "220px",
+                    height: "20px",
+                    padding: "0 8px",
+                    borderRadius: "999px",
+                    border: "1px solid color-mix(in srgb, var(--border-color) 80%, transparent)",
+                    background: "color-mix(in srgb, var(--panel-bg) 88%, transparent)",
+                    color: "var(--text-secondary)",
+                    fontSize: "11px",
+                    fontWeight: 600,
+                    whiteSpace: "nowrap",
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    flexShrink: 1,
+                    cursor: runtimeMeta.state === "opening" ? "default" : "pointer",
+                    marginLeft: planModeActive ? 0 : "2px",
                   }}
                 >
-                  <svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24" aria-hidden="true">
-                    <path d="M0 0h24v24H0z" fill="none" />
-                    <path fill="currentColor" fillRule="evenodd" d="M21 12a9 9 0 1 1-18 0a9 9 0 0 1 18 0M7.293 16.707a1 1 0 0 1 0-1.414L10.586 12L7.293 8.707a1 1 0 0 1 1.414-1.414L12 10.586l3.293-3.293a1 1 0 1 1 1.414 1.414L13.414 12l3.293 3.293a1 1 0 0 1-1.414 1.414L12 13.414l-3.293 3.293a1 1 0 0 1-1.414 0" clipRule="evenodd" />
-                  </svg>
+                  <span
+                    style={{
+                      width: "7px",
+                      height: "7px",
+                      borderRadius: "50%",
+                      background: runtimeMeta.color,
+                      flexShrink: 0,
+                    }}
+                  />
+                  <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>
+                    {runtimeMeta.label}
+                  </span>
                 </button>
               </div>
             ) : null}
@@ -1795,9 +1864,13 @@ export function ActionBar({
               <ModeSelector mode={mode} onModeChange={setMode} compact={true} disabled={isModeLocked} />
               {mode !== "command" ? (
                 <div style={{ display: "flex", alignItems: "center", minWidth: 0 }}>
-                  <AgentSelector
+                  <AgentModelSelector
                     agent={agent}
                     agents={agents}
+                    model={model}
+                    compact={true}
+                    warnUnavailable={isSelectedAgentUnavailable}
+                    maxButtonWidth={isMobile ? "min(34vw, 128px)" : "168px"}
                     onAgentChange={(nextAgent) => {
                       const prevAgent = agent;
                       const nextStatus = agents.find((item) => item.name === nextAgent);
@@ -1824,75 +1897,6 @@ export function ActionBar({
                         }
                       }
                     }}
-                    onAgentRestart={async (targetAgent) => {
-                      await restartAgent(targetAgent);
-                      const items = await fetchAgents(true);
-                      setAgents(items);
-                    }}
-                    compact={true}
-                    warnUnavailable={isSelectedAgentUnavailable}
-                  />
-                  <button
-                    type="button"
-                    title={
-                      runtimeMeta.state === "connected"
-                        ? runtimeMeta.label
-                        : `${runtimeMeta.label} · ${t("session.runtime.reconnectHint")}`
-                    }
-                    aria-label={`${t("session.runtime.label")}: ${runtimeMeta.label}`}
-                    onClick={async () => {
-                      const target = String(runtimeMeta.agent || agent || "").trim();
-                      if (!target || runtimeMeta.state === "opening") return;
-                      try {
-                        if (onRuntimeReconnect) {
-                          await onRuntimeReconnect(target);
-                        } else {
-                          await restartAgent(target);
-                          const items = await fetchAgents(true);
-                          setAgents(items);
-                        }
-                      } catch (err) {
-                        console.warn("[runtime/reconnect] failed", err);
-                      }
-                    }}
-                    style={{
-                      display: "inline-flex",
-                      alignItems: "center",
-                      gap: "6px",
-                      maxWidth: isMobile ? "min(28vw, 110px)" : "160px",
-                      height: "28px",
-                      padding: "0 8px",
-                      borderRadius: "8px",
-                      border: "1px solid var(--border-color)",
-                      background: "var(--bg-secondary, transparent)",
-                      color: "var(--text-secondary)",
-                      fontSize: "11px",
-                      fontWeight: 600,
-                      whiteSpace: "nowrap",
-                      overflow: "hidden",
-                      textOverflow: "ellipsis",
-                      flexShrink: 1,
-                      cursor: runtimeMeta.state === "opening" ? "default" : "pointer",
-                    }}
-                  >
-                    <span
-                      style={{
-                        width: "8px",
-                        height: "8px",
-                        borderRadius: "50%",
-                        background: runtimeMeta.color,
-                        flexShrink: 0,
-                      }}
-                    />
-                    <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>
-                      {runtimeMeta.agent || runtimeMeta.label}
-                    </span>
-                  </button>
-                  <ModelSelector
-                    agent={selectedAgent}
-                    model={model}
-                    compact
-                    maxButtonWidth={isMobile ? "min(25vw, 88px)" : "132px"}
                     onModelChange={(nextModel) => {
                       const defaults = getAgentDefaults(selectedAgent);
                       setModel(nextModel);
@@ -1900,12 +1904,17 @@ export function ActionBar({
                       setEffort(getModelDefaultEffort(selectedAgent, nextModel));
                       setFastService(defaults.fastService);
                     }}
+                    onAgentRestart={async (targetAgent) => {
+                      await restartAgent(targetAgent);
+                      const items = await fetchAgents(true);
+                      setAgents(items);
+                    }}
                   />
                   <AgentModeSelector
                     agent={selectedAgent}
                     mode={agentMode}
                     compact
-                    maxButtonWidth={isMobile ? "min(25vw, 88px)" : "132px"}
+                    maxButtonWidth={isMobile ? "min(22vw, 80px)" : "110px"}
                     onModeChange={(nextAgentMode) => setAgentMode(nextAgentMode || "")}
                   />
                   <EffortSelector
@@ -1913,7 +1922,7 @@ export function ActionBar({
                     model={model}
                     effort={effort}
                     compact
-                    maxButtonWidth={isMobile ? "min(25vw, 88px)" : "132px"}
+                    maxButtonWidth={isMobile ? "min(22vw, 80px)" : "110px"}
                     onEffortChange={(nextEffort) => setEffort(nextEffort || "")}
                   />
                   <FastServiceSelector
@@ -1922,12 +1931,12 @@ export function ActionBar({
                     compact
                     onFastServiceChange={(nextFastService) => setFastService(nextFastService || "")}
                   />
-				  {mindfsSessionID ? (
+                  {mindfsSessionID ? (
                     <button
                       type="button"
                       onClick={copySessionID}
-					  title="Copy MindFS session ID"
-					  aria-label="Copy MindFS session ID"
+                      title="Copy MindFS session ID"
+                      aria-label="Copy MindFS session ID"
                       style={{ width: "28px", height: "28px", borderRadius: "8px", border: "none", background: "transparent", color: "var(--text-secondary)", display: "inline-flex", alignItems: "center", justifyContent: "center", cursor: "pointer" }}
                     >
                       <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="9" y="9" width="11" height="11" rx="2" /><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" /></svg>
