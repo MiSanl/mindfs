@@ -2354,3 +2354,16 @@ func (*renameManagedDirTestRegistry) GetFileWatcher(string, *session.Manager) (*
 }
 
 func (*renameManagedDirTestRegistry) ReleaseFileWatcher(string, string) {}
+
+
+func TestIsContextOverflowAgentError(t *testing.T) {
+	if !isContextOverflowAgentError(errors.New("Prompt is too long for the model context window")) {
+		t.Fatal("expected context overflow detection")
+	}
+	if isContextOverflowAgentError(errors.New("peer disconnected")) {
+		t.Fatal("transport error must not be context overflow")
+	}
+	if !supportsPromptCompactRetry("opencode") {
+		t.Fatal("opencode should support compact retry")
+	}
+}

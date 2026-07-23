@@ -133,8 +133,8 @@ func (h *StreamHub) pendingLookupKey(rootID, sessionKey string) string {
 	for key := range h.pendingSessions {
 		if key == sessionKey || strings.HasSuffix(key, "::"+sessionKey) {
 			if match != "" && match != key {
-				// Ambiguous across roots without rootID; keep legacy bare key.
-				return sessionKey
+				// Ambiguous across roots without rootID: do not guess.
+				return ""
 			}
 			match = key
 		}

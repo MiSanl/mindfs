@@ -857,8 +857,18 @@ func (h *HTTPHandler) handleSessionGet(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	respondJSON(w, http.StatusOK, h.sessionResponseWithBindings(r.Context(), rootID, key, out, pendingUser, contextWindow, exchangeAux))
-}
+	resp := h.sessionResponseWithBindings(r.Context(), rootID, key, out, pendingUser, contextWindow, exchangeAux)
+	if h.AppContext != nil {
+		if manager, mErr := h.AppContext.GetSessionManager(rootID); mErr == nil && manager != nil {
+			if pending, pErr := manager.PeekPendingTurn(r.Context(), key); pErr == nil && pending != nil {
+				resp["pending"] = true
+			}
+			if h.AppContext.GetSessionStreamHub().IsSessionReplying(rootID, key) {
+				resp["pending"] = true
+			}
+		}
+	}
+	respondJSON(w, http.StatusOK, resp)}
 
 func (h *HTTPHandler) handleSessionSync(w http.ResponseWriter, r *http.Request) {
 	rootID := r.URL.Query().Get("root")

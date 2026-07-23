@@ -1645,6 +1645,52 @@ func isCanceledTurnError(err error) bool {
 		strings.Contains(value, "turn cancelled")
 }
 
+func isContextOverflowAgentError(err error) bool {
+	if err == nil {
+		return false
+	}
+	value := strings.ToLower(strings.TrimSpace(err.Error()))
+	if value == "" {
+		return false
+	}
+	needles := []string{
+		"context length",
+		"context_length",
+		"context window",
+		"maximum context",
+		"max context",
+		"prompt is too long",
+		"prompt too long",
+		"request too large",
+		"tokens exceed",
+		"exceeds the context",
+		"exceeded the context",
+		"too many tokens",
+		"token limit",
+		"max_tokens",
+		"model context",
+		"input is too long",
+		"message is too long",
+		"remote compaction failed",
+		"compact_remote",
+	}
+	for _, needle := range needles {
+		if strings.Contains(value, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func supportsPromptCompactRetry(agentName string) bool {
+	switch strings.ToLower(strings.TrimSpace(agentName)) {
+	case "opencode", "claude", "codex", "qwen", "gemini", "goose", "crush", "kilocode", "iflow", "pi", "hermes", "openclaw", "omp":
+		return true
+	default:
+		return strings.TrimSpace(agentName) != ""
+	}
+}
+
 func isNonRecoverableAgentError(err error) bool {
 	if err == nil {
 		return false
@@ -2686,10 +2732,48 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 	}
 	sendErr := sendWithAttachedUpdates(turnCtx, sess, prompt)
 	if sendErr != nil && !isCanceledTurnError(sendErr) {
-		if isNonRecoverableAgentError(sendErr) {
+		// One-shot context overflow recovery: ask the agent to compact, then resend.
+		if isContextOverflowAgentError(sendErr) && supportsPromptCompactRetry(in.Agent) && !sawAssistantChunk {
+			log.Printf("[session] turn.send.context_overflow root=%s session=%s agent=%s action=compact_and_retry err=%v", in.RootID, current.Key, in.Agent, sendErr)
+			if in.OnUpdate != nil {
+				in.OnUpdate(agenttypes.Event{
+					Type: agenttypes.EventTypeCompact,
+					Data: agenttypes.CompactNotice{
+						ID:      "auto-compact-" + randomHex(6),
+						Status:  "auto",
+						Summary: "Context overflow detected; requesting compact and retrying this turn.",
+					},
+				})
+			}
+			// Close and reopen runtime so compact is applied on a clean stream.
+			cancelRuntimeAfterNonRecoverableError(sess, agentPool, in.RootID, current.Key, in.Agent, sendErr)
+			reopened, _, reopenErr := s.ensureAgentSession(turnCtx, agentPool, manager, current, in.RootID, in.Agent, in.Model, in.Mode, in.Effort, in.FastService, rootAbs, binding, providerConfig)
+			if reopenErr != nil {
+				log.Printf("[session] compact.reopen.failed root=%s session=%s agent=%s err=%v", in.RootID, current.Key, in.Agent, reopenErr)
+				sendErr = fmt.Errorf("context overflow and compact reopen failed: %v (original: %w)", reopenErr, sendErr)
+			} else {
+				sess = reopened
+				setActiveTurnSession(in.RootID, current.Key, sess)
+				compactPrompt := "/compact" + string([]byte{10}) + "Please compact this conversation to free context window, keep critical decisions and file paths, drop verbose tool logs."
+				if compactErr := sendWithAttachedUpdates(turnCtx, sess, compactPrompt); compactErr != nil && !isCanceledTurnError(compactErr) {
+					log.Printf("[session] compact.prompt.failed root=%s session=%s agent=%s err=%v", in.RootID, current.Key, in.Agent, compactErr)
+					// Still try resending original prompt after reopen; some agents compact on resume.
+				}
+				retryErr := sendWithAttachedUpdates(turnCtx, sess, prompt)
+				if retryErr == nil {
+					log.Printf("[session] compact.retry.ok root=%s session=%s agent=%s", in.RootID, current.Key, in.Agent)
+					sendErr = nil
+				} else {
+					log.Printf("[session] compact.retry.failed root=%s session=%s agent=%s err=%v", in.RootID, current.Key, in.Agent, retryErr)
+					sendErr = fmt.Errorf("context overflow persists after compact retry: %v", retryErr)
+					cancelRuntimeAfterNonRecoverableError(sess, agentPool, in.RootID, current.Key, in.Agent, sendErr)
+				}
+			}
+		}
+		if sendErr != nil && isNonRecoverableAgentError(sendErr) {
 			log.Printf("[session] turn.send.non_recoverable root=%s session=%s agent=%s action=fail_without_recovery err=%v", in.RootID, current.Key, in.Agent, sendErr)
 			cancelRuntimeAfterNonRecoverableError(sess, agentPool, in.RootID, current.Key, in.Agent, sendErr)
-		} else if !sawAssistantChunk && !isRecoverableTransportError(sendErr) {
+		} else if sendErr != nil && !sawAssistantChunk && !isRecoverableTransportError(sendErr) {
 			log.Printf("[session] turn.send.no_response root=%s session=%s agent=%s action=fail_without_recovery", in.RootID, current.Key, in.Agent)
 		} else {
 			recoveryCtx, cancelRecovery := context.WithCancel(turnCtx)
