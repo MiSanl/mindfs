@@ -2326,17 +2326,17 @@ func (s *Service) resolveSessionProvider(ctx context.Context, manager *session.M
 }
 
 // SessionProviderIsolationAgent reports whether agent uses session-scoped providers.
+// Disabled: all agents use the global agent provider/settings path only.
+// Session-bound RuntimeEnv / per-session provider binding is not applied.
 func SessionProviderIsolationAgent(agentName string) bool {
 	return sessionProviderIsolationAgent(agentName)
 }
 
 func sessionProviderIsolationAgent(agentName string) bool {
-	switch strings.ToLower(strings.TrimSpace(agentName)) {
-	case "claude", "codex":
-		return true
-	default:
-		return false
-	}
+	_ = agentName
+	// Per-session provider isolation removed: never inject session-scoped
+	// provider env/args or bind providers onto mindfs sessions.
+	return false
 }
 
 func cloneProviderRuntimeEnv(env map[string]string) map[string]string {
