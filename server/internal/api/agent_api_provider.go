@@ -737,78 +737,152 @@ func ensureSelectedAPIProviderApplied(agentName string, app *AppContext) error {
 	if ok {
 		return nil
 	}
-	// Do not silently rewrite global agent config here. Provider apply is an
-	// explicit user action (switch provider in Agent Config).
 	log.Printf("[provider/consistency] mismatch agent=%s provider=%s detail=%s action=require_user_reselect", agentName, provider.Name, detail)
-	return fmt.Errorf("session_provider_config_mismatch: selected provider %q is not applied to the agent runtime (%s). Open Agent Config and select this provider again to rewrite agent settings", provider.Name, detail)
+	return fmt.Errorf("session_provider_config_mismatch: selected provider %q is not applied to the agent config files (%s). Open Agent Config and select this provider again to rewrite agent settings", provider.Name, detail)
 }
 
 
-func selectedProviderMatchesEffective(agentName string, provider agentAPIProvider, app *AppContext) (bool, string) {
+func selectedProviderMatchesEffective(agentName string, provider agentAPIProvider, _ *AppContext) (bool, string) {
+	// Compare against the same config files that apply*APIProvider writes.
+	// Do not use in-process pool env as source of truth.
 	wantClaude := anthropicBaseURL(provider.BaseURL)
 	wantOpenAI := openAIModelsBaseURL(provider.BaseURL)
+	wantRaw := strings.TrimSpace(provider.BaseURL)
 	switch normalizedAPIProviderAgent(agentName) {
 	case "claude":
-		// Claude CLI reads ~/.claude/settings.json env; pool env is secondary and
-		// is cleared when the process is killed after provider switch.
 		got, err := readClaudeSettingsBaseURL()
 		if err != nil || strings.TrimSpace(got) == "" {
-			if app != nil && app.GetAgentPool() != nil {
-				env := app.GetAgentPool().GetAgentEnv(agentName)
-				if v := strings.TrimSpace(env["ANTHROPIC_BASE_URL"]); v != "" {
-					got = v
-				}
-			}
-		}
-		if strings.TrimSpace(got) == "" {
 			return false, "missing ANTHROPIC_BASE_URL in ~/.claude/settings.json"
 		}
 		if normalizeURLForCompare(got) != normalizeURLForCompare(wantClaude) {
-			return false, "ANTHROPIC_BASE_URL=" + got
+			return false, "~/.claude/settings.json ANTHROPIC_BASE_URL=" + got
 		}
 		return true, ""
 	case "codex":
-		got, err := readCodexProviderBaseURL(agentAPIProviderConfigName(provider))
-		if err != nil || strings.TrimSpace(got) == "" {
-			if app != nil && app.GetAgentPool() != nil {
-				env := app.GetAgentPool().GetAgentEnv(agentName)
-				if v := strings.TrimSpace(env["OPENAI_BASE_URL"]); v != "" {
-					got = v
-				}
-			}
+		active, err := readCodexActiveModelProvider()
+		if err != nil || strings.TrimSpace(active) == "" {
+			return false, "missing model_provider in ~/.codex/config.toml"
 		}
-		if strings.TrimSpace(got) == "" {
-			return false, "missing codex base_url in config.toml for selected provider"
+		wantName := agentAPIProviderConfigName(provider)
+		if strings.TrimSpace(active) != strings.TrimSpace(wantName) {
+			return false, "~/.codex/config.toml model_provider=" + active
+		}
+		got, err := readCodexProviderBaseURL(wantName)
+		if err != nil || strings.TrimSpace(got) == "" {
+			return false, "missing base_url for selected provider in ~/.codex/config.toml"
 		}
 		if normalizeURLForCompare(got) != normalizeURLForCompare(wantOpenAI) {
-			return false, "codex base_url=" + got
+			return false, "~/.codex/config.toml base_url=" + got
+		}
+		return true, ""
+	case "gemini":
+		path := mustHomePath(".gemini", ".env")
+		got, err := readSimpleEnvValue(path, "GOOGLE_GEMINI_BASE_URL")
+		if (err != nil || strings.TrimSpace(got) == "") && path != "" {
+			got, err = readSimpleEnvValue(path, "GEMINI_API_BASE_URL")
+		}
+		if strings.TrimSpace(got) == "" {
+			return false, "missing GOOGLE_GEMINI_BASE_URL in ~/.gemini/.env"
+		}
+		if normalizeURLForCompare(got) != normalizeURLForCompare(wantRaw) && normalizeURLForCompare(got) != normalizeURLForCompare(wantOpenAI) {
+			return false, "~/.gemini/.env base=" + got
+		}
+		return true, ""
+	case "opencode":
+		got, err := readOpenCodeBaseURL()
+		if err != nil || strings.TrimSpace(got) == "" {
+			return false, "missing baseURL in ~/.config/opencode/opencode.json"
+		}
+		if normalizeURLForCompare(got) != normalizeURLForCompare(wantRaw) &&
+			normalizeURLForCompare(got) != normalizeURLForCompare(wantOpenAI) &&
+			normalizeURLForCompare(got) != normalizeURLForCompare(wantClaude) {
+			return false, "opencode.json baseURL=" + got
 		}
 		return true, ""
 	default:
-		if app == nil || app.GetAgentPool() == nil {
-			return true, ""
-		}
-		env := app.GetAgentPool().GetAgentEnv(agentName)
-		if len(env) == 0 {
-			return true, ""
-		}
-		for _, key := range []string{"OPENAI_BASE_URL", "ANTHROPIC_BASE_URL", "GOOGLE_GEMINI_BASE_URL", "COPILOT_PROVIDER_BASE_URL"} {
-			if got := strings.TrimSpace(env[key]); got != "" {
-				want := wantOpenAI
-				if key == "ANTHROPIC_BASE_URL" {
-					want = wantClaude
-				} else if key == "GOOGLE_GEMINI_BASE_URL" || key == "COPILOT_PROVIDER_BASE_URL" {
-					want = strings.TrimSpace(provider.BaseURL)
-				}
-				if normalizeURLForCompare(got) != normalizeURLForCompare(want) {
-					return false, key + "=" + got
-				}
-				return true, ""
-			}
-		}
+		// Unknown apply targets: do not consult process env.
 		return true, ""
 	}
 }
+
+func mustHomePath(parts ...string) string {
+	p, err := homePath(parts...)
+	if err != nil {
+		return ""
+	}
+	return p
+}
+
+func readSimpleEnvValue(path, key string) (string, error) {
+	if strings.TrimSpace(path) == "" || strings.TrimSpace(key) == "" {
+		return "", fmt.Errorf("path/key required")
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	env := parseSimpleEnv(string(b))
+	return strings.TrimSpace(env[key]), nil
+}
+
+func readOpenCodeBaseURL() (string, error) {
+	path, err := homePath(".config", "opencode", "opencode.json")
+	if err != nil {
+		return "", err
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(b, &obj); err != nil {
+		return "", err
+	}
+	for _, key := range []string{"baseURL", "baseUrl"} {
+		if v, ok := obj[key].(string); ok && strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v), nil
+		}
+	}
+	if prov, ok := obj["provider"].(map[string]any); ok {
+		for _, key := range []string{"baseURL", "baseUrl"} {
+			if v, ok := prov[key].(string); ok && strings.TrimSpace(v) != "" {
+				return strings.TrimSpace(v), nil
+			}
+		}
+	}
+	return "", fmt.Errorf("baseURL missing")
+}
+
+func readCodexActiveModelProvider() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	configPath := filepath.Join(home, ".codex", "config.toml")
+	b, err := os.ReadFile(configPath)
+	if err != nil {
+		return "", err
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "model_provider") {
+			continue
+		}
+		parts := strings.SplitN(trimmed, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		val := strings.TrimSpace(parts[1])
+		if unquoted, err := strconv.Unquote(val); err == nil {
+			return strings.TrimSpace(unquoted), nil
+		}
+		val = strings.Trim(val, "\"")
+		val = strings.Trim(val, "'")
+		return strings.TrimSpace(val), nil
+	}
+	return "", fmt.Errorf("model_provider missing")
+}
+
 
 func normalizeURLForCompare(raw string) string {
 	raw = strings.TrimSpace(strings.ToLower(raw))
