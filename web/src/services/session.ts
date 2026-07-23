@@ -1185,30 +1185,6 @@ class SessionService {
     }
   }
 
-
-  
-  async migrateSessionProvider(
-    rootId: string,
-    sessionKey: string,
-    input: { agent?: string; provider_id: string; model?: string },
-  ): Promise<Session | null> {
-    try {
-      const params = new URLSearchParams({ root: rootId });
-      const data = await protectedJSON<Session>(
-        appURL(`/api/sessions/${encodeURIComponent(sessionKey)}/migrate-provider`, params),
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(input),
-        },
-      );
-      return data as Session;
-    } catch (err) {
-      console.error("[Session] Failed to migrate session provider:", err);
-      throw err;
-    }
-  }
-
   async getSessionErrors(
     rootId: string,
     sessionKey: string,

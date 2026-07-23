@@ -34,7 +34,7 @@ func init() {
 	// Allow send/resume to accept models from the active API provider catalog
 	// even when the agent probe ListModels catalog is still native/stale.
 	usecase.AgentAPIProviderModelAllowed = agentModelAllowedByActiveProvider
-	usecase.SessionProviderResolver = resolveSessionProviderConfig
+	// SessionProviderResolver intentionally unset: session isolation is off.
 	usecase.ProviderSelectionValidator = validateProviderSelection
 }
 

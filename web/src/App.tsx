@@ -9814,64 +9814,10 @@ export function App({ onGoHome }: AppProps) {
             const errCode = sessionErrorCode(errorMessage);
             const errRootId = payloadRootId || pending?.rootId || currentRootIdRef.current;
             const errSessionKey = payloadSessionKey || pending?.sessionKey || null;
-            const providerRecovery =
-              errCode === "session.provider_unavailable" ||
-              errCode === "session.provider_mismatch" ||
-              errCode === "session.provider_changed";
+            // Session-provider isolation is disabled on this delivery line; do not
+            // offer a migrate-provider recovery action (API is removed / always fails).
             reportError(errCode, errorMessage, {
-              recoverable: recoverable || providerRecovery,
-              retryAction: providerRecovery
-                ? async () => {
-                    const root = String(errRootId || "").trim();
-                    const key = String(errSessionKey || "").trim();
-                    if (!root || !key) {
-                      throw new Error(errorMessage);
-                    }
-                    const agentName = String(
-                      (pending as any)?.agent ||
-                        selectedSessionRef.current?.agent ||
-                        "",
-                    ).trim();
-                    const agentInfo = (availableAgentsRef.current || []).find(
-                      (item) => item.name === agentName,
-                    );
-                    const providerId =
-                      agentInfo?.last_config_selection?.type === "api_provider"
-                        ? String(agentInfo.last_config_selection.id || "").trim()
-                        : "";
-                    if (!providerId) {
-                      throw new Error(
-                        "Select a valid API provider in Agent Config, then retry to migrate this session.",
-                      );
-                    }
-                    const migrated = await sessionService.migrateSessionProvider(
-                      root,
-                      key,
-                      {
-                        agent: agentName || undefined,
-                        provider_id: providerId,
-                        model:
-                          String(
-                            (pending as any)?.model ||
-                              selectedSessionRef.current?.model ||
-                              "",
-                          ).trim() || undefined,
-                      },
-                    );
-                    if (!migrated) {
-                      throw new Error("session provider migration failed");
-                    }
-                    const select = handleSelectSessionRef.current;
-                    if (select) {
-                      await select({
-                        ...migrated,
-                        root_id: root,
-                        key: migrated.key || (migrated as any).session_key,
-                        session_key: migrated.key || (migrated as any).session_key,
-                      });
-                    }
-                  }
-                : undefined,
+              recoverable,
               details: {
                 rootId: errRootId,
                 sessionKey: errSessionKey,
