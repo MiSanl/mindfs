@@ -329,6 +329,25 @@ func (m *Manager) UpdatePendingTurn(_ context.Context, sessionKey, agentContent 
 	return m.writePendingTurnUnsafe(sessionKey, *pending)
 }
 
+// UpdatePendingContextWindow stamps the agent exchange with usage for this turn.
+// Called before CompletePendingTurn so refresh can show ContextWindowBadge without
+// a live agent process (session-level context_window is live-only).
+func (m *Manager) UpdatePendingContextWindow(_ context.Context, sessionKey string, cw agenttypes.ContextWindow) error {
+	if cw.TotalTokens <= 0 && cw.ModelContextWindow <= 0 {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	pending, err := m.readPendingTurnUnsafe(sessionKey)
+	if err != nil || pending == nil {
+		return err
+	}
+	copy := cw
+	pending.Agent.ContextWindow = &copy
+	pending.Agent.Timestamp = m.now().UTC()
+	return m.writePendingTurnUnsafe(sessionKey, *pending)
+}
+
 func (m *Manager) CompletePendingTurn(_ context.Context, sessionKey string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

@@ -303,14 +303,9 @@ function formatAssistantExchangeMeta(
   return parts.join(" · ");
 }
 
-/**
- * TODO(opencode-context-ui): Verify and complete OpenCode context display.
- * - ContextWindowBadge already renders when exchange.context_window is present.
- * - Trace ACP/OpenCode usage events into exchange.context_window (totalTokens +
- *   modelContextWindow) through pending→complete and reload.
- * - Ensure opencode sessions show the badge near assistant meta / ActionBar.
- * See memory: opencode-context-ui-todo.
- */
+// ContextWindowBadge renders per-assistant usage from exchange.context_window
+// (durable) or live session.context_window. OpenCode/ACP UsageUpdate and
+// prompt usage are stamped onto the agent exchange before CompletePendingTurn.
 function ContextWindowBadge({
   contextWindow,
 }: {

@@ -1572,9 +1572,8 @@ const autoCompactPrompt = "/compact\nPlease compact this conversation to free co
 // Mid-turn overflow (after some assistant chunks) is allowed: partial output is
 // already in pending aux/responseText, and retry continues the turn after compact.
 // Callers may still pass sawAssistantChunk for logging/metrics; it no longer blocks.
-// TODO(opencode-context-ui): Ensure OpenCode/ACP usage/context window fields are
-// populated on agent updates so the frontend ContextWindowBadge can show live
-// context pressure for opencode sessions (not only overflow recovery).
+// OpenCode/ACP usage is captured on message_done and stamped onto the agent
+// exchange (context_window) so ContextWindowBadge survives refresh.
 func shouldAttemptContextOverflowCompact(sendErr error, agentName string, _sawAssistantChunk bool) bool {
 	return sendErr != nil &&
 		!isCanceledTurnError(sendErr) &&
@@ -2471,11 +2470,27 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 	sawAssistantChunk := false
 	plannedAssistantSeq := len(current.Exchanges) + 2
 	auxBuffer := make([]session.ExchangeAux, 0, 8)
+	// Captured from message_done / agent ContextWindow for durable exchange badge.
+	var lastContextWindow agenttypes.ContextWindow
 	defer manager.ClearPendingExchangeAux(context.Background(), current.Key)
 	defer manager.ReleasePendingTurn(context.Background(), current.Key)
 	updatePending := func() {
 		if err := manager.UpdatePendingTurn(context.Background(), current.Key, responseText, auxBuffer); err != nil {
 			log.Printf("[session] pending.update.error root=%s session=%s err=%v", in.RootID, current.Key, err)
+		}
+	}
+	stampPendingContextWindow := func(runtime agenttypes.Session) {
+		cw := lastContextWindow
+		if (cw.TotalTokens <= 0 && cw.ModelContextWindow <= 0) && runtime != nil {
+			if live, err := runtime.ContextWindow(context.Background()); err == nil {
+				cw = live
+			}
+		}
+		if cw.TotalTokens <= 0 && cw.ModelContextWindow <= 0 {
+			return
+		}
+		if err := manager.UpdatePendingContextWindow(context.Background(), current.Key, cw); err != nil {
+			log.Printf("[session] pending.context_window.error root=%s session=%s err=%v", in.RootID, current.Key, err)
 		}
 	}
 	var thoughtBuffer strings.Builder
@@ -2614,6 +2629,12 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 					responseText = appendResponseChunk(responseText, lastResponseUpdateType, chunk.Content)
 					lastResponseUpdateType = string(update.Type)
 					updatePending()
+				}
+			} else if update.Type == agenttypes.EventTypeMessageDone {
+				if done, ok := update.Data.(agenttypes.MessageDone); ok {
+					if done.ContextWindow.TotalTokens > 0 || done.ContextWindow.ModelContextWindow > 0 {
+						lastContextWindow = done.ContextWindow
+					}
 				}
 			} else if update.Type == agenttypes.EventTypeThoughtChunk ||
 				update.Type == agenttypes.EventTypeToolCall ||
@@ -2766,6 +2787,7 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 				auxBuffer[i] = hydratePendingToolCallAux(ctx, manager, current.Key, auxBuffer[i])
 			}
 			updatePending()
+			stampPendingContextWindow(sess)
 			if err := manager.CompletePendingTurn(ctx, current.Key); err != nil {
 				log.Printf("[session] pending.complete_on_error.error root=%s session=%s err=%v", in.RootID, current.Key, err)
 			}
@@ -2790,6 +2812,8 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 		auxBuffer[i] = hydratePendingToolCallAux(ctx, manager, current.Key, auxBuffer[i])
 	}
 	updatePending()
+	// Durable OpenCode/Claude/Codex usage for ContextWindowBadge after refresh.
+	stampPendingContextWindow(sess)
 	if err := manager.CompletePendingTurn(ctx, current.Key); err != nil {
 		return err
 	}

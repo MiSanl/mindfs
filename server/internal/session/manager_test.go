@@ -192,6 +192,45 @@ func TestManagerRecoversPendingTurnAfterRestart(t *testing.T) {
 	}
 }
 
+func TestManagerPersistsPendingContextWindow(t *testing.T) {
+	root := rootfs.NewRootInfo("pending-context", "pending-context", t.TempDir())
+	manager := newTestManager(t, root)
+	created, err := manager.Create(context.Background(), CreateInput{Type: TypeChat, Name: "Pending context", Agent: "opencode"})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	now := time.Now().UTC()
+	if err := manager.StartPendingTurn(context.Background(), created,
+		Exchange{Seq: 1, Role: "user", Agent: "opencode", Content: "hello", Timestamp: now},
+		Exchange{Seq: 2, Role: "agent", Agent: "opencode", Timestamp: now},
+	); err != nil {
+		t.Fatalf("start pending turn: %v", err)
+	}
+	if err := manager.UpdatePendingTurn(context.Background(), created.Key, "assistant reply", nil); err != nil {
+		t.Fatalf("update pending: %v", err)
+	}
+	if err := manager.UpdatePendingContextWindow(context.Background(), created.Key, agenttypes.ContextWindow{
+		TotalTokens:        12345,
+		ModelContextWindow: 200000,
+	}); err != nil {
+		t.Fatalf("stamp context window: %v", err)
+	}
+	if err := manager.CompletePendingTurn(context.Background(), created.Key); err != nil {
+		t.Fatalf("complete pending: %v", err)
+	}
+	got, err := manager.Get(context.Background(), created.Key, 0)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if len(got.Exchanges) != 2 {
+		t.Fatalf("exchanges=%d want 2", len(got.Exchanges))
+	}
+	cw := got.Exchanges[1].ContextWindow
+	if cw == nil || cw.TotalTokens != 12345 || cw.ModelContextWindow != 200000 {
+		t.Fatalf("agent context_window=%#v", cw)
+	}
+}
+
 func TestManagerCompletesPendingTurnOnlyOnce(t *testing.T) {
 	root := rootfs.NewRootInfo("pending-complete", "pending-complete", t.TempDir())
 	manager := newTestManager(t, root)

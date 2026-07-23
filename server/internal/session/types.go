@@ -46,6 +46,10 @@ type Exchange struct {
 	Mode             string    `json:"mode,omitempty"`
 	Effort           string    `json:"effort,omitempty"`
 	FastService      string    `json:"fast_service,omitempty"`
+	// ContextWindow is the agent-reported usage for this turn when known
+	// (OpenCode/ACP UsageUpdate, Claude result, Codex token usage). Durable so
+	// ContextWindowBadge survives refresh without a live agent process.
+	ContextWindow    *agenttypes.ContextWindow `json:"context_window,omitempty"`
 	Content          string    `json:"content"`
 	Timestamp        time.Time `json:"timestamp"`
 }
