@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -147,12 +148,22 @@ func (p *Pool) GetOrCreate(ctx context.Context, in agenttypes.OpenSessionInput) 
 }
 
 func (p *Pool) openSession(ctx context.Context, protocol Protocol, def Definition, in agenttypes.OpenSessionInput) (agenttypes.Session, error) {
-	env := cloneEnv(def.Env)
+	// Agent env is an overlay on the process environment. Codex SDK replaces the
+	// whole child env when Env is non-empty; a bare CODEX_HOME overlay would drop
+	// PATH and make "codex" unresolvable inside app-server scripts.
+	env := mergeProcessEnv(def.Env)
 	if in.RuntimeEnv != nil {
-		env = cloneEnv(in.RuntimeEnv)
+		env = mergeProcessEnv(in.RuntimeEnv)
+		// Keep any non-runtime agent env keys (e.g. CODEX_HOME from apply) too.
+		for k, v := range def.Env {
+			if _, ok := in.RuntimeEnv[k]; !ok && strings.TrimSpace(v) != "" {
+				env[k] = v
+			}
+		}
 	}
 	args := append([]string{}, def.Args...)
 	args = append(args, in.RuntimeArgs...)
+	command := resolveAgentCommand(def.Command)
 	switch protocol {
 	case ProtocolClaudeSDK:
 		return p.claude.OpenSession(ctx, claude.OpenOptions{
@@ -162,7 +173,7 @@ func (p *Pool) openSession(ctx context.Context, protocol Protocol, def Definitio
 			Effort:          in.Effort,
 			PlanMode:        in.PlanMode,
 			RootPath:        in.RootPath,
-			Command:         def.Command,
+			Command:         command,
 			Args:            args,
 			Env:             env,
 			ResumeSessionID: in.AgentSessionID,
@@ -187,7 +198,7 @@ func (p *Pool) openSession(ctx context.Context, protocol Protocol, def Definitio
 			PlanMode:         in.PlanMode,
 			Probe:            in.Probe,
 			RootPath:         in.RootPath,
-			Command:          def.Command,
+			Command:          command,
 			Args:             args,
 			Env:              env,
 			RuntimeKey:       in.RuntimeKey,
@@ -205,7 +216,7 @@ func (p *Pool) openSession(ctx context.Context, protocol Protocol, def Definitio
 			Mode:            in.Mode,
 			Effort:          in.Effort,
 			RootPath:        in.RootPath,
-			Command:         def.Command,
+			Command:         command,
 			Args:            append(def.BuildArgs(in.RootPath), in.RuntimeArgs...),
 			Env:             env,
 			Cwd:             def.ResolveCwd(in.RootPath),
@@ -268,14 +279,48 @@ func cloneEnv(env map[string]string) map[string]string {
 	return out
 }
 
+// mergeProcessEnv returns process environment plus overlay keys.
+// Never return a sparse map for SDKs that replace the whole child env.
+func mergeProcessEnv(overlay map[string]string) map[string]string {
+	out := map[string]string{}
+	for _, entry := range os.Environ() {
+		key, value, ok := strings.Cut(entry, "=")
+		if !ok || key == "" {
+			continue
+		}
+		out[key] = value
+	}
+	for key, value := range overlay {
+		if strings.TrimSpace(key) == "" {
+			continue
+		}
+		out[key] = value
+	}
+	return out
+}
+
+// resolveAgentCommand prefers an absolute executable path when LookPath works.
+func resolveAgentCommand(command string) string {
+	command = strings.TrimSpace(command)
+	if command == "" {
+		return command
+	}
+	if filepath.IsAbs(command) {
+		return command
+	}
+	if path, err := exec.LookPath(command); err == nil && strings.TrimSpace(path) != "" {
+		return path
+	}
+	return command
+}
+
 // ensureCodexHomeEnv pins CODEX_HOME so the app-server uses the same config
-// directory MindFS wrote/checked. Prefer an already-set CODEX_HOME (process or
-// agent env); otherwise default to $HOME/.codex / %USERPROFILE%\.codex via
-// os.UserHomeDir semantics in the child after CODEX_HOME is set explicitly.
+// directory MindFS apply/check use. env is expected to already include the
+// full process environment (see mergeProcessEnv).
 func ensureCodexHomeEnv(env map[string]string) map[string]string {
-	out := cloneEnv(env)
+	out := env
 	if out == nil {
-		out = map[string]string{}
+		out = mergeProcessEnv(nil)
 	}
 	if v := strings.TrimSpace(out["CODEX_HOME"]); v != "" {
 		return out

@@ -462,3 +462,31 @@ func TestLoadConfigWithExtraMergesSingleExtraConfigAfterDefaultConfig(t *testing
 		t.Fatalf("token station url = %q", cfg.TokenStationURL)
 	}
 }
+
+func TestMergeProcessEnvKeepsPath(t *testing.T) {
+	t.Setenv("PATH", `C:\Windows\system32;E:\OtherPrograms\nodejs\node_global`)
+	got := mergeProcessEnv(map[string]string{"CODEX_HOME": `E:\tmp\.codex`})
+	if got["CODEX_HOME"] != `E:\tmp\.codex` {
+		t.Fatalf("CODEX_HOME=%q", got["CODEX_HOME"])
+	}
+	if got["PATH"] == "" && got["Path"] == "" {
+		t.Fatal("expected PATH retained from process env")
+	}
+	// Sparse overlay alone must not be returned by openSession path helpers.
+	if len(got) < 2 {
+		t.Fatalf("env too sparse: %#v", got)
+	}
+}
+
+func TestEnsureCodexHomeEnvDoesNotDropPath(t *testing.T) {
+	base := mergeProcessEnv(nil)
+	base["Path"] = `C:\Windows\system32;E:\fake\node_global`
+	delete(base, "CODEX_HOME")
+	out := ensureCodexHomeEnv(base)
+	if strings.TrimSpace(out["CODEX_HOME"]) == "" {
+		t.Fatal("expected CODEX_HOME set")
+	}
+	if out["Path"] == "" && out["PATH"] == "" {
+		t.Fatal("PATH dropped")
+	}
+}
