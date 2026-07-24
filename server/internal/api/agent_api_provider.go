@@ -1402,6 +1402,10 @@ func applyOpenCodeAPIProvider(provider agentAPIProvider) error {
 		baseURL = anthropicBaseURL(provider.BaseURL)
 	}
 	providerName := agentAPIProviderConfigName(provider)
+	// Prefer slug-like IDs for OpenCode runtime. Display names with spaces
+	// (e.g. "Composer 2.5 Fast") often 404 at OpenAI-compatible providers even
+	// when a slug like "grok-composer-2.5-fast" exists in the same catalog.
+	models := openCodeRuntimeModels(provider.Models)
 	providers := ensureJSONObject(cfg, "provider")
 	providers[providerName] = map[string]any{
 		"npm":  npm,
@@ -1410,9 +1414,9 @@ func applyOpenCodeAPIProvider(provider agentAPIProvider) error {
 			"baseURL": baseURL,
 			"apiKey":  provider.APIKey,
 		},
-		"models": modelObject(provider.Models),
+		"models": modelObject(models),
 	}
-	if model := firstModelOrDefault(provider.Models, ""); model != "" {
+	if model := firstModelOrDefault(models, ""); model != "" {
 		cfg["model"] = providerName + "/" + model
 	}
 	return writeJSONObject(path, cfg, 0o600)
@@ -2497,6 +2501,34 @@ func firstModelOrDefault(models []string, fallback string) string {
 		}
 	}
 	return fallback
+}
+
+// openCodeRuntimeModels filters provider catalog entries to IDs that are safe
+// to send to OpenCode / OpenAI-compatible gateways. Prefer non-space slug IDs;
+// only keep spaced display names when no slug alternative exists.
+func openCodeRuntimeModels(models []string) []string {
+	slugs := make([]string, 0, len(models))
+	spaced := make([]string, 0)
+	seen := map[string]struct{}{}
+	for _, model := range models {
+		model = strings.TrimSpace(model)
+		if model == "" {
+			continue
+		}
+		if _, ok := seen[model]; ok {
+			continue
+		}
+		seen[model] = struct{}{}
+		if strings.Contains(model, " ") {
+			spaced = append(spaced, model)
+			continue
+		}
+		slugs = append(slugs, model)
+	}
+	if len(slugs) > 0 {
+		return slugs
+	}
+	return spaced
 }
 
 func homePath(parts ...string) (string, error) {

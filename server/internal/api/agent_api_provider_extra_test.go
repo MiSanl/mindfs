@@ -341,3 +341,34 @@ func TestOpenCodeConsistencyUsesNamedProviderBaseURL(t *testing.T) {
 		t.Fatalf("detail should mention provider name, got %q", detail)
 	}
 }
+
+
+func TestOpenCodeRuntimeModelsPrefersSlugs(t *testing.T) {
+	got := openCodeRuntimeModels([]string{
+		"Composer 2.5 Fast",
+		"Grok 4.5",
+		"grok-composer-2.5-fast",
+		"grok-4.5",
+		"  ",
+	})
+	want := []string{"grok-composer-2.5-fast", "grok-4.5"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %#v want %#v", got, want)
+	}
+	// Only spaced names remain if no slug exists.
+	got = openCodeRuntimeModels([]string{"Composer 2.5 Fast", "Grok 4.5"})
+	if !reflect.DeepEqual(got, []string{"Composer 2.5 Fast", "Grok 4.5"}) {
+		t.Fatalf("spaced-only got %#v", got)
+	}
+}
+
+func TestNormalizeAgentErrorMessageProviderAPI(t *testing.T) {
+	got := normalizeAgentErrorMessage(errors.New(`{"code":-32603,"message":"Internal error: status 404","data":{"errorName":"APIError"}}`))
+	if !strings.Contains(got, "404") || !strings.Contains(strings.ToLower(got), "model") {
+		t.Fatalf("404 normalize=%q", got)
+	}
+	got = normalizeAgentErrorMessage(errors.New(`{"message":"Internal error: \"Upstream request failed\""}`))
+	if !strings.Contains(strings.ToLower(got), "upstream") {
+		t.Fatalf("upstream normalize=%q", got)
+	}
+}

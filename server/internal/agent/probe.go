@@ -381,7 +381,9 @@ func (p *Prober) ClearProbeSession(agentName string) error {
 	return clearProbeSessionBinding(p.probeSessions, agentName)
 }
 
-// ReportRuntimeFailure marks an agent as unavailable due to a real user-facing runtime failure.
+// ReportRuntimeFailure records a user-facing turn failure.
+// Provider API failures (404 / upstream request failed) keep Available=true so the
+// UI does not treat a bad model/endpoint as an agent process crash.
 func (p *Prober) ReportRuntimeFailure(name string, err error) {
 	msg := "unknown failure"
 	if err != nil {
@@ -398,9 +400,23 @@ func (p *Prober) ReportRuntimeFailure(name string, err error) {
 	}
 	status.Name = name
 	status.Installed = installed
-	status.Available = false
 	status.LastProbe = time.Now().UTC()
 	status.RuntimeError = msg
+	// Only mark unavailable for process/spawn style failures.
+	lower := strings.ToLower(msg)
+	providerAPI := strings.Contains(lower, "status 404") ||
+		strings.Contains(lower, "upstream request failed") ||
+		strings.Contains(lower, "apierror") ||
+		strings.Contains(lower, "model/provider returned 404") ||
+		strings.Contains(lower, "upstream provider request failed")
+	if providerAPI {
+		// Keep previous Available bit (usually true after successful probe).
+		if !ok {
+			status.Available = true
+		}
+	} else {
+		status.Available = false
+	}
 	p.setStatus(status)
 }
 

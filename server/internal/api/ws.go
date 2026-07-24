@@ -1286,11 +1286,26 @@ func normalizeAgentErrorMessage(err error) string {
 	if raw == "" {
 		return "Unknown error"
 	}
-	var payload struct {
-		Message string `json:"message"`
-	}
-	if strings.HasPrefix(raw, "{") && json.Unmarshal([]byte(raw), &payload) == nil && strings.TrimSpace(payload.Message) != "" {
-		return strings.TrimSpace(payload.Message)
+	if strings.HasPrefix(raw, "{") {
+		var payload map[string]any
+		if json.Unmarshal([]byte(raw), &payload) == nil {
+			msg := ""
+			if v, ok := payload["message"].(string); ok {
+				msg = strings.TrimSpace(v)
+			}
+			// ACP wraps provider failures as Internal error: status 404 / Upstream request failed.
+			// Surface a clearer, stable string for UI (not a full agent crash).
+			if msg != "" {
+				lower := strings.ToLower(msg)
+				if strings.Contains(lower, "status 404") || strings.Contains(lower, "not found") {
+					return "model/provider returned 404 (model id or endpoint not found). Re-select a slug model id (no spaces) in Agent Config"
+				}
+				if strings.Contains(lower, "upstream request failed") {
+					return "upstream provider request failed (check provider baseURL/apiKey/model). Agent runtime is still installed"
+				}
+				return msg
+			}
+		}
 	}
 	return raw
 }
