@@ -372,3 +372,40 @@ func TestNormalizeAgentErrorMessageProviderAPI(t *testing.T) {
 		t.Fatalf("upstream normalize=%q", got)
 	}
 }
+
+
+func TestOverlayOpenCodeFiltersSpacedModels(t *testing.T) {
+	status := agent.Status{
+		Name:           "opencode",
+		CurrentModelID: "my-cpa-grok/Composer 2.5 Fast",
+		DefaultModelID: "my-cpa-grok/Composer 2.5 Fast",
+		Models:         []agenttypes.ModelInfo{{ID: "stale", Name: "stale"}},
+	}
+	provider := agentAPIProvider{
+		ID:   "api-cpa",
+		Name: "my-cpa-grok",
+		Models: []string{
+			"Composer 2.5 Fast",
+			"grok-composer-2.5-fast",
+			"grok-4.5",
+		},
+	}
+	out := overlaySelectedProviderModels(status, provider)
+	ids := make([]string, 0, len(out.Models))
+	for _, m := range out.Models {
+		ids = append(ids, m.ID)
+	}
+	want := []string{"my-cpa-grok/grok-composer-2.5-fast", "my-cpa-grok/grok-4.5"}
+	if !reflect.DeepEqual(ids, want) {
+		t.Fatalf("picker models = %#v want %#v", ids, want)
+	}
+	// Spaced current model remapped onto first slug.
+	if out.CurrentModelID != "my-cpa-grok/grok-composer-2.5-fast" {
+		t.Fatalf("current=%q", out.CurrentModelID)
+	}
+	for _, id := range ids {
+		if strings.Contains(id, " ") {
+			t.Fatalf("spaced id leaked into picker: %q", id)
+		}
+	}
+}

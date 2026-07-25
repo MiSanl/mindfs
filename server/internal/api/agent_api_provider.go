@@ -2058,9 +2058,15 @@ func overlaySelectedProviderModels(status agent.Status, provider agentAPIProvide
 	}
 	agentName := normalizedAPIProviderAgent(status.Name)
 	providerName := strings.TrimSpace(agentAPIProviderConfigName(provider))
-	models := make([]agenttypes.ModelInfo, 0, len(provider.Models))
+	// Keep picker aligned with OpenCode apply: prefer slug IDs; drop spaced display
+	// names when any slug alternative exists (avoids my-cpa-grok/Composer 2.5 Fast 404).
+	rawModels := provider.Models
+	if agentName == "opencode" {
+		rawModels = openCodeRuntimeModels(provider.Models)
+	}
+	models := make([]agenttypes.ModelInfo, 0, len(rawModels))
 	seen := map[string]struct{}{}
-	for _, raw := range provider.Models {
+	for _, raw := range rawModels {
 		model := strings.TrimSpace(raw)
 		if model == "" {
 			continue
