@@ -18,7 +18,6 @@ const defaultRelayBaseURL = "http://localhost:7331"
 type Status struct {
 	Bound             bool   `json:"relay_bound"`
 	NoRelayer         bool   `json:"no_relayer"`
-	TokenStationBound bool   `json:"token_station_bound"`
 	PendingCode       string `json:"pending_code"`
 	NodeName          string `json:"node_name"`
 	NodeID            string `json:"node_id"`
@@ -29,14 +28,6 @@ type Status struct {
 	E2EERequired      bool   `json:"e2ee_required"`
 }
 
-type TokenStationStatus struct {
-	Bound        bool           `json:"bound"`
-	PendingCode  string         `json:"pending_code,omitempty"`
-	RelayBaseURL string         `json:"relay_base_url"`
-	TopUpURL     string         `json:"topup_url"`
-	UserInfo     map[string]any `json:"userinfo,omitempty"`
-	LastError    string         `json:"last_error,omitempty"`
-}
 
 type Manager struct {
 	service   *Service
@@ -53,9 +44,6 @@ type Manager struct {
 	nodeName     string
 	lastError    string
 
-	tokenStationPendingCode string
-	tokenStationPolling     bool
-	tokenStationLastError   string
 }
 
 func NewManager(localAddr string, noRelayer bool, relayBaseURL string, useTLS bool) (*Manager, error) {
@@ -147,56 +135,9 @@ func (m *Manager) StartBinding() (Status, error) {
 	return m.statusLocked(), nil
 }
 
-func (m *Manager) TokenStationStatus(ctx context.Context) (TokenStationStatus, error) {
-	m.mu.Lock()
-	status := m.tokenStationStatusLocked()
-	m.mu.Unlock()
-	if !status.Bound {
-		return status, nil
-	}
-	userInfo, err := m.TokenStationUserInfo(ctx, "")
-	if err != nil {
-		status.LastError = err.Error()
-		return status, err
-	}
-	status.UserInfo = userInfo
-	return status, nil
-}
-
-func (m *Manager) StartTokenStationBinding() (TokenStationStatus, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if m.ctx == nil {
-		return m.tokenStationStatusLocked(), errors.New("relay manager not started")
-	}
-	if creds, err := m.service.store.Load(); err == nil {
-		if creds.Relay.DeviceToken != "" || creds.TokenStation.Token != "" {
-			return m.tokenStationStatusLocked(), nil
-		}
-	} else {
-		m.tokenStationLastError = err.Error()
-		return m.tokenStationStatusLocked(), err
-	}
-	if strings.TrimSpace(m.tokenStationPendingCode) == "" {
-		m.tokenStationPendingCode = generatePendingCode()
-	}
-	m.startTokenStationPollingLocked(m.ctx, m.tokenStationPendingCode)
-	return m.tokenStationStatusLocked(), nil
-}
-
-func (m *Manager) TokenStationUserInfo(ctx context.Context, purpose string) (map[string]any, error) {
-	creds, err := m.service.store.Load()
-	if err != nil {
-		return nil, err
-	}
-	return m.service.FetchTokenStationUserInfo(ctx, m.resolveRelayBase(), creds, purpose)
-}
-
 func (m *Manager) statusLocked() Status {
 	status := Status{
 		NoRelayer:         m.noRelayer,
-		TokenStationBound: m.tokenStationBoundLocked(),
 		PendingCode:       m.pendingCode,
 		NodeName:          m.nodeName,
 		RelayBaseURL:      m.resolveRelayBaseLocked(),
@@ -224,24 +165,7 @@ func (m *Manager) statusLocked() Status {
 	return status
 }
 
-func (m *Manager) tokenStationBoundLocked() bool {
-	creds, err := m.service.store.Load()
-	return err == nil && (creds.Relay.DeviceToken != "" || creds.TokenStation.Token != "")
-}
 
-func (m *Manager) tokenStationStatusLocked() TokenStationStatus {
-	status := TokenStationStatus{
-		PendingCode:  m.tokenStationPendingCode,
-		RelayBaseURL: m.resolveRelayBaseLocked(),
-		TopUpURL:     m.resolveRelayBaseLocked(),
-		LastError:    m.tokenStationLastError,
-	}
-	status.Bound = m.tokenStationBoundLocked()
-	if status.Bound {
-		status.PendingCode = ""
-	}
-	return status
-}
 
 func (m *Manager) startLocked(parent context.Context) {
 	runCtx, cancel := context.WithCancel(parent)
@@ -266,38 +190,7 @@ func (m *Manager) startPollingLocked(parent context.Context, pendingCode string)
 	go m.pollLoop(parent, pendingCode)
 }
 
-func (m *Manager) startTokenStationPollingLocked(parent context.Context, pendingCode string) {
-	if strings.TrimSpace(pendingCode) == "" || m.tokenStationPolling {
-		return
-	}
-	m.tokenStationPolling = true
-	go m.tokenStationPollLoop(parent, pendingCode)
-}
 
-func (m *Manager) tokenStationPollLoop(parent context.Context, pendingCode string) {
-	defer func() {
-		m.mu.Lock()
-		m.tokenStationPolling = false
-		m.mu.Unlock()
-	}()
-
-	m.runBindPollLoop(parent, pendingCode, "token_station",
-		func(result BindPollResult) error {
-			return m.service.store.SaveTokenStation(result.TokenStationToken)
-		},
-		func(status string) {
-			m.mu.Lock()
-			m.tokenStationPendingCode = ""
-			m.tokenStationLastError = status
-			m.mu.Unlock()
-		},
-		func(message string) {
-			m.mu.Lock()
-			m.tokenStationLastError = message
-			m.mu.Unlock()
-		},
-	)
-}
 
 func (m *Manager) pollLoop(parent context.Context, pendingCode string) {
 	defer m.finishPolling(pendingCode)

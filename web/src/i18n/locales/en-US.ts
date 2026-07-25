@@ -607,13 +607,6 @@ export const enUS = {
   "worktree.confirmRemove": "Remove worktree \"{name}\"?\nThis will delete the worktree directory and remove it from the MindFS project list.",
   "worktree.removeFailed": "Failed to remove worktree",
 
-  "tokenStation.title": "Token Station",
-  "tokenStation.reading": "Reading",
-  "tokenStation.unbound": "No account bound",
-  "tokenStation.apply": "Apply config",
-  "tokenStation.processing": "Processing",
-  "tokenStation.topUp": "Top up",
-
   "plugin.loading": "Loading...",
   "plugin.rawFile": "Raw file",
   "plugin.rawViewActive": "Switched to raw file view (plugin: {name})",
@@ -630,9 +623,6 @@ export const enUS = {
   "externalImport.emptyHintAction": "If this project already has sessions, use the import button above. Imported sessions can continue.",
 
   "relay.publicAccess": "Public access",
-  "tokenStation.loadFailed": "Failed to read Token Station config",
-  "tokenStation.noAPIKey": "Token Station has no API Key to sync",
-  "tokenStation.applyFailed": "Failed to apply Token Station config",
 
   "action.ws.connected": "WebSocket connected",
   "action.ws.connecting": "WebSocket connecting",

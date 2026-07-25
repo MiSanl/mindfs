@@ -12,8 +12,7 @@ import (
 )
 
 type Credentials struct {
-	Relay        RelayCredentials        `json:"relay"`
-	TokenStation TokenStationCredentials `json:"token_station,omitempty"`
+	Relay RelayCredentials `json:"relay"`
 }
 
 type RelayCredentials struct {
@@ -23,9 +22,6 @@ type RelayCredentials struct {
 	Endpoint    string `json:"endpoint"`
 }
 
-type TokenStationCredentials struct {
-	Token string `json:"token"`
-}
 
 type CredentialsStore struct {
 	mu       sync.RWMutex
@@ -79,29 +75,6 @@ func (s *CredentialsStore) Save(creds Credentials) error {
 	return os.Chmod(s.filePath, 0o600)
 }
 
-func (s *CredentialsStore) SaveTokenStation(token string) error {
-	token = strings.TrimSpace(token)
-	if token == "" {
-		return errors.New("token station credentials require token")
-	}
-	creds, err := s.Load()
-	if err != nil {
-		return err
-	}
-	creds.TokenStation.Token = token
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	payload, err := json.MarshalIndent(creds, "", "  ")
-	if err != nil {
-		return err
-	}
-	if err := os.WriteFile(s.filePath, payload, 0o600); err != nil {
-		return err
-	}
-	return os.Chmod(s.filePath, 0o600)
-}
 
 func (s *CredentialsStore) Clear() error {
 	s.mu.Lock()

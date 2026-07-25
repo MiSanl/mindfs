@@ -605,13 +605,6 @@ export const zhCN = {
   "worktree.confirmRemove": "确认移除 worktree“{name}”？\n这会删除该 worktree 目录，并从 MindFS 项目列表中移除。",
   "worktree.removeFailed": "移除 worktree 失败",
 
-  "tokenStation.title": "Token 加油站",
-  "tokenStation.reading": "读取中",
-  "tokenStation.unbound": "未绑定账户",
-  "tokenStation.apply": "配置生效",
-  "tokenStation.processing": "处理中",
-  "tokenStation.topUp": "去加油",
-
   "plugin.loading": "加载中...",
   "plugin.rawFile": "原始文件",
   "plugin.rawViewActive": "已切换为原始文件视图（插件：{name}）",
@@ -628,9 +621,6 @@ export const zhCN = {
   "externalImport.emptyHintAction": "如果项目中已有会话，请点击上方导入按钮，导入后会话可以继续",
 
   "relay.publicAccess": "从公网访问",
-  "tokenStation.loadFailed": "Token 加油站配置读取失败",
-  "tokenStation.noAPIKey": "Token 加油站没有可同步的 API Key",
-  "tokenStation.applyFailed": "Token 加油站配置生效失败",
 
   "action.ws.connected": "WebSocket 连接正常",
   "action.ws.connecting": "WebSocket 正在连接",

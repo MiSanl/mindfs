@@ -4,7 +4,6 @@ import { e2eeService, type E2EEState } from "./e2ee";
 export type RelayStatusPayload = {
   relay_bound?: boolean;
   no_relayer?: boolean;
-  token_station_bound?: boolean;
   pending_code?: string;
   node_name?: string;
   node_id?: string;
