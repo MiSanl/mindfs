@@ -1585,8 +1585,11 @@ export function ActionBar({
                   aria-label={`${t("session.runtime.label")}: ${runtimeMeta.label}`}
                   onClick={async () => {
                     const target = String(runtimeMeta.agent || agent || "").trim();
-                    if (!target || runtimeMeta.state === "opening") return;
-                    // Connected runtimes: require confirm — restart kills the whole agent process.
+                    if (!target || runtimeMeta.state === "opening" || sending || currentSession?.pending) {
+                      return;
+                    }
+                    // Connected runtimes: require confirm — restart kills the whole agent process
+                    // and will disconnect every session currently using this agent.
                     if (runtimeMeta.state === "connected") {
                       const ok = window.confirm(
                         t("session.runtime.reconnectConfirm", { agent: target }),
@@ -1622,7 +1625,10 @@ export function ActionBar({
                     overflow: "hidden",
                     textOverflow: "ellipsis",
                     flexShrink: 1,
-                    cursor: runtimeMeta.state === "opening" ? "default" : "pointer",
+                    cursor:
+                      runtimeMeta.state === "opening" || sending || currentSession?.pending
+                        ? "default"
+                        : "pointer",
                     marginLeft: planModeActive ? 0 : "2px",
                   }}
                 >

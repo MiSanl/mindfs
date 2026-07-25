@@ -1588,6 +1588,8 @@ export function App({ onGoHome }: AppProps) {
   const pendingDraftRef = useRef<PendingSend | null>(null);
   const pendingBySessionRef = useRef<Record<string, PendingSend>>({});
   const pendingRequestRef = useRef<Record<string, PendingSend>>({});
+  /** Suppress peer-disconnect error dialogs briefly after intentional agent restart. */
+  const recentAgentRestartRef = useRef(false);
   const skipCompletionSoundBySessionRef = useRef<Record<string, boolean>>({});
   const queuedMessagesBySessionRef = useRef<Record<string, SessionQueueItem[]>>({});
   const queueFrozenBySessionRef = useRef<Record<string, boolean>>({});
@@ -9869,16 +9871,33 @@ export function App({ onGoHome }: AppProps) {
             const errCode = sessionErrorCode(errorMessage);
             const errRootId = payloadRootId || pending?.rootId || currentRootIdRef.current;
             const errSessionKey = payloadSessionKey || pending?.sessionKey || null;
-            // Session-provider isolation is disabled on this delivery line; do not
-            // offer a migrate-provider recovery action (API is removed / always fails).
-            reportError(errCode, errorMessage, {
-              recoverable,
-              details: {
-                rootId: errRootId,
-                sessionKey: errSessionKey,
-                requestId: requestId || null,
-              },
-            });
+            // Only show error dialogs for the active session. Restarting an agent kills
+            // every session on that agent; other sessions' peer-disconnect errors must
+            // not open crash dialogs on the chat the user is watching.
+            const activeKey =
+              selectedSessionRef.current?.key ||
+              selectedSessionRef.current?.session_key ||
+              currentSessionRef.current?.key ||
+              currentSessionRef.current?.session_key ||
+              "";
+            const activeRoot = currentRootIdRef.current || "";
+            const isActiveSession =
+              !errSessionKey ||
+              (errSessionKey === activeKey &&
+                (!errRootId || !activeRoot || errRootId === activeRoot));
+            const isPeerDisconnect = /peer disconnected|stream disconnected/i.test(
+              errorMessage,
+            );
+            if (isActiveSession && !(isPeerDisconnect && recentAgentRestartRef.current)) {
+              reportError(errCode, errorMessage, {
+                recoverable,
+                details: {
+                  rootId: errRootId,
+                  sessionKey: errSessionKey,
+                  requestId: requestId || null,
+                },
+              });
+            }
           }
           {
             const errRoot = payloadRootId || pending?.rootId || currentRootIdRef.current || "";
@@ -14399,29 +14418,25 @@ export function App({ onGoHome }: AppProps) {
                   selectedSessionRef.current?.key ||
                   selectedSessionRef.current?.session_key ||
                   "";
-                try {
-                  const { restartAgent } = await import("./services/agents");
-                  await restartAgent(targetAgent);
-                } catch (err) {
-                  console.warn("[runtime/reconnect] restart failed", err);
-                }
-                setAgentsVersion((v) => v + 1);
-                // Process restart is not a session open. Mark disconnected (not opening)
-                // and fan out to cache/selected/drawer so GET/sync cannot rehydrate stale
-                // "connected" from an old cache entry.
+                // Immediate UI feedback: KillAgentProcess can block ~10s waiting for ACP
+                // process exit. Without this, a click on "disconnected" looks like a no-op
+                // until the HTTP call returns, then suddenly flips to "restarted".
+                recentAgentRestartRef.current = true;
+                window.setTimeout(() => {
+                  recentAgentRestartRef.current = false;
+                }, 15000);
+                const runtime = {
+                  agent: targetAgent,
+                  state: "disconnected",
+                  message: "agent process restarted; next message will reconnect",
+                };
                 if (root && key) {
                   const cacheKey = rootSessionKey(root, key);
-                  delete pendingBySessionRef.current[cacheKey];
-                  const runtime = {
-                    agent: targetAgent,
-                    state: "disconnected",
-                    message: "agent process restarted; next message will reconnect",
-                  };
+                  // Do not clear pending: an in-flight reply should keep its pending flag.
                   const cached = sessionCacheRef.current[cacheKey];
                   if (cached && typeof cached === "object") {
                     sessionCacheRef.current[cacheKey] = {
                       ...(cached as any),
-                      pending: false,
                       runtime,
                     } as any;
                   }
@@ -14429,7 +14444,6 @@ export function App({ onGoHome }: AppProps) {
                     prev && (prev.key === key || prev.session_key === key)
                       ? ({
                           ...(prev as any),
-                          pending: false,
                           runtime,
                         } as SessionItem)
                       : prev,
@@ -14438,12 +14452,18 @@ export function App({ onGoHome }: AppProps) {
                   if (drawer && (drawer.key === key || (drawer as any).session_key === key)) {
                     setDrawerSessionForRoot(root, {
                       ...(drawer as any),
-                      pending: false,
                       runtime,
                     } as any);
                   }
                   bumpCacheVersion();
                 }
+                try {
+                  const { restartAgent } = await import("./services/agents");
+                  await restartAgent(targetAgent);
+                } catch (err) {
+                  console.warn("[runtime/reconnect] restart failed", err);
+                }
+                setAgentsVersion((v) => v + 1);
               }}
               currentRootId={currentRootId}
               currentSession={actionBarSession}
