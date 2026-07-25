@@ -399,6 +399,7 @@ export const enUS = {
   "session.runtime.willUse": "Next message will use {agent}",
   "session.runtime.reconnectHint": "Click to reconnect agent",
   "session.runtime.reconnectConfirm": "This restarts the entire {agent} process (all sessions for that agent). Continue?",
+  "session.runtime.reconnectBlockedBusy": "This session is still sending or generating a reply. Wait until it finishes before restarting the agent.",
   "session.runtime.label": "Agent connection",
   "error.agent.connectFailed": "Agent connection failed",
   "error.agent.switchFailed": "Failed to switch agent",

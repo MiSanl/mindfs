@@ -220,6 +220,41 @@ function isCanceledSessionError(message: string): boolean {
   );
 }
 
+function isPeerDisconnectErrorMessage(message: string): boolean {
+  return /peer disconnected|stream disconnected/i.test(message || "");
+}
+
+/** Fail-closed: missing session_key never opens a global crash dialog. */
+function isActiveSessionErrorTarget(
+  errSessionKey: string | null | undefined,
+  errRootId: string | null | undefined,
+  activeKey: string,
+  activeRoot: string,
+): boolean {
+  const key = String(errSessionKey || "").trim();
+  if (!key || !activeKey || key !== activeKey) return false;
+  const root = String(errRootId || "").trim();
+  if (root && activeRoot && root !== activeRoot) return false;
+  return true;
+}
+
+function shouldReportSessionErrorDialog(opts: {
+  errorMessage: string;
+  errSessionKey: string | null | undefined;
+  errRootId: string | null | undefined;
+  activeKey: string;
+  activeRoot: string;
+  suppressPeerDisconnect: boolean;
+}): boolean {
+  if (!isActiveSessionErrorTarget(opts.errSessionKey, opts.errRootId, opts.activeKey, opts.activeRoot)) {
+    return false;
+  }
+  if (opts.suppressPeerDisconnect && isPeerDisconnectErrorMessage(opts.errorMessage)) {
+    return false;
+  }
+  return true;
+}
+
 function sessionErrorCode(message: string): ErrorCode {
   const normalized = message.trim().toLowerCase();
   if (normalized.includes("session_provider_unavailable")) {
@@ -9272,14 +9307,34 @@ export function App({ onGoHome }: AppProps) {
             typeof event.data?.message === "string" && event.data.message.trim()
               ? event.data.message.trim()
               : t("session.messageSendFailed");
+          // Same dialog gate as session.error: active session only; suppress peer-
+          // disconnect right after intentional agent restart (bystander kill noise).
           if (!isCanceledSessionError(streamErrorMessage)) {
-            reportError(sessionErrorCode(streamErrorMessage), streamErrorMessage, {
-              details: {
-                rootId: activeRoot,
-                sessionKey: streamKey,
-                eventType: event.type,
-              },
-            });
+            const activeKey =
+              selectedSessionRef.current?.key ||
+              selectedSessionRef.current?.session_key ||
+              currentSessionRef.current?.key ||
+              currentSessionRef.current?.session_key ||
+              "";
+            const activeRootId = currentRootIdRef.current || "";
+            if (
+              shouldReportSessionErrorDialog({
+                errorMessage: streamErrorMessage,
+                errSessionKey: streamKey,
+                errRootId: activeRoot,
+                activeKey,
+                activeRoot: activeRootId,
+                suppressPeerDisconnect: recentAgentRestartRef.current,
+              })
+            ) {
+              reportError(sessionErrorCode(streamErrorMessage), streamErrorMessage, {
+                details: {
+                  rootId: activeRoot,
+                  sessionKey: streamKey,
+                  eventType: event.type,
+                },
+              });
+            }
           }
           skipCompletionSoundBySessionRef.current[rootSessionKey(activeRoot, streamKey)] = true;
           handleSessionStreamDone(activeRoot, streamKey);
@@ -9874,6 +9929,7 @@ export function App({ onGoHome }: AppProps) {
             // Only show error dialogs for the active session. Restarting an agent kills
             // every session on that agent; other sessions' peer-disconnect errors must
             // not open crash dialogs on the chat the user is watching.
+            // Missing session_key is fail-closed (no dialog); durable panel still records below.
             const activeKey =
               selectedSessionRef.current?.key ||
               selectedSessionRef.current?.session_key ||
@@ -9881,14 +9937,16 @@ export function App({ onGoHome }: AppProps) {
               currentSessionRef.current?.session_key ||
               "";
             const activeRoot = currentRootIdRef.current || "";
-            const isActiveSession =
-              !errSessionKey ||
-              (errSessionKey === activeKey &&
-                (!errRootId || !activeRoot || errRootId === activeRoot));
-            const isPeerDisconnect = /peer disconnected|stream disconnected/i.test(
-              errorMessage,
-            );
-            if (isActiveSession && !(isPeerDisconnect && recentAgentRestartRef.current)) {
+            if (
+              shouldReportSessionErrorDialog({
+                errorMessage,
+                errSessionKey,
+                errRootId,
+                activeKey,
+                activeRoot,
+                suppressPeerDisconnect: recentAgentRestartRef.current,
+              })
+            ) {
               reportError(errCode, errorMessage, {
                 recoverable,
                 details: {
@@ -14418,6 +14476,8 @@ export function App({ onGoHome }: AppProps) {
                   selectedSessionRef.current?.key ||
                   selectedSessionRef.current?.session_key ||
                   "";
+                // ActionBar already blocks sending/pending with an alert. Reconnect only runs
+                // when the active session is idle, so we only update runtime status here.
                 // Immediate UI feedback: KillAgentProcess can block ~10s waiting for ACP
                 // process exit. Without this, a click on "disconnected" looks like a no-op
                 // until the HTTP call returns, then suddenly flips to "restarted".
@@ -14432,7 +14492,6 @@ export function App({ onGoHome }: AppProps) {
                 };
                 if (root && key) {
                   const cacheKey = rootSessionKey(root, key);
-                  // Do not clear pending: an in-flight reply should keep its pending flag.
                   const cached = sessionCacheRef.current[cacheKey];
                   if (cached && typeof cached === "object") {
                     sessionCacheRef.current[cacheKey] = {

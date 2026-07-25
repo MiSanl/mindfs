@@ -1578,14 +1578,21 @@ export function ActionBar({
                 <button
                   type="button"
                   title={
-                    runtimeMeta.state === "connected"
-                      ? `${runtimeMeta.label} · ${t("session.runtime.reconnectHint")}`
-                      : `${runtimeMeta.label} · ${t("session.runtime.reconnectHint")}`
+                    sending || currentSession?.pending
+                      ? t("session.runtime.reconnectBlockedBusy")
+                      : runtimeMeta.state === "opening"
+                        ? runtimeMeta.label
+                        : `${runtimeMeta.label} · ${t("session.runtime.reconnectHint")}`
                   }
                   aria-label={`${t("session.runtime.label")}: ${runtimeMeta.label}`}
                   onClick={async () => {
                     const target = String(runtimeMeta.agent || agent || "").trim();
-                    if (!target || runtimeMeta.state === "opening" || sending || currentSession?.pending) {
+                    if (!target || runtimeMeta.state === "opening") return;
+                    // Mid-turn restart would kill the in-flight reply for this session
+                    // (and every other session on the same agent). Block with an explicit
+                    // popup so the click is not a silent no-op.
+                    if (sending || currentSession?.pending) {
+                      window.alert(t("session.runtime.reconnectBlockedBusy"));
                       return;
                     }
                     // Connected runtimes: require confirm — restart kills the whole agent process
@@ -1627,7 +1634,7 @@ export function ActionBar({
                     flexShrink: 1,
                     cursor:
                       runtimeMeta.state === "opening" || sending || currentSession?.pending
-                        ? "default"
+                        ? "not-allowed"
                         : "pointer",
                     marginLeft: planModeActive ? 0 : "2px",
                   }}
