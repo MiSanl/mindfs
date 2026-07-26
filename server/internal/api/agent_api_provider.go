@@ -2510,12 +2510,14 @@ func firstModelOrDefault(models []string, fallback string) string {
 }
 
 // openCodeRuntimeModels filters provider catalog entries to IDs that are safe
-// to send to OpenCode / OpenAI-compatible gateways. Prefer non-space slug IDs;
-// only keep spaced display names when no slug alternative exists.
+// to send to OpenCode / OpenAI-compatible gateways. A spaced display name
+// (e.g. "Composer 2.5 Fast") is dropped ONLY when a matching slug alternative
+// exists in the same catalog (e.g. "grok-composer-2.5-fast"); unrelated slugs
+// must not evict a spaced-only real model. Order is preserved.
 func openCodeRuntimeModels(models []string) []string {
-	slugs := make([]string, 0, len(models))
-	spaced := make([]string, 0)
+	trimmed := make([]string, 0, len(models))
 	seen := map[string]struct{}{}
+	slugSet := make([]string, 0, len(models))
 	for _, model := range models {
 		model = strings.TrimSpace(model)
 		if model == "" {
@@ -2525,16 +2527,37 @@ func openCodeRuntimeModels(models []string) []string {
 			continue
 		}
 		seen[model] = struct{}{}
-		if strings.Contains(model, " ") {
-			spaced = append(spaced, model)
+		trimmed = append(trimmed, model)
+		if !strings.Contains(model, " ") {
+			slugSet = append(slugSet, strings.ToLower(model))
+		}
+	}
+	out := make([]string, 0, len(trimmed))
+	for _, model := range trimmed {
+		if strings.Contains(model, " ") && spacedModelHasSlugAlternative(model, slugSet) {
 			continue
 		}
-		slugs = append(slugs, model)
+		out = append(out, model)
 	}
-	if len(slugs) > 0 {
-		return slugs
+	return out
+}
+
+// spacedModelHasSlugAlternative reports whether the slugified spaced name
+// ("Composer 2.5 Fast" -> "composer-2.5-fast") matches any catalog slug
+// exactly or as a trailing segment (e.g. "grok-composer-2.5-fast").
+func spacedModelHasSlugAlternative(spaced string, slugs []string) bool {
+	candidate := strings.ToLower(strings.Join(strings.Fields(spaced), "-"))
+	if candidate == "" {
+		return false
 	}
-	return spaced
+	for _, slug := range slugs {
+		if slug == candidate ||
+			strings.HasSuffix(slug, "-"+candidate) ||
+			strings.HasSuffix(slug, "/"+candidate) {
+			return true
+		}
+	}
+	return false
 }
 
 func homePath(parts ...string) (string, error) {

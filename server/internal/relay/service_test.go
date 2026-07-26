@@ -430,12 +430,20 @@ func TestManagerPollTerminalBindStatusStopsPolling(t *testing.T) {
 	for {
 		select {
 		case <-requests:
+			// RoundTrip signals BEFORE client.Do returns to the poll loop, so the
+			// manager may not have processed "expired" yet. Poll status briefly
+			// instead of asserting immediately (avoids scheduling-dependent flake).
+			settle := time.Now().Add(2 * time.Second)
+			for time.Now().Before(settle) {
+				status := manager.Status()
+				if status.LastError == "expired" && status.PendingCode == "" {
+					return
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
 			status := manager.Status()
 			if status.LastError != "expired" {
 				continue
-			}
-			if status.PendingCode == "" {
-				return
 			}
 			t.Fatalf("expected pending code to clear after expired status, got first=%q current=%q", firstPendingCode, status.PendingCode)
 		case <-timeout:

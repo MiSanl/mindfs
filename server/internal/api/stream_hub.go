@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"log"
 	"strings"
 	"sync"
 	"time"
@@ -908,7 +909,14 @@ func (h *StreamHub) ClearSessionPending(rootID, sessionKey string) {
 	if blank(sessionKey) {
 		return
 	}
+	// Bounded wait: a replay client that disconnects without unregister would
+	// otherwise spin this goroutine forever and permanently stall queue drain.
+	deadline := time.Now().Add(2 * time.Second)
 	for h.HasReplayClients(rootID, sessionKey) {
+		if time.Now().After(deadline) {
+			log.Printf("[stream] clear_pending.replay_wait_timeout root=%s session=%s", rootID, sessionKey)
+			break
+		}
 		time.Sleep(10 * time.Millisecond)
 	}
 	h.mu.Lock()
@@ -963,11 +971,21 @@ func (h *StreamHub) BroadcastSessionStream(rootID, sessionKey string, event *Str
 	}
 }
 
+// completedSessionTTL bounds the completed map: entries older than this are
+// swept on insert so a long-lived server does not leak one entry per session.
+const completedSessionTTL = 30 * time.Minute
+
 func (h *StreamHub) BroadcastSessionDone(rootID, sessionKey, requestID string) {
 	h.mu.Lock()
+	now := time.Now().UTC()
+	for key, state := range h.completed {
+		if state == nil || now.Sub(state.Completed) > completedSessionTTL {
+			delete(h.completed, key)
+		}
+	}
 	h.completed[pendingKey(rootID, sessionKey)] = &CompletedSessionState{
 		RequestID: requestID,
-		Completed: time.Now().UTC(),
+		Completed: now,
 	}
 	h.mu.Unlock()
 	resp := buildSessionDoneResponse(rootID, sessionKey, requestID, false)

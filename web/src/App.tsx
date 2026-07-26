@@ -219,15 +219,18 @@ function isPeerDisconnectErrorMessage(message: string): boolean {
   return /peer disconnected|stream disconnected/i.test(message || "");
 }
 
-/** Fail-closed: missing session_key never opens a global crash dialog. */
+/** Fail-closed: missing session_key never opens a global crash dialog.
+ * activeKeys carries BOTH the main-selected and drawer/current session keys so
+ * drawer-mode send failures still surface (selectedSession may point elsewhere). */
 function isActiveSessionErrorTarget(
   errSessionKey: string | null | undefined,
   errRootId: string | null | undefined,
-  activeKey: string,
+  activeKeys: string[],
   activeRoot: string,
 ): boolean {
   const key = String(errSessionKey || "").trim();
-  if (!key || !activeKey || key !== activeKey) return false;
+  if (!key) return false;
+  if (!activeKeys.some((k) => k && k === key)) return false;
   const root = String(errRootId || "").trim();
   if (root && activeRoot && root !== activeRoot) return false;
   return true;
@@ -237,11 +240,11 @@ function shouldReportSessionErrorDialog(opts: {
   errorMessage: string;
   errSessionKey: string | null | undefined;
   errRootId: string | null | undefined;
-  activeKey: string;
+  activeKeys: string[];
   activeRoot: string;
   suppressPeerDisconnect: boolean;
 }): boolean {
-  if (!isActiveSessionErrorTarget(opts.errSessionKey, opts.errRootId, opts.activeKey, opts.activeRoot)) {
+  if (!isActiveSessionErrorTarget(opts.errSessionKey, opts.errRootId, opts.activeKeys, opts.activeRoot)) {
     return false;
   }
   if (opts.suppressPeerDisconnect && isPeerDisconnectErrorMessage(opts.errorMessage)) {
@@ -456,6 +459,17 @@ export type SessionItem = {
     kind?: string;
     message?: string;
     recoverable?: boolean;
+    timestamp?: string;
+  }>;
+  turn_requests?: Array<{
+    id?: string;
+    request_id?: string;
+    after_seq?: number;
+    agent?: string;
+    model?: string;
+    provider_id?: string;
+    provider_name?: string;
+    base_url?: string;
     timestamp?: string;
   }>;
   context_window?: {
@@ -5297,7 +5311,7 @@ export function App({ onGoHome }: AppProps) {
             sessionCacheRef.current[cacheKey] = {
               ...(existing as any),
               errors: merged,
-                    turn_requests: (typeof turnRequests !== "undefined" ? turnRequests : ((prev as any)?.turn_requests || [])),
+                    turn_requests: turnRequests,
             } as any;
           }
           setSelectedSession((prev) => {
@@ -5313,7 +5327,7 @@ export function App({ onGoHome }: AppProps) {
               setDrawerSessionForRoot(targetRoot, {
                 ...(drawer as any),
                 errors: merged,
-                    turn_requests: (typeof turnRequests !== "undefined" ? turnRequests : ((prev as any)?.turn_requests || [])),
+                    turn_requests: turnRequests,
               } as Session);
             }
           }
@@ -9218,19 +9232,19 @@ export function App({ onGoHome }: AppProps) {
           // Same dialog gate as session.error: active session only; suppress peer-
           // disconnect right after intentional agent restart (bystander kill noise).
           if (!isCanceledSessionError(streamErrorMessage)) {
-            const activeKey =
-              selectedSessionRef.current?.key ||
-              selectedSessionRef.current?.session_key ||
-              currentSessionRef.current?.key ||
-              currentSessionRef.current?.session_key ||
-              "";
+            const activeKeys = [
+              selectedSessionRef.current?.key,
+              selectedSessionRef.current?.session_key,
+              currentSessionRef.current?.key,
+              currentSessionRef.current?.session_key,
+            ].filter((k): k is string => typeof k === "string" && k !== "");
             const activeRootId = currentRootIdRef.current || "";
             if (
               shouldReportSessionErrorDialog({
                 errorMessage: streamErrorMessage,
                 errSessionKey: streamKey,
                 errRootId: activeRoot,
-                activeKey,
+                activeKeys,
                 activeRoot: activeRootId,
                 suppressPeerDisconnect: recentAgentRestartRef.current,
               })
@@ -9838,19 +9852,21 @@ export function App({ onGoHome }: AppProps) {
             // every session on that agent; other sessions' peer-disconnect errors must
             // not open crash dialogs on the chat the user is watching.
             // Missing session_key is fail-closed (no dialog); durable panel still records below.
-            const activeKey =
-              selectedSessionRef.current?.key ||
-              selectedSessionRef.current?.session_key ||
-              currentSessionRef.current?.key ||
-              currentSessionRef.current?.session_key ||
-              "";
+            // Include BOTH main-selected and drawer/current keys: in drawer mode the
+            // user chats on currentSession while selectedSession may point elsewhere.
+            const activeKeys = [
+              selectedSessionRef.current?.key,
+              selectedSessionRef.current?.session_key,
+              currentSessionRef.current?.key,
+              currentSessionRef.current?.session_key,
+            ].filter((k): k is string => typeof k === "string" && k !== "");
             const activeRoot = currentRootIdRef.current || "";
             if (
               shouldReportSessionErrorDialog({
                 errorMessage,
                 errSessionKey,
                 errRootId,
-                activeKey,
+                activeKeys,
                 activeRoot,
                 suppressPeerDisconnect: recentAgentRestartRef.current,
               })
@@ -9955,7 +9971,7 @@ export function App({ onGoHome }: AppProps) {
                   sessionCacheRef.current[cacheKey] = {
                     ...(sessionCacheRef.current[cacheKey] as any),
                     errors: merged,
-                    turn_requests: (typeof turnRequests !== "undefined" ? turnRequests : ((prev as any)?.turn_requests || [])),
+                    turn_requests: turnRequests,
                   } as any;
                 }
                 const drawer = drawerSessionByRootRef.current[errRoot];

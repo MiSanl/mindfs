@@ -1913,7 +1913,8 @@ export function ActionBar({
                     onFastServiceChange={(nextFastService) => setFastService(nextFastService || "")}
                     onAgentRestart={async (target) => {
                       await restartAgent(target);
-                      await refreshAgents();
+                      const items = await fetchAgents(true);
+                      setAgents(items);
                     }}
                   />
                   {mindfsSessionID ? (

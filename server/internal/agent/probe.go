@@ -382,21 +382,28 @@ func (p *Prober) ClearProbeSession(agentName string) error {
 }
 
 // ReportRuntimeFailure records a user-facing turn failure.
-// Provider API failures (404 / upstream request failed) keep Available=true so the
+// Provider API failures (404 / upstream request failed) keep Available so the
 // UI does not treat a bad model/endpoint as an agent process crash.
 func (p *Prober) ReportRuntimeFailure(name string, err error) {
 	msg := "unknown failure"
 	if err != nil {
 		msg = err.Error()
 	}
-	installed := true
 	current, ok := p.GetStatus(name)
-	if ok {
-		installed = current.Installed
-	}
+	installed := current.Installed
 	status := current
 	if !ok {
-		status = unavailableStatus(name, installed, "", time.Now().UTC())
+		// No cached status: derive Installed from a real binary check instead of
+		// guessing, so a provider 404 on a never-probed agent cannot claim an
+		// uninstalled binary is available.
+		if def, defOK := p.configuredDefinition(strings.TrimSpace(name)); defOK {
+			fresh := probeInstallStatus(name, def, time.Now().UTC())
+			installed = fresh.Installed
+			status = fresh
+		} else {
+			installed = false
+			status = unavailableStatus(name, false, "", time.Now().UTC())
+		}
 	}
 	status.Name = name
 	status.Installed = installed
@@ -411,8 +418,9 @@ func (p *Prober) ReportRuntimeFailure(name string, err error) {
 		strings.Contains(lower, "upstream provider request failed")
 	if providerAPI {
 		// Keep previous Available bit (usually true after successful probe).
+		// Fresh status: available only if the binary is actually installed.
 		if !ok {
-			status.Available = true
+			status.Available = installed
 		}
 	} else {
 		status.Available = false

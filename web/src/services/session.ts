@@ -93,7 +93,6 @@ export type ExchangeAux = {
 export type SessionErrorRecord = {
   provider_id?: string;
   provider_name?: string;
-  kind?: string;
 
   id: string;
   session_key?: string;

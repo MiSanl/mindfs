@@ -360,6 +360,17 @@ func TestOpenCodeRuntimeModelsPrefersSlugs(t *testing.T) {
 	if !reflect.DeepEqual(got, []string{"Composer 2.5 Fast", "Grok 4.5"}) {
 		t.Fatalf("spaced-only got %#v", got)
 	}
+	// An UNRELATED slug must not evict a spaced-only real model: the user would
+	// silently lose "Composer 2.5 Fast" and get gpt-4o written as default.
+	got = openCodeRuntimeModels([]string{"gpt-4o", "Composer 2.5 Fast"})
+	if !reflect.DeepEqual(got, []string{"gpt-4o", "Composer 2.5 Fast"}) {
+		t.Fatalf("unrelated slug evicted spaced model: %#v", got)
+	}
+	// Matching is pairwise: only the spaced name with a slug twin is dropped.
+	got = openCodeRuntimeModels([]string{"Composer 2.5 Fast", "grok-composer-2.5-fast", "Solo Model X"})
+	if !reflect.DeepEqual(got, []string{"grok-composer-2.5-fast", "Solo Model X"}) {
+		t.Fatalf("pairwise filter wrong: %#v", got)
+	}
 }
 
 func TestNormalizeAgentErrorMessageProviderAPI(t *testing.T) {
