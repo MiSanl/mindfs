@@ -905,19 +905,60 @@ func (h *StreamHub) HasReplayClients(rootID, sessionKey string) bool {
 	return false
 }
 
+// ReplayProgress reports how many clients are mid-replay for the session and
+// the summed ReplayIndex across them. The sum only moves while replay steps
+// are actually being consumed, so callers can distinguish a slow-but-live
+// drain from a wedged one (e.g. WriteJSON blocked on a half-open conn).
+func (h *StreamHub) ReplayProgress(rootID, sessionKey string) (int, int) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	count := 0
+	progress := 0
+	for _, replayKey := range h.getReplayKeyListLocked(rootID, sessionKey, "") {
+		replay := h.replayStates[replayKey]
+		if replay != nil && replay.Status == ClientStreamStatusReplay {
+			count++
+			progress += replay.ReplayIndex
+		}
+	}
+	return count, progress
+}
+
+// Replay drain bounds for ClearSessionPending. Cutting a replay short is cheap
+// (durable exchanges are intact and the frontend re-syncs after done), while
+// waiting blocks the done frame and queue drain. So: keep waiting while the
+// replay is making progress (up to a hard cap), but cut quickly once it stalls
+// — a WriteJSON wedged on a half-open TCP conn never recovers and would
+// otherwise hold the session in "generating" for the full timeout.
+const (
+	replayStallTimeout = 2 * time.Second
+	replayDrainHardCap = 30 * time.Second
+)
+
 func (h *StreamHub) ClearSessionPending(rootID, sessionKey string) {
 	if blank(sessionKey) {
 		return
 	}
-	// Bounded wait: a replay client that disconnects without unregister would
-	// otherwise spin this goroutine forever and permanently stall queue drain.
-	deadline := time.Now().Add(2 * time.Second)
-	for h.HasReplayClients(rootID, sessionKey) {
-		if time.Now().After(deadline) {
-			log.Printf("[stream] clear_pending.replay_wait_timeout root=%s session=%s", rootID, sessionKey)
+	start := time.Now()
+	lastCount, lastProgress := h.ReplayProgress(rootID, sessionKey)
+	lastChange := start
+	for lastCount > 0 {
+		time.Sleep(10 * time.Millisecond)
+		count, progress := h.ReplayProgress(rootID, sessionKey)
+		now := time.Now()
+		if count != lastCount || progress != lastProgress {
+			lastCount, lastProgress = count, progress
+			lastChange = now
+			continue
+		}
+		if now.Sub(lastChange) > replayStallTimeout {
+			log.Printf("[stream] clear_pending.replay_stalled root=%s session=%s clients=%d", rootID, sessionKey, count)
 			break
 		}
-		time.Sleep(10 * time.Millisecond)
+		if now.Sub(start) > replayDrainHardCap {
+			log.Printf("[stream] clear_pending.replay_drain_cap root=%s session=%s clients=%d", rootID, sessionKey, count)
+			break
+		}
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
