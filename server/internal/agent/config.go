@@ -18,7 +18,6 @@ type Config struct {
 	Agents          []Definition `json:"agents"`
 	Shells          []Shell      `json:"shells,omitempty"`
 	RelayBaseURL    string       `json:"relayBaseURL,omitempty"`
-	TokenStationURL string       `json:"tokenStationURL,omitempty"`
 }
 
 type Shell struct {
@@ -211,7 +210,6 @@ func loadInstalledDefaultConfig() (Config, string, error) {
 
 func normalizeConfig(cfg Config) (Config, error) {
 	cfg.RelayBaseURL = strings.TrimSpace(cfg.RelayBaseURL)
-	cfg.TokenStationURL = strings.TrimSpace(cfg.TokenStationURL)
 	shells := make([]Shell, 0, len(cfg.Shells))
 	for _, shell := range cfg.Shells {
 		if trimmed := strings.TrimSpace(shell.Command); trimmed != "" {
@@ -260,16 +258,12 @@ func mergeConfigs(base Config, override Config) Config {
 		Agents:          append([]Definition(nil), base.Agents...),
 		Shells:          append([]Shell(nil), base.Shells...),
 		RelayBaseURL:    base.RelayBaseURL,
-		TokenStationURL: base.TokenStationURL,
 	}
 	if len(override.Shells) > 0 {
 		merged.Shells = mergeShells(base.Shells, override.Shells)
 	}
 	if override.RelayBaseURL != "" {
 		merged.RelayBaseURL = override.RelayBaseURL
-	}
-	if override.TokenStationURL != "" {
-		merged.TokenStationURL = override.TokenStationURL
 	}
 
 	agentIndexes := make(map[string]int, len(merged.Agents))

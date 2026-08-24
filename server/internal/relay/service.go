@@ -45,7 +45,6 @@ type credentialResponse struct {
 	NodeID            string `json:"node_id"`
 	NodeName          string `json:"node_name"`
 	Endpoint          string `json:"endpoint"`
-	TokenStationToken string `json:"token_station_token"`
 }
 
 type bindPollResponse struct {
@@ -58,7 +57,6 @@ type BindPollResult struct {
 	Status            string
 	NextPollAfter     time.Duration
 	Credentials       RelayCredentials
-	TokenStationToken string
 }
 
 type relayDialError struct {
@@ -218,7 +216,6 @@ func (s *Service) PollBindPurpose(ctx context.Context, baseURL, pendingCode, pur
 			NodeName:    strings.TrimSpace(out.NodeName),
 			Endpoint:    strings.TrimSpace(out.Endpoint),
 		}
-		result.TokenStationToken = strings.TrimSpace(out.TokenStationToken)
 	}
 	return result, nil
 }
@@ -266,67 +263,6 @@ func buildBindPollURL(baseURL, pendingCode string, purpose ...string) (string, e
 	}
 }
 
-func (s *Service) FetchTokenStationUserInfo(ctx context.Context, baseURL string, creds Credentials, purpose string) (map[string]any, error) {
-	baseURL = strings.TrimSuffix(strings.TrimSpace(baseURL), "/")
-	if baseURL == "" {
-		return nil, errors.New("relay base URL required")
-	}
-	token := strings.TrimSpace(creds.Relay.DeviceToken)
-	if token == "" {
-		token = strings.TrimSpace(creds.TokenStation.Token)
-	}
-	if token == "" {
-		return nil, errors.New("token station credentials unavailable")
-	}
-	u, err := url.Parse(baseURL)
-	if err != nil {
-		return nil, err
-	}
-	u.Path = strings.TrimSuffix(u.Path, "/") + "/api/token-station/userinfo"
-	q := u.Query()
-	if purpose = strings.TrimSpace(purpose); purpose != "" {
-		q.Set("purpose", purpose)
-	}
-	u.RawQuery = q.Encode()
-	u.Fragment = ""
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	resp, err := s.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return nil, err
-	}
-	var payload map[string]any
-	if len(strings.TrimSpace(string(body))) > 0 {
-		if err := json.Unmarshal(body, &payload); err != nil {
-			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-				return nil, fmt.Errorf("token station userinfo failed: %s", resp.Status)
-			}
-			return nil, fmt.Errorf("token station userinfo returned invalid payload")
-		}
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		if message, _ := payload["error"].(string); strings.TrimSpace(message) != "" {
-			return nil, errors.New(message)
-		}
-		if message, _ := payload["message"].(string); strings.TrimSpace(message) != "" {
-			return nil, errors.New(message)
-		}
-		return nil, fmt.Errorf("token station userinfo failed: %s", resp.Status)
-	}
-	if payload == nil {
-		return nil, errors.New("token station userinfo returned empty payload")
-	}
-	return payload, nil
-}
 
 func (s *Service) runSession(ctx context.Context, creds RelayCredentials) error {
 	headers := http.Header{}

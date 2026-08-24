@@ -481,6 +481,5 @@
       }
     }
   ],
-  "relayBaseURL": "https://relay.a9gent.com",
-  "tokenStationURL":"https://token.a9gent.com"
+  "relayBaseURL": "https://relay.a9gent.com"
 }
